@@ -42,7 +42,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.2.0"
+    APP_VERSION = "1.2.1"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -68,6 +68,14 @@ except ImportError:
     GroqClient = None
     DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
     DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
+
+
+def _qt_excepthook(exc_type, exc_val, exc_tb):
+    import traceback
+    traceback.print_exception(exc_type, exc_val, exc_tb)
+
+if PYSIDE6_AVAILABLE:
+    sys.excepthook = _qt_excepthook
 
 
 def get_app_icon():
@@ -211,9 +219,14 @@ class Spring:
             self.value = self.target
             self.velocity = 0.0
             return self.value
-        force = -self.stiffness * (self.value - self.target) - self.damping * self.velocity
-        self.velocity += force * dt
-        self.value += self.velocity * dt
+        dt = min(max(float(dt), 1e-4), 0.05)
+        sub_steps = max(1, int(dt / 0.016) + 1)
+        sub_dt = dt / sub_steps
+        for _ in range(sub_steps):
+            force = -self.stiffness * (self.value - self.target) - self.damping * self.velocity
+            self.velocity += force * sub_dt
+            self.value += self.velocity * sub_dt
+        self.value = min(max(self.value, 10.0), 3840.0)
         return self.value
 
 
@@ -286,13 +299,16 @@ class AppleDynamicIsland(QWidget):
             print(f"[overlay] backdrop error: {exc}")
 
     def _center_top(self):
-        screen = QApplication.primaryScreen()
-        if screen:
-            geom = screen.geometry()
-            w = int(round(self.spring_w.value))
-            h = int(round(self.spring_h.value))
-            cx = geom.x() + (geom.width() - w) // 2
-            self.setGeometry(cx, geom.y(), w, h)
+        try:
+            screen = QApplication.primaryScreen()
+            if screen:
+                geom = screen.geometry()
+                w = max(40, min(int(round(self.spring_w.value)), 3840))
+                h = max(20, min(int(round(self.spring_h.value)), 2160))
+                cx = geom.x() + (geom.width() - w) // 2
+                self.setGeometry(cx, geom.y(), w, h)
+        except Exception as exc:
+            print(f"[overlay] center_top error: {exc}")
 
     def update_frame(self, now):
         dt = max(now - self.last_frame_t, 1e-4)
@@ -971,16 +987,40 @@ class SettingsWindow(QDialog):
         self._build_display_page()
         self._build_about_page()
 
-        self.sidebar.currentRowChanged.connect(self.stack.setCurrentIndex)
+        def on_tab_changed(index):
+            self.stack.setCurrentIndex(index)
+            if hasattr(self, "mic_timer") and hasattr(self, "voice_page"):
+                if self.stack.currentWidget() == self.voice_page:
+                    if not self.mic_timer.isActive():
+                        self.mic_timer.start(120)
+                else:
+                    if self.mic_timer.isActive():
+                        self.mic_timer.stop()
+
+        self.sidebar.currentRowChanged.connect(on_tab_changed)
         self.sidebar.setCurrentRow(0)
+
+        for btn in self.findChildren(QPushButton):
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+
+    def closeEvent(self, event):
+        if hasattr(self, "mic_timer") and self.mic_timer.isActive():
+            self.mic_timer.stop()
+        super().closeEvent(event)
+
+    def reject(self):
+        if hasattr(self, "mic_timer") and self.mic_timer.isActive():
+            self.mic_timer.stop()
+        super().reject()
 
     def select_tab(self, tab):
         """Selects tab by integer index or case-insensitive category string."""
         if isinstance(tab, int):
             if 0 <= tab < self.sidebar.count():
                 self.sidebar.setCurrentRow(tab)
-            return
-        if isinstance(tab, str):
+                return
+        elif isinstance(tab, str):
             tab_lower = tab.strip().lower()
             for i in range(self.sidebar.count()):
                 item = self.sidebar.item(i)
@@ -1328,28 +1368,33 @@ class SettingsWindow(QDialog):
         layout.addWidget(meter_card)
         layout.addStretch()
         self.stack.addWidget(page)
+        self.voice_page = page
 
-        # Setup periodic audio level timer (runs smoothly when settings is open)
+        # Setup periodic audio level timer (runs smoothly when Voice tab is visible)
         self.mic_timer = QTimer(self)
-        self.mic_timer.setInterval(80)
+        self.mic_timer.setInterval(120)
 
         def update_mic_level():
-            if not self.isVisible() or self.stack.currentWidget() != page:
+            if not self.isVisible() or self.stack.currentWidget() != self.voice_page:
+                if self.mic_timer.isActive():
+                    self.mic_timer.stop()
                 return
-            chosen_dev = self.cfg.mic_device_index
-            norm, rms = probe_mic_level(chosen_dev)
-            val = int(norm * 100)
-            self.mic_level_bar.setValue(val)
-            self.mic_level_lbl.setText(f"{val}%")
-            if rms > 15.0:
-                self.mic_status_lbl.setText(f"Microphone active (Signal: {rms:.0f})")
-                self.mic_status_lbl.setStyleSheet("font-size: 11px; color: #34c759;")
-            else:
-                self.mic_status_lbl.setText("No audio signal detected. Speak louder or select another microphone.")
-                self.mic_status_lbl.setStyleSheet("font-size: 11px; color: #8e8e93;")
+            try:
+                chosen_dev = self.cfg.mic_device_index
+                norm, rms = probe_mic_level(chosen_dev)
+                val = int(norm * 100)
+                self.mic_level_bar.setValue(val)
+                self.mic_level_lbl.setText(f"{val}%")
+                if rms > 15.0:
+                    self.mic_status_lbl.setText(f"Microphone active (Signal: {rms:.0f})")
+                    self.mic_status_lbl.setStyleSheet("font-size: 11px; color: #34c759;")
+                else:
+                    self.mic_status_lbl.setText("No audio signal detected. Speak louder or select another microphone.")
+                    self.mic_status_lbl.setStyleSheet("font-size: 11px; color: #8e8e93;")
+            except Exception as exc:
+                print(f"[settings] mic level update note: {exc}")
 
         self.mic_timer.timeout.connect(update_mic_level)
-        self.mic_timer.start()
 
     def _build_ai_page(self):
         page, layout = self._build_page_container("AI & Intelligence", "Groq speech-to-text and intelligent voice assistant")
@@ -1630,14 +1675,24 @@ class SettingsWindow(QDialog):
         self._save("frame_height", h)
 
     def _run_diagnose_action(self):
-        import subprocess
-        python_exe = sys.executable
-        subprocess.Popen([python_exe, "diagnose.py"])
+        try:
+            import subprocess
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            diag_script = os.path.join(base_dir, "diagnose.py")
+            if os.path.exists(diag_script):
+                subprocess.Popen([sys.executable, diag_script])
+        except Exception as exc:
+            print(f"[settings] diagnose error: {exc}")
 
     def _open_target_practice(self):
-        import subprocess
-        python_exe = sys.executable
-        subprocess.Popen([python_exe, "tests/target_practice.py", "--gui"])
+        try:
+            import subprocess
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            tp_script = os.path.join(base_dir, "tests", "target_practice.py")
+            if os.path.exists(tp_script):
+                subprocess.Popen([sys.executable, tp_script, "--gui"])
+        except Exception as exc:
+            print(f"[settings] target practice error: {exc}")
 
     def _save(self, key, value):
         # Strict safeguard: Never write any API key, token, or secret to config file
@@ -1769,6 +1824,7 @@ class Overlay:
 
         if PYSIDE6_AVAILABLE:
             self.app = QApplication.instance() or QApplication(sys.argv)
+            self.app.setQuitOnLastWindowClosed(False)
             self.app_icon = get_app_icon()
             if self.app_icon and not self.app_icon.isNull():
                 self.app.setWindowIcon(self.app_icon)
@@ -1853,9 +1909,12 @@ class Overlay:
         if self.stop.is_set():
             self.app.quit()
             return
-        now = time.time()
-        self._drain(now)
-        self.island.update_frame(now)
+        try:
+            now = time.time()
+            self._drain(now)
+            self.island.update_frame(now)
+        except Exception as exc:
+            print(f"[overlay] tick error: {exc}")
 
     def _init_tk_fallback(self):
         self.root = tk.Tk()

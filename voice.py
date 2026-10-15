@@ -28,64 +28,78 @@ from ai import (
 )
 
 
-def list_microphones():
+_PORTAUDIO_LOCK = threading.RLock()
+_SHARED_PYAUDIO = None
+
+
+def get_shared_pyaudio():
+    """Returns a process-wide PyAudio instance protected by _PORTAUDIO_LOCK."""
+    global _SHARED_PYAUDIO
+    with _PORTAUDIO_LOCK:
+        if _SHARED_PYAUDIO is None:
+            import pyaudio
+            _SHARED_PYAUDIO = pyaudio.PyAudio()
+        return _SHARED_PYAUDIO
+
+
+def list_microphones(probe_rms=False):
     """
-    Enumerates all system audio input devices and probes each for functionality and RMS level.
+    Enumerates all system audio input devices safely using the shared PyAudio instance.
     Returns list of dicts:
         [{'index': int, 'name': str, 'channels': int, 'working': bool, 'rms': float, 'is_virtual': bool}]
     """
     mics = []
-    try:
-        import pyaudio
-        p = pyaudio.PyAudio()
-        dev_count = p.get_device_count()
-        for i in range(dev_count):
-            try:
-                info = p.get_device_info_by_index(i)
-                max_ch = info.get("maxInputChannels", 0)
-                if max_ch <= 0:
-                    continue
-
-                name = info.get("name", f"Microphone {i}")
-                rate = int(info.get("defaultSampleRate", 44100))
-                ch = min(max_ch, 2)
-                is_virtual = any(k in name.lower() for k in ("virtual", "cable", "mapper", "stereo mix", "wave out"))
-
-                # Quick probe to test if stream can be opened and measure signal
-                working = False
-                rms = 0.0
+    with _PORTAUDIO_LOCK:
+        try:
+            import pyaudio
+            p = get_shared_pyaudio()
+            dev_count = p.get_device_count()
+            for i in range(dev_count):
                 try:
-                    stream = p.open(
-                        format=pyaudio.paInt16,
-                        channels=ch,
-                        rate=rate,
-                        input=True,
-                        input_device_index=i,
-                        frames_per_buffer=1024
-                    )
-                    data = stream.read(1024, exception_on_overflow=False)
-                    stream.stop_stream()
-                    stream.close()
-                    arr = np.frombuffer(data, dtype=np.int16)
-                    rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
-                    working = True
-                except Exception:
-                    working = False
-                    rms = 0.0
+                    info = p.get_device_info_by_index(i)
+                    max_ch = info.get("maxInputChannels", 0)
+                    if max_ch <= 0:
+                        continue
 
-                mics.append({
-                    "index": i,
-                    "name": name,
-                    "channels": max_ch,
-                    "working": working,
-                    "rms": rms,
-                    "is_virtual": is_virtual
-                })
-            except Exception:
-                pass
-        p.terminate()
-    except Exception as exc:
-        print(f"[voice] error enumerating microphones: {exc}")
+                    name = info.get("name", f"Microphone {i}")
+                    rate = int(info.get("defaultSampleRate", 44100))
+                    ch = min(max_ch, 2)
+                    is_virtual = any(k in name.lower() for k in ("virtual", "cable", "mapper", "stereo mix", "wave out"))
+
+                    working = True
+                    rms = 0.0
+                    if probe_rms:
+                        try:
+                            stream = p.open(
+                                format=pyaudio.paInt16,
+                                channels=ch,
+                                rate=rate,
+                                input=True,
+                                input_device_index=i,
+                                frames_per_buffer=1024
+                            )
+                            data = stream.read(1024, exception_on_overflow=False)
+                            stream.stop_stream()
+                            stream.close()
+                            arr = np.frombuffer(data, dtype=np.int16)
+                            rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
+                            working = True
+                        except Exception:
+                            working = False
+                            rms = 0.0
+
+                    mics.append({
+                        "index": i,
+                        "name": name,
+                        "channels": max_ch,
+                        "working": working,
+                        "rms": rms,
+                        "is_virtual": is_virtual
+                    })
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"[voice] error enumerating microphones: {exc}")
     return mics
 
 
@@ -97,7 +111,7 @@ def find_best_microphone(cfg=None):
        and selecting the physical microphone with active audio signal.
     """
     cfg_idx = getattr(cfg, "mic_device_index", None) if cfg else None
-    mics = list_microphones()
+    mics = list_microphones(probe_rms=False)
     if not mics:
         return None, "Default System Microphone"
 
@@ -120,7 +134,6 @@ def find_best_microphone(cfg=None):
             score += 30.0
         if "intel" in name or "realtek" in name:
             score += 20.0
-        # Add audio signal presence (devices with actual acoustic energy get priority)
         if m["rms"] > 5.0:
             score += 50.0 + min(m["rms"] / 100.0, 30.0)
         return score
@@ -142,44 +155,48 @@ def find_best_microphone(cfg=None):
 def probe_mic_level(device_index=None, chunk_samples=1024):
     """
     Reads a short frame from the microphone and returns normalized volume (0.0 to 1.0) and raw RMS.
-    Safe and lightweight for non-blocking UI polling timers.
+    Safe and lightweight for non-blocking UI polling timers. Uses shared PyAudio instance without termination.
+    Never blocks the caller if audio hardware is locked by another thread.
     """
+    acquired = _PORTAUDIO_LOCK.acquire(blocking=False)
+    if not acquired:
+        return 0.0, 0.0
+    stream = None
     try:
         import pyaudio
-        p = pyaudio.PyAudio()
-        try:
-            if device_index is None:
-                info = p.get_default_input_device_info()
-                dev_idx = info["index"]
-            else:
-                info = p.get_device_info_by_index(device_index)
-                dev_idx = device_index
-            ch = min(info.get("maxInputChannels", 1), 2)
-            rate = int(info.get("defaultSampleRate", 44100))
+        p = get_shared_pyaudio()
+        if device_index is None:
+            info = p.get_default_input_device_info()
+            dev_idx = info["index"]
+        else:
+            info = p.get_device_info_by_index(device_index)
+            dev_idx = device_index
+        ch = min(info.get("maxInputChannels", 1), 2)
+        rate = int(info.get("defaultSampleRate", 44100))
 
-            stream = p.open(
-                format=pyaudio.paInt16,
-                channels=ch,
-                rate=rate,
-                input=True,
-                input_device_index=dev_idx,
-                frames_per_buffer=chunk_samples
-            )
-            data = stream.read(chunk_samples, exception_on_overflow=False)
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-
-            arr = np.frombuffer(data, dtype=np.int16)
-            rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
-            # Logarithmic/perceptual normalization (0 dB to 90 dB range)
-            norm = min(max((rms - 20.0) / 2500.0, 0.0), 1.0)
-            return norm, rms
-        except Exception:
-            p.terminate()
-            return 0.0, 0.0
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=ch,
+            rate=rate,
+            input=True,
+            input_device_index=dev_idx,
+            frames_per_buffer=chunk_samples
+        )
+        data = stream.read(chunk_samples, exception_on_overflow=False)
+        arr = np.frombuffer(data, dtype=np.int16)
+        rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
+        norm = min(max((rms - 20.0) / 2500.0, 0.0), 1.0)
+        return norm, rms
     except Exception:
         return 0.0, 0.0
+    finally:
+        if stream is not None:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+        _PORTAUDIO_LOCK.release()
 
 
 def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
@@ -214,16 +231,16 @@ def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
     }
 
     try:
-        r = sr.Recognizer()
-        r.energy_threshold = 300
-        r.dynamic_energy_threshold = True
+        with _PORTAUDIO_LOCK:
+            r = sr.Recognizer()
+            r.energy_threshold = 300
+            r.dynamic_energy_threshold = True
 
-        mic = sr.Microphone(device_index=device_index)
-        levels = []
-        with mic as source:
-            r.adjust_for_ambient_noise(source, duration=0.6)
-            # Record phrase
-            audio = r.listen(source, timeout=2.0, phrase_time_limit=duration)
+            mic = sr.Microphone(device_index=device_index)
+            with mic as source:
+                r.adjust_for_ambient_noise(source, duration=0.6)
+                # Record phrase
+                audio = r.listen(source, timeout=2.0, phrase_time_limit=duration)
 
         # Compute level from captured audio
         raw_bytes = audio.get_raw_data()
@@ -318,7 +335,8 @@ class Voice(threading.Thread):
         print(f"[voice] Connecting to microphone [{dev_idx}]: {dev_name}")
 
         try:
-            mic = sr.Microphone(device_index=dev_idx)
+            with _PORTAUDIO_LOCK:
+                mic = sr.Microphone(device_index=dev_idx)
             initial_thresh = getattr(self.cfg, "mic_energy_threshold", 400)
             recognizer.energy_threshold = initial_thresh
 
@@ -349,7 +367,8 @@ class Voice(threading.Thread):
             if configured_idx is not None and configured_idx != self.current_mic_index:
                 print(f"[voice] Switching microphone from [{self.current_mic_index}] to [{configured_idx}]...")
                 try:
-                    mic = sr.Microphone(device_index=configured_idx)
+                    with _PORTAUDIO_LOCK:
+                        mic = sr.Microphone(device_index=configured_idx)
                     self.current_mic_index = configured_idx
                 except Exception as switch_err:
                     print(f"[voice] error switching microphone: {switch_err}")

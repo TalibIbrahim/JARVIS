@@ -201,4 +201,26 @@
   - **macOS System Settings AI Tab**: Added clean Apple HIG configuration tab with enable switch, masked key input, test connection tool with inline status, model selectors, and `"set up ai"` voice command.
   - **Test Suite Expansion**: Added 41 unit tests in `tests/test_ai.py` (totaling 79 passing tests across the repository).
 
+---
+
+### 21. Release v1.2.1: Settings Window Stability & PortAudio Concurrency Hardening
+- **Issues Addressed**:
+  - Interacting with Settings controls mid-session caused the application to crash or abruptly exit without a traceback.
+  - Selecting the Voice tab or opening Settings with active background speech recognition resulted in a hard Windows access violation segfault (`0xC0000005`) or PortAudio `[Errno -222813555] Invalid error code`.
+  - Closing the Settings dialog or dismissing it dismissed the entire JARVIS application.
+- **Root Causes**:
+  - **PortAudio Reinitialization Segfault**: `probe_mic_level()` and `list_microphones()` created new `pyaudio.PyAudio()` instances and called `p.terminate()` while the background `Voice` thread held open an active PortAudio input stream. PortAudio's global `Pa_Terminate()` tore down shared heap structures concurrently, corrupting memory pointers and crashing `portaudio_x64.dll`.
+  - **Spring Physics Euler Explosion**: When audio device enumeration or high-frequency probing briefly blocked the GUI event loop for $\sim 0.5$ s, the unconstrained frame delta ($dt \approx 0.5$ s) caused Euler integration in `Spring.update()` to oscillate uncontrollably and explode to $\sim 10^{11}$. The resulting window dimension passed to `setGeometry()` raised an unhandled `OverflowError`, terminating PySide6.
+  - **Qt Application Lifecycle**: In PySide6, `QApplication.quitOnLastWindowClosed` defaults to `True`. Because the Dynamic Island and Cursor Feedback overlays are frameless `Qt.WindowType.Tool` windows, `SettingsWindow` was the sole primary top-level window. Closing the dialog prompted Qt to terminate the entire process.
+  - **AutoDefault Buttons**: In Qt `QDialog`, `QPushButton` children default to `autoDefault=True`. Hitting Enter in text fields triggered default button actions.
+- **Fixes Applied**:
+  - **Thread-Safe Shared PortAudio Architecture**: Added `_PORTAUDIO_LOCK` (reentrant lock) and `get_shared_pyaudio()` singleton. Reused a single `PyAudio` instance without calling `terminate()` on transient probes.
+  - **Non-Blocking Device Probing**: Updated `list_microphones(probe_rms=False)` to inspect device capabilities via `get_device_info_by_index()` without opening hardware audio streams on every input device.
+  - **Non-Blocking UI Audio Metering**: `probe_mic_level()` now uses non-blocking lock acquisition (`acquire(blocking=False)`). If another thread is using the hardware, the UI immediately skips without stalling the main thread.
+  - **Conditionally Controlled Mic Timer**: Settings `mic_timer` now runs strictly while the user is actively viewing the Voice tab and pauses immediately when navigating away or closing the dialog.
+  - **Numerically Stable Clamped Spring Physics**: Clamped $dt \in [0.0001, 0.05]$ s, added sub-stepping ($dt_{\text{sub}} \le 16$ ms) to keep spring equations strictly stable under arbitrary frame lag, and clamped dimensions to physical screen bounds $[10, 3840]$ px.
+  - **Application Persistence**: Explicitly configured `self.app.setQuitOnLastWindowClosed(False)` so closing or dismissing Settings preserves the background application, Dynamic Island, and voice services.
+  - **AutoDefault Suppression**: Explicitly set `setAutoDefault(False)` and `setDefault(False)` on all buttons in the Settings window.
+  - **Unit Test Expansion**: Added `tests/test_settings.py` covering Spring physics stability under extreme lag, non-blocking audio lock acquisition, and dialog lifecycle behavior (totaling 86 passing tests).
+
 
