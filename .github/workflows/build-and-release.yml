@@ -43,7 +43,7 @@ jobs:
         run: |
           python tests/test_gestures.py
 
-      - name: Build Windows Executable
+      - name: Build Standalone Windows Executable
         run: |
           python build_exe.py
 
@@ -52,7 +52,7 @@ jobs:
         run: |
           $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.version || 'v1.0.0' }}" }
           $zipName = "JARVIS-${ver}-Windows-x64.zip"
-          Compress-Archive -Path "dist/jarvis/*" -DestinationPath "dist/$zipName" -Force
+          Compress-Archive -Path "dist/JARVIS.exe" -DestinationPath "dist/$zipName" -Force
           Write-Host "Created release archive: dist/$zipName"
 
       - name: Publish to GitHub Releases
@@ -60,7 +60,9 @@ jobs:
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (inputs.version || 'v1.0.0') }}
           name: ${{ github.ref_type == 'tag' && github.ref_name || (inputs.release_title || 'J.A.R.V.I.S. v1.0.0 — Windows Release') }}
-          files: dist/*.zip
+          files: |
+            dist/JARVIS.exe
+            dist/*.zip
           draft: false
           prerelease: false
           generate_release_notes: true

@@ -8,11 +8,11 @@ import sys
 
 
 def build():
-    print("[build] Packaging J.A.R.V.I.S. into jarvis.exe...")
+    print("[build] Packaging J.A.R.V.I.S. into standalone JARVIS.exe...")
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--name=jarvis",
-        "--onedir",  # onedir is faster to launch and avoids temp directory extraction overhead for 100MB+ models
+        "--name=JARVIS",
+        "--onefile",  # standalone single-file executable for direct download & run
         "--windowed",  # suppresses standard console window
         "--noconfirm",
         "--collect-data", "mediapipe",
@@ -27,7 +27,7 @@ def build():
     print("[build] Command:", " ".join(cmd))
     res = subprocess.run(cmd)
     if res.returncode == 0:
-        print("\n[build] SUCCESS! Output generated in dist/jarvis/jarvis.exe")
+        print("\n[build] SUCCESS! Output generated: dist/JARVIS.exe")
     else:
         print(f"\n[build] FAILED with return code {res.returncode}")
 
