@@ -126,4 +126,16 @@ def run_command(text, ctx):
         pyautogui.scroll(600, _pause=False)
         return None
 
+    # --- software updates ---
+    if _any(t, "check for updates", "update jarvis", "check updates", "any updates"):
+        if hasattr(ctx, "updater") and ctx.updater:
+            ctx.updater.check_async(notify_if_latest=True)
+            return "Checking GitHub for updates, sir."
+        return "Updater is not initialized, sir."
+    if _any(t, "install update", "apply update", "restart and update"):
+        if hasattr(ctx, "updater") and ctx.updater and ctx.updater.downloaded_path:
+            ctx.updater.apply_update_and_restart()
+            return "Applying update and restarting Jarvis now, sir."
+        return "No downloaded update is ready to install, sir."
+
     return "I didn't catch a command for that, sir."

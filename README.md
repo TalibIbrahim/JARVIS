@@ -94,6 +94,12 @@
 - **Interactive Hand Calibration**: Live 3-step wizard that measures your personal thumb-to-index pinch distance and auto-tunes thresholds to your exact hand geometry.
 - **JSON Persistence**: Automatically saves and loads overrides from `jarvis_config.json`.
 
+### Discord-Style Auto-Updater
+- **Silent Background Checks**: Queries GitHub Releases in the background on startup and every 4 hours without stalling tracking or framerate.
+- **In-Place Atomic Replacement**: Uses a detached Windows replacer script to wait for the current process to terminate, overwrite the executable in-place, and relaunch.
+- **Dedicated Updates Dialog Tab**: View current vs latest version, preview release notes, stream updates with live percentage progress, and configure auto-check preferences.
+- **Tray & Voice Controls**: Access *"Check for Updates..."* directly from the taskbar tray context menu, or say *"Jarvis, check for updates"* and *"Jarvis, install update"*.
+
 ---
 
 ## Gestures

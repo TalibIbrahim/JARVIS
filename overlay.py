@@ -30,12 +30,18 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
         QLabel, QSlider, QCheckBox, QPushButton, QComboBox,
-        QGroupBox, QSystemTrayIcon, QMenu, QTabWidget
+        QGroupBox, QSystemTrayIcon, QMenu, QTabWidget,
+        QProgressBar, QTextEdit
     )
     PYSIDE6_AVAILABLE = True
 except ImportError:
     PYSIDE6_AVAILABLE = False
     import tkinter as tk
+
+try:
+    from updater import APP_VERSION
+except ImportError:
+    APP_VERSION = "1.0.0"
 
 # Brand colors
 CYAN = "#00e5ff"
@@ -266,12 +272,13 @@ class DynamicIsland(QWidget):
 class SettingsWindow(QDialog):
     """Configuration, tuning sliders, and interactive calibration wizard."""
 
-    def __init__(self, cfg, ctx, parent=None):
+    def __init__(self, cfg, ctx, updater=None, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self.ctx = ctx
+        self.updater = updater
         self.setWindowTitle("J.A.R.V.I.S. // System Settings")
-        self.setFixedSize(540, 560)
+        self.setFixedSize(540, 600)
         self.setStyleSheet("""
             QDialog {
                 background-color: #0b1118;
@@ -332,6 +339,11 @@ class SettingsWindow(QDialog):
                 background-color: #00e5ff;
                 color: #05080e;
             }
+            QPushButton:disabled {
+                background-color: #0d1a24;
+                border: 1px solid #1c3b47;
+                color: #4a6a78;
+            }
             QComboBox {
                 background-color: #0d1a24;
                 border: 1px solid #1c3b47;
@@ -347,6 +359,7 @@ class SettingsWindow(QDialog):
         tabs = QTabWidget()
         tabs.setStyleSheet("QTabBar::tab { background: #0e1c26; color: #b0d6df; padding: 6px 16px; } QTabBar::tab:selected { background: #163647; color: #00e5ff; font-weight: bold; }")
         layout.addWidget(tabs)
+        self.tabs = tabs
 
         # --- Tab 1: General Settings ---
         tab_general = QWidget()
@@ -446,6 +459,80 @@ class SettingsWindow(QDialog):
 
         tabs.addTab(tab_calib, "Hand Calibration")
 
+        # --- Tab 3: Updates ---
+        tab_updates = QWidget()
+        upd_layout = QVBoxLayout(tab_updates)
+
+        ver_box = QGroupBox("Version Status")
+        ver_l = QVBoxLayout(ver_box)
+        self.ver_label = QLabel(f"Current Installed:  v{APP_VERSION}")
+        self.ver_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #00e5ff;")
+        self.latest_label = QLabel("Latest Available:  Checking...")
+        self.latest_label.setStyleSheet("font-size: 12px; color: #ffc94d;")
+        ver_l.addWidget(self.ver_label)
+        ver_l.addWidget(self.latest_label)
+        upd_layout.addWidget(ver_box)
+
+        notes_box = QGroupBox("Release Notes")
+        notes_l = QVBoxLayout(notes_box)
+        self.release_notes = QTextEdit()
+        self.release_notes.setReadOnly(True)
+        self.release_notes.setStyleSheet(
+            "background-color: #081017; border: 1px solid #1c3b47; color: #b0d6df; font-family: Consolas;"
+        )
+        self.release_notes.setPlaceholderText("Release notes will appear here when an update is found.")
+        notes_l.addWidget(self.release_notes)
+        upd_layout.addWidget(notes_box)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #0d1a24;
+                border: 1px solid #1c3b47;
+                border-radius: 4px;
+                text-align: center;
+                color: #e8fbff;
+                font-weight: bold;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #00e5ff;
+                border-radius: 3px;
+            }
+        """)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        upd_layout.addWidget(self.progress_bar)
+
+        self.upd_status = QLabel("Press 'Check for Updates' to check GitHub releases.")
+        self.upd_status.setStyleSheet("color: #b0d6df; font-size: 11px;")
+        upd_layout.addWidget(self.upd_status)
+
+        upd_btn_layout = QHBoxLayout()
+        self.check_upd_btn = QPushButton("Check for Updates")
+        self.check_upd_btn.clicked.connect(self._manual_check_updates)
+        self.download_upd_btn = QPushButton("Download & Restart")
+        self.download_upd_btn.setEnabled(False)
+        self.download_upd_btn.clicked.connect(self._start_download_update)
+        upd_btn_layout.addWidget(self.check_upd_btn)
+        upd_btn_layout.addWidget(self.download_upd_btn)
+        upd_layout.addLayout(upd_btn_layout)
+
+        self.auto_upd_cb = QCheckBox("Automatically check for updates on startup")
+        self.auto_upd_cb.setChecked(getattr(cfg, "auto_update_check", True))
+        upd_layout.addWidget(self.auto_upd_cb)
+
+        tabs.addTab(tab_updates, "Updates")
+
+        if self.updater:
+            self.updater.add_listener(self._on_updater_signal)
+            if self.updater.latest_info:
+                self._update_ui_state("available", info=self.updater.latest_info)
+            elif self.updater.status == "downloaded":
+                self._update_ui_state("downloaded", path=self.updater.downloaded_path)
+            elif self.updater.status == "up-to-date":
+                self._update_ui_state("up-to-date")
+
         # Bottom Buttons
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Save & Apply")
@@ -462,6 +549,69 @@ class SettingsWindow(QDialog):
         self.cal_timer.timeout.connect(self._update_cal_telemetry)
         self.cal_timer.start(100)
 
+    def _on_updater_signal(self, state, **kwargs):
+        QTimer.singleShot(0, lambda: self._update_ui_state(state, **kwargs))
+
+    def _update_ui_state(self, state, **kwargs):
+        if state == "checking":
+            self.check_upd_btn.setEnabled(False)
+            self.upd_status.setText("Checking GitHub for the latest release...")
+        elif state == "available":
+            info = kwargs.get("info", {})
+            ver = info.get("version", "Latest")
+            name = info.get("name", ver)
+            body = info.get("body", "No release notes.")
+            self.latest_label.setText(f"Latest Available:  {ver} ({name})")
+            self.release_notes.setPlainText(body)
+            self.upd_status.setText(f"Update {ver} is ready for download!")
+            self.download_upd_btn.setEnabled(True)
+            self.download_upd_btn.setText("Download & Restart")
+            self.check_upd_btn.setEnabled(True)
+        elif state == "up-to-date":
+            self.latest_label.setText(f"Latest Available:  v{APP_VERSION} (Up to date)")
+            self.upd_status.setText(f"Jarvis is up to date (v{APP_VERSION}).")
+            self.check_upd_btn.setEnabled(True)
+            self.download_upd_btn.setEnabled(False)
+        elif state == "downloading":
+            pct = kwargs.get("percent", 0)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(pct)
+            self.download_upd_btn.setEnabled(False)
+            self.download_upd_btn.setText(f"Downloading {pct}%...")
+            self.upd_status.setText(f"Downloading update: {pct}% complete")
+        elif state == "downloaded":
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(100)
+            self.download_upd_btn.setEnabled(True)
+            self.download_upd_btn.setText("Restart Now to Apply")
+            self.upd_status.setText("Download complete! Click 'Restart Now to Apply'.")
+        elif state == "error":
+            msg = kwargs.get("message", "Unknown error")
+            self.upd_status.setText(f"Update error: {msg}")
+            self.check_upd_btn.setEnabled(True)
+            self.download_upd_btn.setEnabled(False)
+
+    def _manual_check_updates(self):
+        if self.updater:
+            self.check_upd_btn.setEnabled(False)
+            self.upd_status.setText("Checking GitHub for updates...")
+            self.updater.check_async(notify_if_latest=True)
+        else:
+            self.upd_status.setText("Updater is not initialized.")
+
+    def _start_download_update(self):
+        if not self.updater:
+            return
+        if self.updater.status == "downloaded" or (self.updater.downloaded_path and os.path.exists(self.updater.downloaded_path)):
+            self.upd_status.setText("Applying update and restarting...")
+            self.updater.apply_update_and_restart()
+        else:
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.download_upd_btn.setEnabled(False)
+            self.download_upd_btn.setText("Starting download...")
+            self.updater.download_async()
+
     def _update_cal_telemetry(self):
         st = self.ctx.engine.status(time.time())
         dbg = st.get("debug")
@@ -476,7 +626,6 @@ class SettingsWindow(QDialog):
         if dbg:
             ti = dbg.get("pinch_ti", 0.0)
             if ti > 0.05:
-                # Set pinch_down slightly above the measured contact distance for easy activation
                 new_down = round(ti + 0.04, 2)
                 self.pinch_slider.setValue(int(new_down * 100))
                 self.cal_status.setText(f"Calibrated! Pinch threshold set to {new_down:.2f}")
@@ -493,6 +642,9 @@ class SettingsWindow(QDialog):
         self.cfg.scroll_invert = self.scroll_inv_cb.isChecked()
         self.cfg.voice_enabled = self.voice_cb.isChecked()
         self.cfg.speak = self.tts_cb.isChecked()
+        self.cfg.auto_update_check = self.auto_upd_cb.isChecked()
+        if self.updater:
+            self.updater.auto_check = self.cfg.auto_update_check
 
         # Persist to jarvis_config.json
         cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
@@ -507,6 +659,7 @@ class SettingsWindow(QDialog):
                 "scroll_invert": self.cfg.scroll_invert,
                 "voice_enabled": self.cfg.voice_enabled,
                 "speak": self.cfg.speak,
+                "auto_update_check": self.cfg.auto_update_check,
             }
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
@@ -546,11 +699,39 @@ class JarvisTray(QSystemTrayIcon):
         settings_action.triggered.connect(self.mgr.open_settings)
 
         menu.addSeparator()
+        self.update_action = menu.addAction("Check for Updates...")
+        self.update_action.triggered.connect(self._on_tray_update_clicked)
+
+        menu.addSeparator()
         quit_action = menu.addAction("Quit Jarvis")
         quit_action.triggered.connect(self.mgr.quit_app)
 
         self.setContextMenu(menu)
         self.show()
+
+    def _on_tray_update_clicked(self):
+        updater = getattr(self.mgr, "updater", None)
+        if updater and (updater.status == "downloaded" or (updater.downloaded_path and os.path.exists(updater.downloaded_path))):
+            updater.apply_update_and_restart()
+        elif updater and updater.status == "available":
+            self.mgr.open_settings(initial_tab=2)
+        elif updater:
+            updater.check_async(notify_if_latest=True)
+            self.mgr.open_settings(initial_tab=2)
+        else:
+            self.mgr.open_settings(initial_tab=2)
+
+    def on_update_state(self, state, **kwargs):
+        if state == "available":
+            ver = kwargs.get("info", {}).get("version", "New")
+            self.update_action.setText(f"Update Available ({ver}) — Install")
+        elif state == "downloaded":
+            self.update_action.setText("Restart Jarvis to Update")
+        elif state == "up-to-date":
+            self.update_action.setText("Jarvis is Up to Date")
+        elif state == "downloading":
+            pct = kwargs.get("percent", 0)
+            self.update_action.setText(f"Downloading Update ({pct}%)...")
 
     def _create_icon(self):
         pm = QPixmap(32, 32)
@@ -583,6 +764,7 @@ class Overlay:
         self.stop = stop_event
         self.cfg = cfg
         self.ctx = ctx
+        self.updater = None
         self.q = queue.Queue()
         self.settings_dlg = None
 
@@ -611,11 +793,16 @@ class Overlay:
         else:
             self.root.mainloop()
 
-    def open_settings(self):
+    def open_settings(self, initial_tab=0):
         if PYSIDE6_AVAILABLE and self.cfg and self.ctx:
             if self.settings_dlg is None or not self.settings_dlg.isVisible():
-                self.settings_dlg = SettingsWindow(self.cfg, self.ctx)
+                self.settings_dlg = SettingsWindow(self.cfg, self.ctx, updater=self.updater)
+                self.settings_dlg.tabs.setCurrentIndex(initial_tab)
                 self.settings_dlg.show()
+                self.settings_dlg.raise_()
+                self.settings_dlg.activateWindow()
+            else:
+                self.settings_dlg.tabs.setCurrentIndex(initial_tab)
                 self.settings_dlg.raise_()
                 self.settings_dlg.activateWindow()
 
@@ -644,6 +831,10 @@ class Overlay:
                 elif kind == "error":
                     self.island.error_text = d.get("text", "ERROR")
                     self.island.error_until = now + 5.0
+                elif kind == "updater":
+                    state = d.get("state")
+                    if hasattr(self, "tray") and self.tray:
+                        self.tray.on_update_state(state, **d)
         except queue.Empty:
             pass
 

@@ -43,6 +43,9 @@ class Config:
     wake_aliases: list = field(default_factory=lambda: ["jarvis", "jarvas", "jervis", "gervais"])
     command_window: float = 6.0         # seconds Jarvis keeps listening after "Jarvis?"
 
+    # --- updates ---
+    auto_update_check: bool = True      # automatically check for GitHub releases on startup
+
 
 def load_config(path=None):
     cfg = Config()
