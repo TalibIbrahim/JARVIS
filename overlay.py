@@ -31,7 +31,8 @@ try:
         QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
         QLabel, QSlider, QCheckBox, QPushButton, QComboBox,
         QGroupBox, QSystemTrayIcon, QMenu, QStackedWidget,
-        QListWidget, QListWidgetItem, QScrollArea, QFrame, QProgressBar
+        QListWidget, QListWidgetItem, QScrollArea, QFrame, QProgressBar,
+        QLineEdit
     )
     PYSIDE6_AVAILABLE = True
 except ImportError:
@@ -41,7 +42,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.1.1"
+    APP_VERSION = "1.2.0"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -50,6 +51,23 @@ except ImportError:
     find_best_microphone = lambda cfg=None: (None, "Default Microphone")
     probe_mic_level = lambda dev=None: (0.0, 0.0)
     test_microphone_recognition = lambda dev=None: {"success": False, "error": "Voice module unavailable"}
+
+try:
+    from ai import (
+        get_api_key,
+        set_api_key,
+        delete_api_key,
+        GroqClient,
+        DEFAULT_LLM_MODEL,
+        DEFAULT_STT_MODEL,
+    )
+except ImportError:
+    get_api_key = lambda: None
+    set_api_key = lambda k: None
+    delete_api_key = lambda: None
+    GroqClient = None
+    DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
+    DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
 
 
 def get_app_icon():
@@ -240,6 +258,8 @@ class AppleDynamicIsland(QWidget):
         self.error_text = ""
         self.error_until = 0.0
         self.precision_active = False
+        self.thinking = False
+        self.is_ai_error = False
 
         self.t0 = time.time()
         self.last_frame_t = time.time()
@@ -283,11 +303,14 @@ class AppleDynamicIsland(QWidget):
         # Target dimensions based on Apple HIG layout
         is_error = now < self.error_until
         is_speaking = now < self.say_until
+        is_thinking = self.thinking
         is_listening = now < self.listening_until
         is_gesture = self.label in ("CLICK", "DOUBLE CLICK", "DRAG", "DROP", "RIGHT CLICK", "ZOOM IN", "ZOOM OUT", "SCROLL")
 
         if is_error:
             tw, th = 340.0, 46.0
+        elif is_thinking:
+            tw, th = 260.0, 42.0
         elif is_speaking:
             tw, th = 380.0, 52.0
         elif is_listening:
@@ -324,6 +347,7 @@ class AppleDynamicIsland(QWidget):
         is_speaking = now < self.say_until
         is_listening = now < self.listening_until
         is_error = now < self.error_until
+        is_thinking = self.thinking
 
         # 1. Soft Multi-Layered Drop Shadow
         pill_rect = QRectF(2, -18, w - 4, h + 16)
@@ -356,8 +380,16 @@ class AppleDynamicIsland(QWidget):
         # 4. 1 px Inner Highlight Stroke (Top light reflection, bottom occlusion)
         border_grad = QLinearGradient(0, -18, 0, h)
         if is_error:
-            border_grad.setColorAt(0.0, QColor("#ff453a"))
-            border_grad.setColorAt(1.0, QColor("#d70015"))
+            if self.is_ai_error:
+                border_grad.setColorAt(0.0, QColor("#ff9f0a"))
+                border_grad.setColorAt(1.0, QColor("#d97706"))
+            else:
+                border_grad.setColorAt(0.0, QColor("#ff453a"))
+                border_grad.setColorAt(1.0, QColor("#d70015"))
+        elif is_thinking:
+            pulse_a = int(120 + 80 * math.sin(t * 6.0))
+            border_grad.setColorAt(0.0, QColor(255, 255, 255, pulse_a))
+            border_grad.setColorAt(1.0, QColor(0, 0, 0, 60))
         elif self.dark_mode:
             border_grad.setColorAt(0.0, QColor(255, 255, 255, 65))
             border_grad.setColorAt(1.0, QColor(0, 0, 0, 75))
@@ -378,7 +410,11 @@ class AppleDynamicIsland(QWidget):
         dot_r = 4.0
 
         if is_error:
-            dot_col = QColor("#ff453a")
+            dot_col = QColor("#ff9f0a" if self.is_ai_error else "#ff453a")
+        elif is_thinking:
+            pulse = 0.5 + 0.5 * math.sin(t * 6.0)
+            dot_col = accent
+            dot_r = 3.5 + 1.5 * pulse
         elif self.active:
             dot_col = QColor("#30d158")  # Apple Emerald Green
         else:
@@ -410,12 +446,29 @@ class AppleDynamicIsland(QWidget):
         else:
             # Expanded Active Mode
             if is_error:
-                p.setPen(QColor("#ff453a"))
+                p.setPen(QColor("#ff9f0a" if self.is_ai_error else "#ff453a"))
                 p.drawText(int(tx), int(cy - 2), "Jarvis")
                 font_sub = QFont("Segoe UI", 8)
                 p.setFont(font_sub)
                 p.setPen(text_primary)
-                p.drawText(int(tx), int(cy + 11), self.error_text or "Camera Feed Lost")
+                p.drawText(int(tx), int(cy + 11), self.error_text or "Error")
+
+            elif is_thinking:
+                p.setPen(accent)
+                p.drawText(int(tx), int(cy - 2), "Jarvis")
+                font_sub = QFont("Segoe UI", 8)
+                p.setFont(font_sub)
+                p.setPen(text_primary)
+                p.drawText(int(tx), int(cy + 11), "Thinking…")
+
+                # Subtle animated pulse indicators on right
+                rx = w - 42.0
+                for i in range(3):
+                    phase = t * 5.0 - i * 0.9
+                    alpha = int(70 + 185 * max(0.0, math.sin(phase)))
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QBrush(QColor(accent.red(), accent.green(), accent.blue(), alpha)))
+                    p.drawEllipse(QPointF(rx + i * 8, cy), 2.5, 2.5)
 
             elif is_speaking:
                 p.setPen(accent)
@@ -848,6 +901,17 @@ class SettingsWindow(QDialog):
                 padding: 4px 10px;
                 font-size: 12px;
             }
+            QLineEdit {
+                background-color: #1c1c1e;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 6px;
+                color: #f5f5f7;
+                padding: 4px 10px;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #007aff;
+            }
         """)
 
         main_layout = QHBoxLayout(self)
@@ -884,6 +948,7 @@ class SettingsWindow(QDialog):
             ("Gestures", "Gestures"),
             ("Pointer", "Pointer & Dwell"),
             ("Voice", "Voice"),
+            ("AI", "AI"),
             ("Display", "Display"),
             ("About", "About")
         ]
@@ -902,10 +967,26 @@ class SettingsWindow(QDialog):
         self._build_gestures_page()
         self._build_pointer_page()
         self._build_voice_page()
+        self._build_ai_page()
         self._build_display_page()
         self._build_about_page()
 
         self.sidebar.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.sidebar.setCurrentRow(0)
+
+    def select_tab(self, tab):
+        """Selects tab by integer index or case-insensitive category string."""
+        if isinstance(tab, int):
+            if 0 <= tab < self.sidebar.count():
+                self.sidebar.setCurrentRow(tab)
+            return
+        if isinstance(tab, str):
+            tab_lower = tab.strip().lower()
+            for i in range(self.sidebar.count()):
+                item = self.sidebar.item(i)
+                if item and str(item.data(Qt.ItemDataRole.UserRole)).strip().lower() == tab_lower:
+                    self.sidebar.setCurrentRow(i)
+                    return
         self.sidebar.setCurrentRow(0)
 
     def _build_page_container(self, title, subtitle):
@@ -1270,6 +1351,207 @@ class SettingsWindow(QDialog):
         self.mic_timer.timeout.connect(update_mic_level)
         self.mic_timer.start()
 
+    def _build_ai_page(self):
+        page, layout = self._build_page_container("AI & Intelligence", "Groq speech-to-text and intelligent voice assistant")
+
+        # 1. AI Enablement & API Key Card
+        card_general = GroupedCard()
+
+        sw_ai = AppleSwitch(getattr(self.cfg, "ai_enabled", False))
+        sw_ai.toggled.connect(lambda v: self._save("ai_enabled", v))
+        card_general.add_row("Enable AI", "Use Groq cloud for speech recognition and responses", sw_ai)
+
+        # Masked API Key Row
+        key_widget = QWidget()
+        key_vlayout = QVBoxLayout(key_widget)
+        key_vlayout.setContentsMargins(0, 0, 0, 0)
+        key_vlayout.setSpacing(6)
+
+        key_hlayout = QHBoxLayout()
+        key_hlayout.setSpacing(8)
+
+        self.key_input = QLineEdit()
+        self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_input.setPlaceholderText("gsk_...")
+        self.key_input.setFixedWidth(200)
+
+        existing_key = get_api_key() or ""
+        if existing_key:
+            self.key_input.setText(existing_key)
+
+        btn_toggle_key = QPushButton("Show")
+        btn_toggle_key.setFixedWidth(54)
+
+        def toggle_key_mask():
+            if self.key_input.echoMode() == QLineEdit.EchoMode.Password:
+                self.key_input.setEchoMode(QLineEdit.EchoMode.Normal)
+                btn_toggle_key.setText("Hide")
+            else:
+                self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
+                btn_toggle_key.setText("Show")
+
+        btn_toggle_key.clicked.connect(toggle_key_mask)
+
+        btn_save_key = QPushButton("Save")
+        btn_save_key.setFixedWidth(54)
+
+        btn_remove_key = QPushButton("Remove")
+        btn_remove_key.setFixedWidth(64)
+
+        key_hlayout.addWidget(self.key_input)
+        key_hlayout.addWidget(btn_toggle_key)
+        key_hlayout.addWidget(btn_save_key)
+        key_hlayout.addWidget(btn_remove_key)
+        key_vlayout.addLayout(key_hlayout)
+
+        lbl_key_status = QLabel("")
+        lbl_key_status.setStyleSheet("font-size: 11px; color: #30d158;")
+        key_vlayout.addWidget(lbl_key_status)
+
+        lbl_link = QLabel('<a href="https://console.groq.com/keys" style="color:#007aff; text-decoration:none;">Get a free key at console.groq.com</a>')
+        lbl_link.setOpenExternalLinks(True)
+        lbl_link.setStyleSheet("font-size: 11px;")
+        key_vlayout.addWidget(lbl_link)
+
+        def save_key_action():
+            val = self.key_input.text().strip()
+            if val:
+                set_api_key(val)
+                lbl_key_status.setText("API key saved securely to Windows Credential Manager.")
+                lbl_key_status.setStyleSheet("font-size: 11px; color: #30d158;")
+            else:
+                delete_api_key()
+                lbl_key_status.setText("Empty key removed.")
+                lbl_key_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
+
+        def remove_key_action():
+            delete_api_key()
+            self.key_input.clear()
+            lbl_key_status.setText("API key removed from Windows Credential Manager.")
+            lbl_key_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
+
+        btn_save_key.clicked.connect(save_key_action)
+        btn_remove_key.clicked.connect(remove_key_action)
+
+        card_general.add_row("Groq API Key", "Stored in Windows Credential Manager (never logged or saved to disk)", key_widget)
+        layout.addWidget(card_general)
+
+        # 2. Models & Connectivity Card
+        card_models = GroupedCard()
+
+        # LLM Model dropdown
+        self.llm_combo = QComboBox()
+        default_llms = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"]
+        cur_llm = getattr(self.cfg, "ai_llm_model", "llama-3.1-8b-instant")
+        if cur_llm not in default_llms:
+            default_llms.insert(0, cur_llm)
+        for m in default_llms:
+            self.llm_combo.addItem(m)
+        self.llm_combo.setCurrentText(cur_llm)
+        self.llm_combo.currentTextChanged.connect(lambda v: self._save("ai_llm_model", v))
+        card_models.add_row("Language Model", "Model for command interpretation and conversational responses", self.llm_combo)
+
+        # Speech Model dropdown
+        self.stt_combo = QComboBox()
+        default_stts = ["whisper-large-v3-turbo", "whisper-large-v3"]
+        cur_stt = getattr(self.cfg, "ai_stt_model", "whisper-large-v3-turbo")
+        if cur_stt not in default_stts:
+            default_stts.insert(0, cur_stt)
+        for m in default_stts:
+            self.stt_combo.addItem(m)
+        self.stt_combo.setCurrentText(cur_stt)
+        self.stt_combo.currentTextChanged.connect(lambda v: self._save("ai_stt_model", v))
+        card_models.add_row("Speech Model", "Whisper model for audio speech-to-text", self.stt_combo)
+
+        # Test Connection Row
+        test_widget = QWidget()
+        test_vbox = QVBoxLayout(test_widget)
+        test_vbox.setContentsMargins(0, 0, 0, 0)
+        test_vbox.setSpacing(6)
+
+        test_hbox = QHBoxLayout()
+        test_hbox.setSpacing(10)
+        btn_test_conn = QPushButton("Test Connection")
+        lbl_conn_status = QLabel("Ready to test")
+        lbl_conn_status.setStyleSheet("font-size: 11px; color: #8e8e93;")
+        test_hbox.addWidget(btn_test_conn)
+        test_hbox.addWidget(lbl_conn_status)
+        test_hbox.addStretch()
+        test_vbox.addLayout(test_hbox)
+
+        def run_test_connection():
+            key_to_test = self.key_input.text().strip() or get_api_key()
+            if not key_to_test:
+                lbl_conn_status.setText("No API key entered")
+                lbl_conn_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
+                return
+
+            btn_test_conn.setEnabled(False)
+            lbl_conn_status.setText("Testing connection...")
+            lbl_conn_status.setStyleSheet("font-size: 11px; color: #007aff;")
+
+            def worker():
+                import threading
+                client = GroqClient(api_key=key_to_test, timeout=8)
+                ok, message = client.validate_key()
+                models_data = None
+                if ok:
+                    try:
+                        models_data = client.get_categorized_models()
+                    except Exception:
+                        pass
+
+                def update_test_ui():
+                    btn_test_conn.setEnabled(True)
+                    if ok:
+                        lbl_conn_status.setText(f"Connected: {message}")
+                        lbl_conn_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #30d158;")
+                        if models_data:
+                            cur_l = self.llm_combo.currentText()
+                            self.llm_combo.blockSignals(True)
+                            self.llm_combo.clear()
+                            for lm in models_data.get("llm", []):
+                                self.llm_combo.addItem(lm)
+                            if cur_l in models_data.get("llm", []):
+                                self.llm_combo.setCurrentText(cur_l)
+                            self.llm_combo.blockSignals(False)
+
+                            cur_s = self.stt_combo.currentText()
+                            self.stt_combo.blockSignals(True)
+                            self.stt_combo.clear()
+                            for sm in models_data.get("stt", []):
+                                self.stt_combo.addItem(sm)
+                            if cur_s in models_data.get("stt", []):
+                                self.stt_combo.setCurrentText(cur_s)
+                            self.stt_combo.blockSignals(False)
+                    else:
+                        lbl_conn_status.setText(f"Failed: {message}")
+                        lbl_conn_status.setStyleSheet("font-size: 11px; font-weight: 500; color: #ff9f0a;")
+
+                QTimer.singleShot(0, update_test_ui)
+
+            import threading
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn_test_conn.clicked.connect(run_test_connection)
+        card_models.add_row("Connectivity", "Validate Groq API connection and refresh model directory", test_widget)
+        layout.addWidget(card_models)
+
+        # 3. Privacy Card
+        card_privacy = GroupedCard()
+        lbl_privacy = QLabel(
+            "Privacy Notice:\n"
+            "Audio utterances and conversational text are sent to Groq cloud services only while AI is enabled. "
+            "All API keys are stored exclusively in the Windows Credential Manager and are never written to configuration files, logs, or crash reports."
+        )
+        lbl_privacy.setStyleSheet("font-size: 11px; color: #8e8e93; line-height: 1.4;")
+        lbl_privacy.setWordWrap(True)
+        card_privacy.add_row("Data Privacy", "", lbl_privacy)
+        layout.addWidget(card_privacy)
+
+        layout.addStretch()
+        self.stack.addWidget(page)
+
     def _build_display_page(self):
         page, layout = self._build_page_container("Display & Materials", "Liquid glass appearance and animations")
         card = GroupedCard()
@@ -1358,6 +1640,9 @@ class SettingsWindow(QDialog):
         subprocess.Popen([python_exe, "tests/target_practice.py", "--gui"])
 
     def _save(self, key, value):
+        # Strict safeguard: Never write any API key, token, or secret to config file
+        if any(s in key.lower() for s in ("key", "secret", "token", "password")):
+            return
         setattr(self.cfg, key, value)
         cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
         try:
@@ -1517,12 +1802,12 @@ class Overlay:
         if PYSIDE6_AVAILABLE and self.cfg and self.ctx:
             if self.settings_dlg is None or not self.settings_dlg.isVisible():
                 self.settings_dlg = SettingsWindow(self.cfg, self.ctx, updater=self.updater)
-                self.settings_dlg.sidebar.setCurrentRow(initial_tab)
+                self.settings_dlg.select_tab(initial_tab)
                 self.settings_dlg.show()
                 self.settings_dlg.raise_()
                 self.settings_dlg.activateWindow()
             else:
-                self.settings_dlg.sidebar.setCurrentRow(initial_tab)
+                self.settings_dlg.select_tab(initial_tab)
                 self.settings_dlg.raise_()
                 self.settings_dlg.activateWindow()
 
@@ -1549,9 +1834,16 @@ class Overlay:
                 elif kind == "listening":
                     self.island.listening = True
                     self.island.listening_until = d.get("until", now + 5.0)
+                elif kind == "thinking":
+                    self.island.thinking = d.get("active", True)
+                elif kind == "ai_error":
+                    self.island.error_text = d.get("text", "AI Error")
+                    self.island.error_until = now + 4.5
+                    self.island.is_ai_error = True
                 elif kind == "error":
                     self.island.error_text = d.get("text", "Error")
                     self.island.error_until = now + 5.0
+                    self.island.is_ai_error = False
                 elif kind == "cursor_dwell":
                     self.cursor_overlay.update_dwell(d)
         except queue.Empty:

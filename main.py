@@ -41,6 +41,12 @@ class Context:
         self.speaker.say(text)
 
     def set_active(self, want):
+        if want is False:
+            try:
+                from ai import reset_ai_history
+                reset_ai_history()
+            except Exception:
+                pass
         if want is None:
             self.engine.request_toggle()
         else:

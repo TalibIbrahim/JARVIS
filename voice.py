@@ -17,6 +17,15 @@ import time
 import numpy as np
 
 from commands import run_command
+from ai import (
+    get_api_key,
+    GroqClient,
+    AuthenticationError,
+    RateLimitError,
+    OfflineError,
+    TimeoutError,
+    AIError,
+)
 
 
 def list_microphones():
@@ -289,6 +298,7 @@ class Voice(threading.Thread):
         self.audio_q = queue.Queue(maxsize=3)
         self.current_mic_index = None
         self.current_mic_name = "Auto"
+        self.groq_cooldown_until = 0.0
 
     def run(self):
         try:
@@ -357,6 +367,25 @@ class Voice(threading.Thread):
                 time.sleep(0.5)
                 continue
 
+    def _fallback_google(self, recognizer, audio, sr):
+        """Falls back to Google SpeechRecognition if Groq is unavailable."""
+        try:
+            print("[voice] Falling back to Google SpeechRecognition...")
+            text = recognizer.recognize_google(audio)
+            print(f"[voice] Google Heard: \"{text}\"")
+            return text
+        except sr.UnknownValueError:
+            print("[voice] (Audio captured, but speech could not be understood)")
+            return None
+        except sr.RequestError as re_err:
+            print(f"[voice] Google speech service error: {re_err}")
+            self.ctx.say("The speech service is unreachable, sir.")
+            time.sleep(4)
+            return None
+        except Exception as exc:
+            print(f"[voice] Google recognition error: {exc}")
+            return None
+
     def _recognition_worker(self, recognizer, sr):
         while not self.stop.is_set():
             try:
@@ -364,23 +393,68 @@ class Voice(threading.Thread):
             except queue.Empty:
                 continue
 
-            try:
-                print("[voice] Audio captured, recognizing...")
-                text = recognizer.recognize_google(audio)
-                print(f"[voice] Heard: \"{text}\"")
-            except sr.UnknownValueError:
-                print("[voice] (Audio captured, but speech could not be understood)")
+            # Energy-based VAD validation before sending audio
+            raw_bytes = audio.get_raw_data()
+            if not raw_bytes or len(raw_bytes) < 3200:
                 continue
-            except sr.RequestError as re_err:
-                print(f"[voice] speech service request error: {re_err}")
-                self.ctx.say("The speech service is unreachable, sir.")
-                time.sleep(4)
-                continue
-            except Exception as exc:
-                print(f"[voice] recognition error: {exc}")
-                continue
+            arr = np.frombuffer(raw_bytes, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
+            if rms < 30.0:
+                continue  # Discard silent acoustic flutter to protect quota
 
-            self._process(text)
+            text = None
+            key = get_api_key()
+            ai_enabled = getattr(self.cfg, "ai_enabled", False)
+            now = time.time()
+            use_groq = bool(ai_enabled and key and now >= self.groq_cooldown_until)
+
+            if use_groq:
+                try:
+                    # Convert in-memory audio chunk to 16 kHz mono WAV (zero temp files)
+                    wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+                    stt_model = getattr(self.cfg, "ai_stt_model", "whisper-large-v3-turbo")
+                    timeout = getattr(self.cfg, "ai_timeout", 10)
+                    client = GroqClient(api_key=key, timeout=timeout)
+                    print(f"[voice] Transcribing complete utterance via Groq Whisper ({stt_model})...")
+                    text = client.transcribe(wav_bytes, model=stt_model, language="en")
+                    print(f"[voice] Groq Heard: \"{text}\"")
+                    # Clear any prior cooldown
+                    self.groq_cooldown_until = 0.0
+                except AuthenticationError as auth_err:
+                    print(f"[voice] Groq key authentication failed: {auth_err}")
+                    if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+                        try:
+                            self.ctx.overlay.post("ai_error", text="Invalid Groq Key")
+                        except Exception:
+                            pass
+                    text = self._fallback_google(recognizer, audio, sr)
+                except RateLimitError as rl_err:
+                    print(f"[voice] Groq rate limit: {rl_err}")
+                    wait_sec = rl_err.retry_after if rl_err.retry_after else 10.0
+                    self.groq_cooldown_until = time.time() + wait_sec
+                    if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+                        try:
+                            self.ctx.overlay.post("ai_error", text="Groq Rate Limited")
+                        except Exception:
+                            pass
+                    text = self._fallback_google(recognizer, audio, sr)
+                except (OfflineError, TimeoutError) as net_err:
+                    print(f"[voice] Groq network offline/timeout: {net_err}")
+                    self.groq_cooldown_until = time.time() + 15.0
+                    if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+                        try:
+                            self.ctx.overlay.post("ai_error", text="Groq Offline")
+                        except Exception:
+                            pass
+                    text = self._fallback_google(recognizer, audio, sr)
+                except Exception as exc:
+                    print(f"[voice] Groq error ({exc}), falling back to Google...")
+                    text = self._fallback_google(recognizer, audio, sr)
+            else:
+                text = self._fallback_google(recognizer, audio, sr)
+
+            if text:
+                self._process(text)
 
     def _process(self, text):
         t = text.lower().strip()

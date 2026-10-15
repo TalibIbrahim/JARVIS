@@ -99,6 +99,14 @@ class Config:
     # --- updates ---
     auto_update_check: bool = True      # automatically check for GitHub releases on startup
 
+    # --- ai / groq intelligence ---
+    ai_enabled: bool = False
+    ai_provider: str = "groq"
+    ai_llm_model: str = "llama-3.1-8b-instant"
+    ai_stt_model: str = "whisper-large-v3-turbo"
+    ai_timeout: int = 10
+    ai_max_history: int = 6
+
 
 def load_config(path=None):
     cfg = Config()

@@ -32,10 +32,16 @@ venv.bak/
 jarvis_config.json
 *.log
 *.tmp
+.env
+*.env
+.env.*
+*.key
+*.secret
 
 # PyInstaller
 *.manifest
 *.spec
+!jarvis.spec
 
 # IDEs
 .vscode/

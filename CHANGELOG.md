@@ -187,4 +187,18 @@
   - Added **Test Microphone & Recognition** interactive test tool in the UI and via CLI `python main.py --test-mic`.
   - Removed all emojis from the GUI, ensuring a clean, polished, first-party Apple HIG aesthetic.
 
+---
+
+### 20. Groq AI Integration (Whisper Speech-to-Text & Intelligent Conversational Responses)
+- **Overview**: Integrated Groq cloud infrastructure (free tier) for ultra-fast, low-latency speech transcription and conversational AI command reasoning.
+- **Key Capabilities**:
+  - **Lightweight Groq Client ([`ai.py`](file:///c:/Programming/Jarvis/ai.py))**: Zero heavy SDKs. Uses plain `requests` with connection pooling, typed exceptions (`AuthenticationError`, `RateLimitError`, `TimeoutError`, `OfflineError`), and sliding-window rate limiting.
+  - **In-Memory 16 kHz Mono WAV Audio VAD**: Validates acoustic speech energy (`rms >= 30.0`) and converts speech chunks in-memory without creating temporary files or continuously streaming.
+  - **Automatic Fallback Pipeline**: Automatically routes to Google SpeechRecognition if no key is configured, network connectivity drops, or HTTP 401/429 errors occur, with dynamic cooldown recovery.
+  - **Local Regex First & Whitelisted Action Execution**: Local commands execute instantly and free of charge. Complex utterances route to the Groq LLM (`llama-3.1-8b-instant`), which replies strictly in JSON mapped to an audited action whitelist. Arbitrary shell or code execution is prevented.
+  - **Secure Credential Storage**: Groq API key is stored exclusively in Windows Credential Manager via `keyring` (under `JARVIS`), with dev fallback to `GROQ_API_KEY`. Secrets are never serialized to `jarvis_config.json`, logs, or crash reports.
+  - **Dynamic Island State Additions**: Added "Thinking" state with subtle pulse animations and animated rhythm cadence dots, plus amber badge alerts (`#ff9f0a`) for API key/rate-limit/network issues.
+  - **macOS System Settings AI Tab**: Added clean Apple HIG configuration tab with enable switch, masked key input, test connection tool with inline status, model selectors, and `"set up ai"` voice command.
+  - **Test Suite Expansion**: Added 41 unit tests in `tests/test_ai.py` (totaling 79 passing tests across the repository).
+
 

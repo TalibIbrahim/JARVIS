@@ -44,23 +44,23 @@ J.A.R.V.I.S. operates on a multi-threaded, lock-free architecture designed so th
 | (Dedicated Thread)  |             | (Dedicated Thread) |                         |
 +---------------------+             +--------------------+                         |
        |                                       |                                   |
-  Latest Frame                               Audio Queue                           |
+  Latest Frame                           VAD 16kHz WAV                             |
        v                                       v                                   |
 +---------------------+             +--------------------+                         |
-|   Tracker Thread    |             | Google Speech API  |                         |
-|  MediaPipe Hands    |             | (Non-blocking HTTP)|                         |
+|   Tracker Thread    |             | Groq Whisper STT / |                         |
+|  MediaPipe Hands    |             | Google SR Fallback |                         |
 +---------------------+             +--------------------+                         |
        |                                       |                                   |
    Landmarks (x,y)                       Command String                            |
        v                                       v                                   |
 +---------------------+             +--------------------+                         |
 |    GestureEngine    |             |    commands.py     |                         |
-| (Pure Python Logic) |             |  (Regex Dispatch)  |                         |
-+---------------------+             +--------------------+                         |
-       |                                       |                                   |
-  Action Events                          Mode Changes /                            |
-  (move, click, drag)                    Spoken Replies                            |
-       |                                       |                                   |
+| (Pure Python Logic) |             | (Regex First ->    |                         |
++---------------------+             |  Groq LLM Fallback)|                         |
+       |                            +--------------------+                         |
+  Action Events                                |                                   |
+  (move, click, drag)                    Mode Changes /                            |
+       |                                 Spoken Replies                            |
        v                                       v                                   |
 +--------------------------------------------------------+                         |
 |                Controller (120+ Hz Thread)             |-------------------------+
@@ -70,7 +70,7 @@ J.A.R.V.I.S. operates on a multi-threaded, lock-free architecture designed so th
 | - Dwell Click State Machine & Radial Menu              |
 +--------------------------------------------------------+
        |
-  Visual Telemetry (Dwell progress, badges, waveforms)
+  Visual Telemetry (Dwell progress, badges, waveforms, thinking pulses)
        v
 +--------------------------------------------------------+
 |             PySide6 GUI (Main / Qt Event Loop)         |
@@ -88,7 +88,7 @@ J.A.R.V.I.S. operates on a multi-threaded, lock-free architecture designed so th
 3. **Tracker Thread**: Runs MediaPipe Hands neural inference. When in standby, throttles to 10 FPS to minimize laptop CPU consumption (<0.15% idle) ([`tracker.py`](file:///c:/Programming/Jarvis/tracker.py)).
 4. **GestureEngine (Synchronous in Tracker)**: Classifies finger ratios and openness scores without OS or camera imports ([`gestures.py`](file:///c:/Programming/Jarvis/gestures.py)).
 5. **Controller Thread**: Dedicated 120+ Hz high-refresh cursor interpolation engine using critically damped exponential smoothing and user32 `SetCursorPos` ([`controller.py`](file:///c:/Programming/Jarvis/controller.py)).
-6. **Voice Recognition Worker Thread**: Continuously reads audio frames from PyAudio and executes Google Speech API recognition on background speech chunks ([`voice.py`](file:///c:/Programming/Jarvis/voice.py)).
+6. **Voice Recognition Worker Thread**: Continuously reads audio frames from PyAudio, performs energy-based VAD, executes Groq Whisper STT (or Google Speech API fallback) on background speech chunks, and queries Groq LLM on worker threads ([`voice.py`](file:///c:/Programming/Jarvis/voice.py), [`ai.py`](file:///c:/Programming/Jarvis/ai.py)).
 7. **Speaker Worker Thread**: Manages a non-blocking queue for `pyttsx3` text-to-speech feedback ([`voice.py`](file:///c:/Programming/Jarvis/voice.py)).
 8. **AutoUpdater Thread**: Background check against GitHub Releases API every 4 hours ([`updater.py`](file:///c:/Programming/Jarvis/updater.py)).
 9. **Global Hotkeys Thread**: Uses `pynput.keyboard.GlobalHotKeys` to register `Ctrl+Alt+J` (toggle active/standby) and `Ctrl+Alt+Q` (quit) ([`main.py`](file:///c:/Programming/Jarvis/main.py)).
@@ -105,18 +105,20 @@ J.A.R.V.I.S. operates on a multi-threaded, lock-free architecture designed so th
 | [`tracker.py`](file:///c:/Programming/Jarvis/tracker.py) | OpenCV threaded capture (`FrameGrabber`), MediaPipe Hands inference pipeline, camera resolution and MJPG setup, CPU standby throttling, and OpenCV HUD telemetry debug window. |
 | [`filters.py`](file:///c:/Programming/Jarvis/filters.py) | Mathematical filters: One Euro adaptive low-pass filter (`OneEuro`, `OneEuroPoint`), and smooth linear attenuation deadzone filter (`DeadzoneFilter`). |
 | [`dwell.py`](file:///c:/Programming/Jarvis/dwell.py) | Pure-logic Kinect-style hover-to-click state machine. Dwell timing, anti-repeat latching, stationarity radius checks, and 5-action radial menu directional resolver. |
-| [`overlay.py`](file:///c:/Programming/Jarvis/overlay.py) | PySide6 Apple HIG Dynamic Island overlay, native Windows 11 Acrylic blur (`DwmSetWindowAttribute`), continuous squircle curves, critically damped spring physics, cursor dwell ring overlay, macOS System Settings dialog, and taskbar tray icon. |
-| [`voice.py`](file:///c:/Programming/Jarvis/voice.py) | Voice recognition subsystem. Hardware microphone probing and auto-selection, live RMS volume level probing, SpeechRecognition background worker, and `pyttsx3` TTS speaker queue. |
-| [`commands.py`](file:///c:/Programming/Jarvis/commands.py) | Local voice command directory. Exact regex word-boundary matching for app launching, media keys, volume control, desktop navigation, updates, and mode toggles. |
-| [`config.py`](file:///c:/Programming/Jarvis/config.py) | Dataclass configuration schema with all default parameters and JSON loader/saver for [`jarvis_config.json`](file:///c:/Programming/Jarvis/jarvis_config.json). |
+| [`overlay.py`](file:///c:/Programming/Jarvis/overlay.py) | PySide6 Apple HIG Dynamic Island overlay, native Windows 11 Acrylic blur (`DwmSetWindowAttribute`), continuous squircle curves, critically damped spring physics, cursor dwell ring overlay, macOS System Settings dialog (including AI intelligence tab), and taskbar tray icon. |
+| [`voice.py`](file:///c:/Programming/Jarvis/voice.py) | Voice recognition subsystem. Hardware microphone probing and auto-selection, live RMS volume level probing, energy-based VAD, Groq Whisper STT with automatic Google Speech API fallback, and `pyttsx3` TTS speaker queue. |
+| [`commands.py`](file:///c:/Programming/Jarvis/commands.py) | Voice command directory. Exact regex word-boundary matching first for instant local actions, with intelligent Groq LLM fallback for conversational responses and action reasoning. |
+| [`ai.py`](file:///c:/Programming/Jarvis/ai.py) | Groq AI cloud integration module. Plain `requests` client for Groq's OpenAI-compatible API (`GroqClient`), Windows Credential Manager (`keyring`) key storage with dev env fallback, free-tier sliding window rate limiter, Whisper transcription, low-latency chat completions, and action whitelist dispatcher. |
+| [`config.py`](file:///c:/Programming/Jarvis/config.py) | Dataclass configuration schema with all default parameters (including AI settings) and JSON loader/saver for [`jarvis_config.json`](file:///c:/Programming/Jarvis/jarvis_config.json). Secrets are never written to disk. |
 | [`updater.py`](file:///c:/Programming/Jarvis/updater.py) | Discord-style background auto-updater. Checks GitHub Releases API, downloads assets with progress reporting, and runs detached PowerShell replacer for atomic in-place updates. |
 | [`diagnose.py`](file:///c:/Programming/Jarvis/diagnose.py) | Comprehensive diagnostic benchmark tool. Evaluates resting jitter across 7 anchor points, pre-click drift, camera FPS, inference latency, and generates [`diagnose_report.md`](file:///c:/Programming/Jarvis/diagnose_report.md). |
 | [`build_exe.py`](file:///c:/Programming/Jarvis/build_exe.py) | Packaging script for PyInstaller standalone executable builds. |
-| [`jarvis.spec`](file:///c:/Programming/Jarvis/jarvis.spec) | PyInstaller specification file with binary includes, data assets, and icon definitions. |
+| [`jarvis.spec`](file:///c:/Programming/Jarvis/jarvis.spec) | PyInstaller specification file with binary includes, data assets, icon definitions, certifi CA data, and keyring Windows backend hidden imports. |
 | [`tests/test_gestures.py`](file:///c:/Programming/Jarvis/tests/test_gestures.py) | 26 unit tests verifying gesture detection, openness scoring, pose hysteresis, knuckle anchors, lookback buffer, wake/standby rules, and handedness symmetry with synthetic landmarks. |
 | [`tests/test_dwell.py`](file:///c:/Programming/Jarvis/tests/test_dwell.py) | 5 unit tests verifying dwell hover progress, anti-repeat latching, gesture pause handling, and radial menu directional selection. |
 | [`tests/test_single_instance.py`](file:///c:/Programming/Jarvis/tests/test_single_instance.py) | 2 unit tests verifying Win32 single-instance mutex creation and duplicate process rejection. |
 | [`tests/test_updater.py`](file:///c:/Programming/Jarvis/tests/test_updater.py) | 5 unit tests verifying semver version comparison logic and release asset URL matching. |
+| [`tests/test_ai.py`](file:///c:/Programming/Jarvis/tests/test_ai.py) | 41 unit tests verifying Groq API key validation, 401/429/timeout/offline handling, rate limiter, Whisper STT, LLM chat completions, JSON action schema validation, whitelist rejection of unapproved shell calls, Google SR fallback, and history reset. |
 | [`tests/target_practice.py`](file:///c:/Programming/Jarvis/tests/target_practice.py) | Automated and GUI precision benchmarking tool evaluating hit rates on 24x24 px desktop targets. |
 | [`tests/target_practice.html`](file:///c:/Programming/Jarvis/tests/target_practice.html) | Interactive web-based targeting canvas for manual verification of click accuracy. |
 | [`tests/PRECISION_TEST.md`](file:///c:/Programming/Jarvis/tests/PRECISION_TEST.md) | Official precision and accuracy test specification and empirical benchmark logs. |
@@ -223,22 +225,25 @@ All user interface components in J.A.R.V.I.S. adhere strictly to Apple's Human I
   - *Active Tracking*: Expanded pill with neon cyan glow, miniature real-time hand skeleton wireframe, and active status.
   - *Gesture Badges*: Discrete pill badges for Click, Double Click, Drag, Drop, Scroll, and Zoom.
   - *Voice Listening*: Soft pulsing Siri-style cyan/blue waveform.
+  - *Thinking*: Subtle pulsing accent glow with rhythmic 3-dot cadence indicators while awaiting LLM reasoning.
   - *Speaking*: Dancing 5-bar audio waveform displaying assistant response cadence.
-  - *Error*: Amber warning badge for disconnected camera or microphone.
+  - *Error*: Amber warning badge (`#ff9f0a`) for Groq API key/rate-limit/offline errors and disconnected camera/microphone.
 
 ### 2. Cursor Dwell Overlay
 - Click-through transparent widget following the cursor at high refresh rate.
 - Displays an Apple visionOS-inspired circular glass ring that fills radially as the user hovers, followed by a gentle expansion ripple upon completion.
 
 ### 3. macOS System Settings Window
-- Opened via Taskbar System Tray context menu (**Settings & Calibration...**).
+- Opened via Taskbar System Tray context menu (**Settings & Calibration...**) or voice command (*"set up AI"*).
 - Two-column layout: Styled sidebar navigation with inset grouped cards.
 - **Tabs**:
-  1. *Controls*: Tracking mode (Relative / Absolute), Control Scheme (Palm & Fist / Pinch), Dwell Mode (Off / Click / Radial), Dwell Time slider, Pointer Speed, Precision Mode toggle, and Screen Reach Margin.
-  2. *Hand Calibration*: Live real-time visualization of finger extension ratios and pinch distance, with a one-click wizard to calibrate personal hand geometry.
-  3. *Voice & Audio*: Microphone device selection, live real-time audio volume level meter (`QProgressBar`), microphone sensitivity threshold slider, and interactive mic test tool.
-  4. *Updates*: Version comparison, release notes viewer, download progress bar, and "Check for Updates" action.
-  5. *About*: Architecture details, keyboard shortcuts (`Ctrl+Alt+J`, `Ctrl+Alt+Q`), and diagnostics.
+  1. *General*: Video capture device, camera resolution, model complexity, and automatic startup updates.
+  2. *Gestures*: Tracking schemes (Palm & Fist / Pinch), knuckle anchor selection, openness thresholds, and precision mode.
+  3. *Pointer & Dwell*: Tracking mode (Relative / Absolute), Dwell Mode (Off / Click / Radial), Dwell Delay, Deadzone suppression, and Lookback Buffer.
+  4. *Voice*: Physical microphone device selection, live real-time audio volume level meter (`QProgressBar`), trigger sensitivity slider, and microphone diagnostic test tool.
+  5. *AI & Intelligence*: Enable AI switch (`AppleSwitch`), masked Groq API key with show/hide toggle and Save/Remove actions, direct link to `console.groq.com`, LLM model and Speech model dropdowns (dynamically updated from `list_models()`), asynchronous "Test Connection" tool with inline status, and data privacy notice.
+  6. *Display & Materials*: Appearance theme (System Auto / Dark Glass / Light Glass), Acrylic blur toggle, skeleton mini visualizer, and reduce motion toggle.
+  7. *About*: Architecture details, keyboard shortcuts (`Ctrl+Alt+J`, `Ctrl+Alt+Q`), update check action, and precision diagnostics.
 - Custom `AppleSwitch` toggle widgets replicating macOS switches with smooth animated sliding thumbs.
 - **Typography**: 100% free of emojis across all labels, sidebars, and menus for a clean, professional aesthetic.
 
@@ -255,14 +260,21 @@ Many Windows PCs have Virtual Audio Cables installed (e.g. from OBS, VoiceMeeter
   - Prioritizes physical microphone arrays (e.g., Intel SST, Realtek High Definition Audio) with active acoustic energy.
   - Exposes `probe_mic_level()` for the Settings GUI live audio meter.
 
-### Speech Pipeline
+### Speech Pipeline & Intelligence Architecture
 - **Audio Capture**: PyAudio stream reading audio chunks into a thread-safe queue.
-- **Recognition**: SpeechRecognition library utilizing the Google Speech API.
-- **Local Dispatch**: [`commands.py`](file:///c:/Programming/Jarvis/commands.py) parses recognized text using exact word boundary regexes (`\b...\b`), preventing false triggers.
+- **Energy-Based VAD**: Audio chunks are validated using real-time RMS checks (`rms >= 30.0`). Only complete utterances are serialized in memory as 16 kHz mono WAV chunks without temporary files, avoiding unnecessary streaming or burning free-tier quotas.
+- **Dual Speech Recognition Pipeline**:
+  - *Primary (Groq Whisper)*: When `ai_enabled` is true and a Groq key is configured, audio is transcribed using Groq's high-speed Whisper service (`whisper-large-v3-turbo` with language hint `"en"`).
+  - *Automatic Fallback (Google Speech API)*: If no key is set, the network is offline, or the API returns HTTP 401/429, the system automatically routes to Google SpeechRecognition and presents an amber Island error badge. Once connectivity or rate limit cooldown clears, Groq transcription automatically resumes.
+- **Local Dispatch First**: [`commands.py`](file:///c:/Programming/Jarvis/commands.py) always evaluates exact regex word boundary patterns (`\b...\b`) locally first for instant, zero-latency execution.
+- **Groq LLM Intelligence Fallback**: If no local regex matches and AI is enabled, the utterance is submitted to Groq LLM (`llama-3.1-8b-instant`). The system prompt injects dynamic contextual state (time, active/standby status, tracking mode, dwell mode) and enforces JSON action responses (`action`, `args`, `reply`).
+- **Strict Action Whitelisting**: Actions returned by the LLM are validated against a strict whitelist (volume, media controls, whitelist-only app launching, whitelist-only sites, search, screenshot, workstation lock, window controls, mode switches, status). Arbitrary shell execution is impossible. If JSON parsing fails, the assistant speaks the reply text safely.
+- **In-Memory History**: Keeps up to 6 turns of conversation history in volatile RAM only. Resets automatically whenever Jarvis enters standby.
 - **Feedback**: Spoken responses delivered via an isolated background `pyttsx3` text-to-speech worker thread.
 
 ### Voice Command Catalog
 - **Power & Mode**: `"wake up"`, `"go to sleep"`, `"shut down jarvis"`
+- **AI Configuration**: `"set up ai"` (opens AI settings tab)
 - **Pointer & Dwell**: `"dwell on"`, `"dwell off"`, `"dwell menu"`, `"precision mode on/off"`, `"relative mode"`, `"absolute mode"`
 - **Window Management**: `"show desktop"`, `"minimize"`, `"maximize"`, `"switch window"`, `"close window"`, `"lock workstation"`, `"screenshot"`
 - **Media Controls**: `"volume up"`, `"volume down"`, `"mute"`, `"unmute"`, `"play"`, `"pause"`, `"next track"`, `"previous track"`
@@ -313,11 +325,12 @@ Run the test suite with:
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
-- **38 tests passing in ~0.025 seconds**:
+- **79 tests passing in ~0.53 seconds**:
   - `test_gestures.py` (26 tests): Open palm movement, fist clicks, double clicks, drag & drop, neutral zone deadband, wake/standby rules, handedness symmetry, anchor stability.
   - `test_dwell.py` (5 tests): Hover timing, radius bounds, latching, gesture pausing, radial sector selection.
   - `test_single_instance.py` (2 tests): Win32 mutex acquisition and multi-instance rejection.
   - `test_updater.py` (5 tests): Semver comparisons, asset matching, download verification.
+  - `test_ai.py` (41 tests): Groq API key validation (200, 401, 429, timeout, offline), Whisper STT, chat completions, sliding-window rate limiting, action whitelist enforcement, rejection of unauthorized shell calls, keyring credential manager storage with dev env fallback, Google SR fallback on network/quota failure, VAD silence rejection, and multi-turn history reset.
 
 ---
 
@@ -398,6 +411,13 @@ All runtime options can be overridden via `jarvis_config.json` in the root direc
   "mic_energy_threshold": 400,
   "mic_dynamic_energy": true,
 
+  "ai_enabled": false,
+  "ai_provider": "groq",
+  "ai_llm_model": "llama-3.1-8b-instant",
+  "ai_stt_model": "whisper-large-v3-turbo",
+  "ai_timeout": 10,
+  "ai_max_history": 6,
+
   "theme_mode": "auto",
   "glass_blur": true,
   "reduce_motion": false,
@@ -406,6 +426,9 @@ All runtime options can be overridden via `jarvis_config.json` in the root direc
   "auto_update_check": true
 }
 ```
+
+> [!IMPORTANT]
+> **API Key Security**: The Groq API key is **never** written to `jarvis_config.json`, logs, crash reports, or git commits. It is stored securely in the Windows Credential Manager via `keyring` (under service `JARVIS`), with optional fallback to the `GROQ_API_KEY` environment variable during development.
 
 ---
 
