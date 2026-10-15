@@ -109,7 +109,13 @@ def main():
     parser.add_argument("--preview", action="store_true", help="show the camera HUD window")
     parser.add_argument("--no-voice", action="store_true", help="disable voice commands")
     parser.add_argument("--camera", type=int, default=None, help="camera index (default 0)")
+    parser.add_argument("--diagnose", action="store_true", help="run diagnostic jitter, latency, and precision measurement")
     args = parser.parse_args()
+
+    if args.diagnose:
+        from diagnose import run_diagnose
+        run_diagnose()
+        sys.exit(0)
 
     from config import load_config
     from gestures import GestureEngine
@@ -133,6 +139,7 @@ def main():
     speaker.start()
 
     overlay = Overlay(stop, cfg=cfg)
+    controller.set_overlay(overlay)
     ctx = Context(engine, overlay, speaker, stop)
     overlay.ctx = ctx
 

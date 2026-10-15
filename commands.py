@@ -46,6 +46,29 @@ def run_command(text, ctx):
         ctx.set_active(True)
         return "Online. At your service, sir."
 
+    # --- dwell & pointer modes ---
+    if _any(t, "dwell on", "enable dwell", "turn on dwell", "dwell click on"):
+        ctx.engine.cfg.dwell_mode = "click"
+        return "Dwell click enabled, sir."
+    if _any(t, "dwell off", "disable dwell", "turn off dwell", "dwell click off"):
+        ctx.engine.cfg.dwell_mode = "off"
+        return "Dwell click disabled, sir."
+    if _any(t, "dwell menu", "dwell radial", "radial menu on", "radial mode"):
+        ctx.engine.cfg.dwell_mode = "radial"
+        return "Dwell radial menu enabled, sir."
+    if _any(t, "precision mode on", "enable precision", "fine aim on"):
+        ctx.engine.cfg.precision_mode = True
+        return "Precision fine-aim mode enabled, sir."
+    if _any(t, "precision mode off", "disable precision", "fine aim off"):
+        ctx.engine.cfg.precision_mode = False
+        return "Precision fine-aim mode disabled, sir."
+    if _any(t, "relative mode", "trackpad mode"):
+        ctx.engine.cfg.tracking_mode = "relative"
+        return "Relative trackpad mode active, sir."
+    if _any(t, "absolute mode", "screen mode"):
+        ctx.engine.cfg.tracking_mode = "absolute"
+        return "Absolute screen mapping active, sir."
+
     # --- chatter ---
     if t in ("hello", "hi", "hey", "good morning", "good evening", "good afternoon"):
         return "Welcome back, sir."

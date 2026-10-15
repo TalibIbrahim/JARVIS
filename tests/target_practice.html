@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>J.A.R.V.I.S. // 24x24 px Precision Target Practice</title>
+    <style>
+        :root {
+            --bg: #090d16;
+            --surface: rgba(255, 255, 255, 0.05);
+            --border: rgba(255, 255, 255, 0.12);
+            --accent: #007aff;
+            --text: #f5f5f7;
+            --text-dim: #86868b;
+            --success: #34c759;
+            --fail: #ff3b30;
+        }
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            overflow: hidden;
+            user-select: none;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            padding: 16px 24px;
+            background: var(--surface);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 10;
+        }
+        h1 {
+            margin: 0;
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: -0.2px;
+            color: var(--text);
+        }
+        .stats {
+            display: flex;
+            gap: 20px;
+            font-size: 13px;
+            color: var(--text-dim);
+        }
+        .stat-val {
+            color: var(--text);
+            font-weight: 600;
+        }
+        #arena {
+            flex: 1;
+            position: relative;
+            cursor: crosshair;
+        }
+        .target {
+            position: absolute;
+            width: 24px;
+            height: 24px;
+            background: var(--accent);
+            border: 1.5px solid #ffffff;
+            border-radius: 4px;
+            box-shadow: 0 4px 12px rgba(0, 122, 255, 0.35);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transform: translate(-50%, -50%);
+            transition: transform 0.1s ease;
+        }
+        .target::after {
+            content: '';
+            width: 4px;
+            height: 4px;
+            background: #ffffff;
+            border-radius: 50%;
+        }
+        .target:active {
+            transform: translate(-50%, -50%) scale(0.92);
+        }
+        .flash-hit {
+            animation: hitPulse 0.4s ease-out;
+        }
+        @keyframes hitPulse {
+            0% { transform: translate(-50%, -50%) scale(1); box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.8); }
+            100% { transform: translate(-50%, -50%) scale(1.4); box-shadow: 0 0 0 24px rgba(52, 199, 89, 0); opacity: 0; }
+        }
+        #log {
+            position: absolute;
+            bottom: 16px;
+            right: 16px;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(16px);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px 16px;
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+            font-size: 11px;
+            max-height: 180px;
+            width: 280px;
+            overflow-y: auto;
+            color: var(--text-dim);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>J.A.R.V.I.S. // 24x24 px Target Practice</h1>
+            <div style="font-size: 11px; color: var(--text-dim); margin-top: 2px;">Standard browser tab close button & checkbox dimensions</div>
+        </div>
+        <div class="stats">
+            <div>Trial: <span id="trial" class="stat-val">1 / 10</span></div>
+            <div>Score: <span id="score" class="stat-val">0 (0%)</span></div>
+            <div>Avg Distance: <span id="dist" class="stat-val">0.0 px</span></div>
+        </div>
+    </header>
+
+    <div id="arena">
+        <div id="target" class="target"></div>
+        <div id="log"><strong>Target Log:</strong><br></div>
+    </div>
+
+    <script>
+        const target = document.getElementById("target");
+        const arena = document.getElementById("arena");
+        const lblTrial = document.getElementById("trial");
+        const lblScore = document.getElementById("score");
+        const lblDist = document.getElementById("dist");
+        const logBox = document.getElementById("log");
+
+        const TOTAL_TRIALS = 10;
+        let currentTrial = 1;
+        let hits = 0;
+        let distances = [];
+        let curX = 0, curY = 0;
+
+        function spawnTarget() {
+            if (currentTrial > TOTAL_TRIALS) {
+                const pass = hits >= 9;
+                target.style.display = "none";
+                logBox.innerHTML += `<br><span style="color:${pass ? 'var(--success)' : 'var(--fail)'}; font-weight:bold;">${pass ? 'PASS' : 'FAIL'}: ${hits}/${TOTAL_TRIALS} hits (${(hits/TOTAL_TRIALS*100).toFixed(0)}%)</span>`;
+                return;
+            }
+            const pad = 60;
+            const w = arena.clientWidth - pad * 2;
+            const h = arena.clientHeight - pad * 2;
+            curX = pad + Math.random() * w;
+            curY = pad + Math.random() * h;
+            target.style.left = curX + "px";
+            target.style.top = curY + "px";
+            lblTrial.textContent = `${currentTrial} / ${TOTAL_TRIALS}`;
+        }
+
+        arena.addEventListener("click", (e) => {
+            if (currentTrial > TOTAL_TRIALS) return;
+            const clickX = e.clientX;
+            const clickY = e.clientY - arena.offsetTop;
+            const dist = Math.hypot(clickX - curX, clickY - curY);
+            distances.push(dist);
+
+            const isHit = Math.abs(clickX - curX) <= 12 && Math.abs(clickY - curY) <= 12;
+            if (isHit) hits++;
+
+            const avgD = (distances.reduce((a, b) => a + b, 0) / distances.length).toFixed(1);
+            lblScore.textContent = `${hits} (${((hits / currentTrial) * 100).toFixed(0)}%)`;
+            lblDist.textContent = `${avgD} px`;
+
+            const color = isHit ? 'var(--success)' : 'var(--fail)';
+            const label = isHit ? 'HIT ' : 'MISS';
+            logBox.innerHTML += `Trial ${currentTrial}: <span style="color:${color};">[${label}]</span> dist: ${dist.toFixed(1)}px<br>`;
+            logBox.scrollTop = logBox.scrollHeight;
+
+            currentTrial++;
+            spawnTarget();
+        });
+
+        window.addEventListener("resize", spawnTarget);
+        spawnTarget();
+    </script>
+</body>
+</html>

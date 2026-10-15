@@ -1,11 +1,24 @@
-"""Turns gesture Actions into real mouse / keyboard input."""
-import sys
-import time
+"""
+Turns gesture Actions into high-precision, decoupled mouse / keyboard input.
+Features:
+- Decoupled 120+ Hz high-refresh cursor positioning thread with sub-pixel interpolation.
+- Trackpad-style relative mode with pointer-acceleration curve & precision fine-aim mode.
+- Absolute mapping mode with One Euro & dead-zone filtering.
+- Position lookback buffer (150-250 ms) to completely eliminate click drift during pinch.
+- Integrated Kinect-style dwell click and radial action menu.
+- Failsafe mouse button and modifier key release on all exit/error paths.
+"""
+import collections
 import ctypes
+import math
+import sys
+import threading
+import time
 
 import pyautogui
 
-from filters import OneEuro
+from filters import OneEuro, DeadzoneFilter, OneEuroPoint
+from dwell import DwellClicker
 
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False      # hand control would otherwise trip the corner failsafe
@@ -13,8 +26,9 @@ pyautogui.MINIMUM_DURATION = 0
 
 
 class Controller:
-    def __init__(self, cfg):
+    def __init__(self, cfg, overlay=None):
         self.cfg = cfg
+        self.overlay = overlay
         self._win = sys.platform == "win32"
         if self._win:
             self._user32 = ctypes.windll.user32
@@ -29,10 +43,45 @@ class Controller:
             self.sw, self.sh = pyautogui.size()
             self.vx, self.vy, self.vw, self.vh = 0, 0, self.sw, self.sh
 
-        self.fx = OneEuro(cfg.smooth_min_cutoff, cfg.smooth_beta)
-        self.fy = OneEuro(cfg.smooth_min_cutoff, cfg.smooth_beta)
+        # Smoothing & Deadzone filters
+        self.fx = OneEuro(cfg.smooth_min_cutoff, cfg.smooth_beta, getattr(cfg, "smooth_d_cutoff", 1.0))
+        self.fy = OneEuro(cfg.smooth_min_cutoff, cfg.smooth_beta, getattr(cfg, "smooth_d_cutoff", 1.0))
+        self.deadzone = DeadzoneFilter(getattr(cfg, "deadzone_px", 1.5))
+        self.landmark_filter = OneEuroPoint(cfg.smooth_min_cutoff, cfg.smooth_beta)
+
+        # Cursor positions & lookback buffer
+        cur_pos = pyautogui.position()
+        self.cur_x = float(cur_pos[0])
+        self.cur_y = float(cur_pos[1])
+        self.target_x = self.cur_x
+        self.target_y = self.cur_y
+        self.history = collections.deque(maxlen=400)  # (timestamp, x, y)
+        self.history.append((time.perf_counter(), self.cur_x, self.cur_y))
+
+        # Relative tracking state
+        self.last_landmark_x = None
+        self.last_landmark_y = None
+        self.last_move_t = None
+
+        # State flags
         self.button_down = False
         self.ctrl_down = False
+        self.scroll_mode_active = False
+        self.active = False
+        self.hand_present = False
+        self.pinching = False
+        self.dragging = False
+
+        # Dwell clicker engine
+        self.dwell = DwellClicker(cfg)
+
+        # Decoupled 120+ Hz cursor update thread
+        self._stop_thread = threading.Event()
+        self._thread = threading.Thread(target=self._cursor_loop, daemon=True)
+        self._thread.start()
+
+    def set_overlay(self, overlay):
+        self.overlay = overlay
 
     def _move(self, x, y):
         if self._win:
@@ -43,6 +92,12 @@ class Controller:
     def _reset_filters(self):
         self.fx.reset()
         self.fy.reset()
+        self.deadzone.reset()
+        self.landmark_filter.reset()
+        self.last_landmark_x = None
+        self.last_landmark_y = None
+        self.last_move_t = None
+        self.dwell.reset()
 
     def _release_ctrl(self):
         if self.ctrl_down:
@@ -52,40 +107,200 @@ class Controller:
                 pass
             self.ctrl_down = False
 
+    def _cursor_loop(self):
+        """Dedicated high-frequency loop (120+ Hz) for smooth, decoupled cursor interpolation."""
+        rate = max(getattr(self.cfg, "cursor_rate_hz", 120), 60)
+        dt_target = 1.0 / rate
+
+        while not self._stop_thread.is_set():
+            t0 = time.perf_counter()
+
+            # Smoothly interpolate towards target position
+            # Critically damped exponential approach
+            alpha = 1.0 - math.exp(-38.0 * dt_target)
+            dx = (self.target_x - self.cur_x) * alpha
+            dy = (self.target_y - self.cur_y) * alpha
+
+            if abs(dx) > 0.02 or abs(dy) > 0.02:
+                self.cur_x += dx
+                self.cur_y += dy
+                self._move(round(self.cur_x), round(self.cur_y))
+
+            now = time.perf_counter()
+            self.history.append((now, self.cur_x, self.cur_y))
+
+            # Update dwell click state
+            dwell_state = self.dwell.update(
+                self.cur_x, self.cur_y, now,
+                active=self.active,
+                hand_present=self.hand_present,
+                pinching=self.pinching,
+                dragging=self.dragging
+            )
+
+            # Handle dwell actions
+            if dwell_state.get("action"):
+                self._handle_dwell_action(dwell_state["action"])
+
+            # Post dwell feedback to overlay if available
+            if self.overlay:
+                self.overlay.post("cursor_dwell", **dwell_state)
+
+            elapsed = time.perf_counter() - t0
+            sleep_time = max(dt_target - elapsed, 0.001)
+            time.sleep(sleep_time)
+
+    def _handle_dwell_action(self, act):
+        if act == "click":
+            pyautogui.click(_pause=False)
+        elif act == "double_click":
+            pyautogui.doubleClick(_pause=False)
+        elif act == "right_click":
+            pyautogui.rightClick(_pause=False)
+        elif act == "drag":
+            if self.button_down:
+                pyautogui.mouseUp(_pause=False)
+                self.button_down = False
+            else:
+                pyautogui.mouseDown(_pause=False)
+                self.button_down = True
+        elif act == "scroll":
+            self.scroll_mode_active = not self.scroll_mode_active
+
+    def _get_lookback_position(self, lookback_ms):
+        """Returns the cursor position from lookback_ms before now."""
+        target_t = time.perf_counter() - (lookback_ms / 1000.0)
+        best_pos = (self.cur_x, self.cur_y)
+        for t, x, y in reversed(self.history):
+            if t <= target_t:
+                return x, y
+            best_pos = (x, y)
+        return best_pos
+
     def handle(self, a):
         k = a.kind
+        now = time.perf_counter()
+
         if k != "zoom" and self.ctrl_down:
             self._release_ctrl()
 
-        if k == "move":
-            t = time.perf_counter()
-            # If multi-monitor is requested and virtual desktop is broader than primary screen
-            if getattr(self.cfg, "multi_monitor", False) and self.vw > self.sw:
-                raw_x = self.vx + a.x * (self.vw - 1)
-                raw_y = self.vy + a.y * (self.vh - 1)
-                max_x, max_y = self.vx + self.vw - 1, self.vy + self.vh - 1
-                min_x, min_y = self.vx, self.vy
-            else:
-                raw_x = a.x * (self.sw - 1)
-                raw_y = a.y * (self.sh - 1)
-                max_x, max_y = self.sw - 1, self.sh - 1
-                min_x, min_y = 0, 0
+        # Multi-monitor bounds
+        if getattr(self.cfg, "multi_monitor", False) and self.vw > self.sw:
+            min_x, min_y = self.vx, self.vy
+            max_x, max_y = self.vx + self.vw - 1, self.vy + self.vh - 1
+            span_w, span_h = self.vw, self.vh
+        else:
+            min_x, min_y = 0, 0
+            max_x, max_y = self.sw - 1, self.sh - 1
+            span_w, span_h = self.sw, self.sh
 
-            fx = min(max(self.fx(raw_x, t), min_x), max_x)
-            fy = min(max(self.fy(raw_y, t), min_y), max_y)
-            self._move(round(fx), round(fy))
+        if k == "move":
+            self.hand_present = True
+            tracking_mode = getattr(self.cfg, "tracking_mode", "relative")
+
+            if tracking_mode == "relative":
+                # Trackpad-style relative mapping
+                flm_x, flm_y = self.landmark_filter(a.x, a.y, now)
+
+                if self.last_landmark_x is None or self.last_move_t is None:
+                    self.last_landmark_x = flm_x
+                    self.last_landmark_y = flm_y
+                    self.last_move_t = now
+                    return
+
+                dt = max(now - self.last_move_t, 1e-4)
+                # Normalized landmark displacement
+                d_x = flm_x - self.last_landmark_x
+                d_y = flm_y - self.last_landmark_y
+                self.last_landmark_x = flm_x
+                self.last_landmark_y = flm_y
+                self.last_move_t = now
+
+                # Pixel travel on target screen
+                px_dx = d_x * span_w
+                px_dy = d_y * span_h
+                step_dist = math.hypot(px_dx, px_dy)
+                velocity = step_dist / dt
+
+                # Deadzone suppression below threshold
+                deadzone = getattr(self.cfg, "deadzone_px", 1.5)
+                if step_dist < (deadzone * 0.75):
+                    px_dx, px_dy = 0.0, 0.0
+                else:
+                    speed = getattr(self.cfg, "pointer_speed", 1.15)
+                    prec_thresh = getattr(self.cfg, "precision_threshold", 0.015) * span_w
+                    accel_thresh = getattr(self.cfg, "accel_threshold", 0.035) * span_w
+                    accel_gain = getattr(self.cfg, "accel_gain", 1.8)
+                    prec_gain = getattr(self.cfg, "precision_gain", 0.35)
+
+                    if a.precision or velocity < prec_thresh:
+                        # Fine-aim precision mode
+                        gain = speed * prec_gain
+                    elif velocity > accel_thresh:
+                        # Pointer acceleration
+                        excess = (velocity - accel_thresh) / (span_w * 0.1)
+                        gain = speed * (1.0 + accel_gain * min(excess, 2.5))
+                    else:
+                        gain = speed
+
+                    px_dx *= gain
+                    px_dy *= gain
+
+                # In scroll mode, vertical motion scrolls instead of moves
+                if self.scroll_mode_active and abs(px_dy) > 4.0:
+                    notch = 1 if px_dy < 0 else -1
+                    pyautogui.scroll(120 * notch, _pause=False)
+                    return
+
+                self.target_x = min(max(self.target_x + px_dx, min_x), max_x)
+                self.target_y = min(max(self.target_y + px_dy, min_y), max_y)
+
+            else:
+                # Absolute mapping
+                raw_x = min_x + a.x * (span_w - 1)
+                raw_y = min_y + a.y * (span_h - 1)
+
+                fx = min(max(self.fx(raw_x, now), min_x), max_x)
+                fy = min(max(self.fy(raw_y, now), min_y), max_y)
+                out_x, out_y = self.deadzone(fx, fy)
+                self.target_x = out_x
+                self.target_y = out_y
+
         elif k == "click":
-            pyautogui.click(_pause=False)
+            # Eliminate click drift with position lookback
+            lookback_ms = getattr(self.cfg, "cursor_lookback_ms", 200.0)
+            lb_x, lb_y = self._get_lookback_position(lookback_ms)
+
+            self.target_x, self.target_y = lb_x, lb_y
+            self.cur_x, self.cur_y = lb_x, lb_y
+            self._move(round(lb_x), round(lb_y))
+
+            if a.double:
+                pyautogui.doubleClick(_pause=False)
+            else:
+                pyautogui.click(_pause=False)
+
+            self.pinching = False
+
         elif k == "right_click":
             pyautogui.rightClick(_pause=False)
+            self.pinching = False
+
         elif k == "drag_start":
+            self.pinching = True
+            self.dragging = True
             pyautogui.mouseDown(_pause=False)
             self.button_down = True
+
         elif k == "drag_end":
+            self.pinching = False
+            self.dragging = False
             pyautogui.mouseUp(_pause=False)
             self.button_down = False
+
         elif k == "scroll":
             pyautogui.scroll(120 * a.n, _pause=False)
+
         elif k == "zoom":
             if not self.ctrl_down:
                 try:
@@ -94,17 +309,31 @@ class Controller:
                 except Exception:
                     pass
             pyautogui.scroll(120 * a.n, _pause=False)
-        elif k in ("lost", "activate", "deactivate"):
+
+        elif k == "activate":
+            self.active = True
+            self.hand_present = True
+            self._reset_filters()
+
+        elif k in ("deactivate", "lost"):
+            self.active = (k != "deactivate" and self.active)
+            self.hand_present = False
+            self.pinching = False
+            self.dragging = False
+            self.scroll_mode_active = False
+
             if self.button_down:
                 try:
                     pyautogui.mouseUp(_pause=False)
                 except Exception:
                     pass
                 self.button_down = False
+
             self._release_ctrl()
             self._reset_filters()
 
     def shutdown(self):
+        self._stop_thread.set()
         try:
             pyautogui.mouseUp(_pause=False)
         except Exception:

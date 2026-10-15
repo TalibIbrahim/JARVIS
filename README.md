@@ -102,19 +102,36 @@
 
 ---
 
-## Gestures
+## Gestures & Control Schemes
+
+J.A.R.V.I.S. offers two precision control schemes, selectable in Settings (`Control Scheme`).
+
+### 1. Palm & Fist Scheme (Default)
+The most stable and ergonomic control scheme. Cursor position is anchored on the rigid **metacarpal knuckles (landmarks 0, 5, 9, 13, 17)** rather than moving fingertips, eliminating jitter and closing displacement.
 
 | Gesture | Action | Thresholds & Mechanics |
 |---|---|---|
-| **Open palm (hold 0.8s)** | **Wake Up** | Minimum finger extension > 1.55; gold circular progress ring fills around Arc Reactor. |
-| **Open palm (hold 1.5s)** | **Standby** | Deactivation chime sounds; overlay smoothly collapses into compact standby pill. |
-| **Point with index finger** | **Move Cursor** | Follows index tip; smoothed by One Euro filter (`min_cutoff: 1.0, beta: 0.03`). |
-| **Thumb + index pinch (quick)** | **Single Click** | Triggered when `pinch_ti < 0.28`; cursor freezes at `pinch_ti < 0.55` to prevent drift. |
-| **Two quick pinches (< 0.45s)** | **Double Click** | Second pinch completed within 0.45s triggers native Windows double-click. |
-| **Thumb + index pinch (hold > 0.35s)** | **Drag & Drop** | Latch left mouse button down; follows hand; opening fingers emits `drag_end` and `DROP`. |
-| **Thumb + middle pinch** | **Right Click** | Triggered when `pinch_tm < 0.28`; middle finger extended (`mid > 1.30`). |
-| **Peace sign (move up / down)** | **Scroll** | Hand up scrolls up; hand down scrolls down. Accumulator step: 0.025. |
-| **Both hands up (spread / close)** | **Zoom In / Out** | Two index tips moving apart zooms in; bringing them together zooms out (`Ctrl` held). |
+| **Open Palm** | **Move Cursor** | Rigid metacarpal anchor (MCP knuckles 5, 9, 13, 17); trackpad-style relative acceleration + precision aim. |
+| **Quick Fist (< 400 ms)** | **Left Click** | Closing fingers into a fist and reopening within 400 ms triggers left click. 200 ms Lookback Buffer locks aim. |
+| **Two Quick Fists (< 0.65 s)** | **Double Click** | Two quick fists within 0.65 s fires native Windows double click. |
+| **Fist Held (> 350 ms)** | **Drag & Drop** | Latch left mouse button down; cursor follows hand; opening the hand drops the item (`DROP`). |
+| **Thumb + Middle Pinch** | **Right Click** | Thumb contacts middle fingertip (`pinch_tm < 0.28`). |
+| **Peace Sign (move up / down)** | **Scroll** | Index and middle fingers extended; vertical travel scrolls documents and webpages. |
+| **Two Open Hands (spread / close)** | **Zoom In / Out** | Moving both hands apart zooms in; bringing together zooms out (`Ctrl` + scroll). |
+| **Open Palm in Standby (hold 0.8 s)** | **Wake Up** | Circular golden wake ring completes; app transitions from Standby to Active. *(Open palm while awake never sleeps!)* |
+| **Thumbs-Up (hold 1.2 s)** | **Standby** | 4 fingers curled, thumb extended upward for 1.2 s returns Jarvis to standby. Fists never sleep. |
+
+### 2. Dwell-Click (Kinect-Style Hover to Click)
+Hover the cursor stationary inside a target area to click completely hands-free:
+- **Hover Trigger**: Hovering still within a 14 px radius for 1.0 s triggers a left click.
+- **Glass Progress Ring**: An Apple visionOS style translucent ring fills around the cursor and pulses on completion.
+- **Radial Action Menu**: Optional mode where hovering reveals an action menu: *Click, Double Click, Right Click, Drag, Scroll*.
+- **Anti-Repeat Protection**: The cursor or hand must leave the target area before another dwell click can fire.
+
+### 3. Pinch Scheme (Legacy Selectable in Settings)
+- **Pointing Finger**: Move cursor with blended index tip / PIP joint.
+- **Thumb + Index Pinch**: Single click, double click, and hold to drag.
+- **Open Palm Hold (1.5 s)**: Returns app to standby.
 
 ---
 
