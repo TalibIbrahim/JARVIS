@@ -222,19 +222,28 @@ Open the graphical Settings dialog from the Windows system tray (**Right-click t
 ```
 JARVIS/
 ├── main.py              # Application lifecycle, Per-Monitor V2 DPI, hotkey dispatcher
-├── tracker.py           # Webcam capture, MediaPipe inference, HUD telemetry, CPU throttling
-├── gestures.py          # Pure Python gesture state machine, landmark geometry, debouncing
-├── controller.py        # Windows mouse/keyboard emulation, One Euro filter, multi-monitor bounds
-├── overlay.py           # PySide6 Dynamic-Island overlay, system tray, and settings window
-├── voice.py             # Background audio worker queue, Google speech recognition, pyttsx3
+├── tracker.py           # OpenCV threaded capture, MediaPipe inference, HUD telemetry, CPU throttling
+├── gestures.py          # Pure Python gesture state machine, Palm & Fist + Pinch schemes
+├── controller.py        # Decoupled 120+ Hz cursor engine, relative acceleration, Lookback buffer
+├── overlay.py           # PySide6 Apple HIG Dynamic Island, Mica/Acrylic glass, settings window
+├── dwell.py             # Kinect-style hover-to-click engine and radial action menu
+├── voice.py             # Speech recognition worker, hardware mic auto-probing, pyttsx3 speaker
 ├── commands.py          # Local command directory with regex word boundary matching
-├── config.py            # Configuration dataclass and JSON file loader
-├── filters.py           # One Euro adaptive low-pass filter implementation
+├── config.py            # Configuration dataclass and JSON file loader (jarvis_config.json)
+├── filters.py           # One Euro adaptive low-pass filter and deadzone hysteresis
+├── updater.py           # Discord-style background auto-updater with atomic self-replacement
+├── diagnose.py          # Jitter, latency, anchor point, and pre-click drift benchmarking tool
 ├── build_exe.py         # PyInstaller standalone executable packaging script
 ├── requirements.txt     # Pinned Python package dependencies
 ├── tests/
-│   ├── test_gestures.py # 17 synthetic landmark unit tests
-│   └── MANUAL_TEST.md   # Verification checklist and real-world test results
+│   ├── test_gestures.py        # 26 synthetic landmark unit tests
+│   ├── test_dwell.py           # 5 dwell hover and radial menu unit tests
+│   ├── test_single_instance.py # 2 Win32 mutex single-instance unit tests
+│   ├── test_updater.py         # 5 semver and release asset unit tests
+│   ├── target_practice.py      # Automated and GUI 24x24 px precision targeting tool
+│   ├── target_practice.html    # Web-based interactive precision target practice
+│   └── PRECISION_TEST.md       # Precision test procedures and empirical benchmark results
+├── APP_CONTEXT.md       # Comprehensive architecture and codebase reference for AI / Claude
 ├── CHANGELOG.md         # Detailed post-mortem of all bug fixes and root causes
 ├── LICENSE              # MIT License
 └── README.md            # Comprehensive project documentation
@@ -244,13 +253,13 @@ JARVIS/
 
 ## Running Unit Tests
 
-Run the pure Python gesture tests anytime:
+Run the complete unit test suite anytime:
 
 ```powershell
-python tests/test_gestures.py
+python -m unittest discover -s tests
 ```
 
-All 17 tests run in under 0.1 seconds, verifying wake/standby, clicks, double click, drag, right click, scroll, zoom, jitter tolerance, fist suppression, and handedness symmetry.
+All 38 tests run in under 0.03 seconds, verifying wake/standby, clicks, double click, drag, right click, scroll, zoom, jitter tolerance, fist suppression, dwell timing, mutex locks, and handedness symmetry.
 
 ---
 
