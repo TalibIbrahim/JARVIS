@@ -57,7 +57,53 @@ class Context:
         threading.Thread(target=play, daemon=True).start()
 
 
+_INSTANCE_MUTEX = None
+
+
+def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstance_Mutex"):
+    """
+    Guarantees only one instance of J.A.R.V.I.S. can run simultaneously.
+    If another instance is already running, brings it to focus and exits immediately.
+    """
+    global _INSTANCE_MUTEX
+    if sys.platform != "win32":
+        return True
+
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+
+    # Create session-local mutex to prevent multi-instance runs
+    handle = kernel32.CreateMutexW(None, False, app_id)
+    last_error = kernel32.GetLastError()
+
+    if last_error == ERROR_ALREADY_EXISTS:
+        if handle:
+            kernel32.CloseHandle(handle)
+        _INSTANCE_MUTEX = None
+        print("[JARVIS] Another instance is already running. Exiting.")
+        try:
+            # Locate existing Dynamic Island window if present
+            hwnd = user32.FindWindowW(None, "JARVIS_DYNAMIC_ISLAND")
+            if hwnd:
+                user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                user32.SetForegroundWindow(hwnd)
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            pass
+        return False
+
+    _INSTANCE_MUTEX = handle
+    return True
+
+
 def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        pass
+    elif not acquire_single_instance_lock():
+        sys.exit(0)
+
     _enable_dpi_awareness()
     parser = argparse.ArgumentParser(description="J.A.R.V.I.S. gesture control")
     parser.add_argument("--preview", action="store_true", help="show the camera HUD window")
@@ -126,6 +172,11 @@ def main():
         controller.shutdown()
         speaker.q.put(None)
         tracker.join(timeout=2)
+        if _INSTANCE_MUTEX and sys.platform == "win32":
+            try:
+                ctypes.windll.kernel32.CloseHandle(_INSTANCE_MUTEX)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

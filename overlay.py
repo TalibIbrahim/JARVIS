@@ -69,6 +69,7 @@ class DynamicIsland(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setWindowTitle("JARVIS_DYNAMIC_ISLAND")
 
         self.w = 140.0
         self.h = 32.0
