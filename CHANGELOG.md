@@ -223,4 +223,17 @@
   - **AutoDefault Suppression**: Explicitly set `setAutoDefault(False)` and `setDefault(False)` on all buttons in the Settings window.
   - **Unit Test Expansion**: Added `tests/test_settings.py` covering Spring physics stability under extreme lag, non-blocking audio lock acquisition, and dialog lifecycle behavior (totaling 86 passing tests).
 
+---
+
+### 22. Release v1.2.2: Interactive Software Update UI, Program Files UAC Elevation & APPDATA Config Persistence
+- **Interactive In-App Updates**:
+  - Added dedicated **Software Update** card to Settings $\rightarrow$ About tab with inline version status, real-time download progress bar, and dynamic **Restart to Update** action button.
+  - Added **Check for Updates…** directly to the Windows System Tray context menu.
+- **Program Files UAC Elevation**:
+  - When J.A.R.V.I.S. is installed in `C:\Program Files\Jarvis\`, the atomic replacement script automatically requests Windows UAC elevation via `powershell -Verb RunAs`, preventing silent `Access is denied` replacement failures.
+- **Persistent User Configuration (`%APPDATA%\Jarvis\`)**:
+  - Implemented `get_config_path()` in `config.py` and `overlay.py` to route configuration storage to `%APPDATA%\Jarvis\jarvis_config.json`, ensuring non-admin user persistence even when running from write-protected system directories.
+- **PyInstaller Build Bundling**:
+  - Added hidden imports for `keyring`, `certifi`, `requests`, and `win32cred` directly to `build_exe.py`.
+
 

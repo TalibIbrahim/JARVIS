@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 GITHUB_REPO = "TalibIbrahim/JARVIS"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -222,12 +222,16 @@ exit
         with open(bat_script, "w", encoding="utf-8") as f:
             f.write(bat_content)
 
-        # Launch the updater script in a detached background process and exit this app
-        subprocess.Popen(
-            ["cmd.exe", "/c", bat_script],
-            creationflags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0,
-            close_fds=True
-        )
+        # Launch the updater script in a detached background process (elevating if in Program Files)
+        if "program files" in current_exe.lower() and sys.platform == "win32":
+            ps_script = f'Start-Process cmd.exe -ArgumentList "/c `"{bat_script}`"" -Verb RunAs'
+            subprocess.Popen(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script])
+        else:
+            subprocess.Popen(
+                ["cmd.exe", "/c", bat_script],
+                creationflags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0,
+                close_fds=True
+            )
 
         # Trigger clean application shutdown
         if self.ctx:

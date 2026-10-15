@@ -108,9 +108,33 @@ class Config:
     ai_max_history: int = 6
 
 
+def get_config_path(explicit_path=None):
+    r"""
+    Returns persistent config file path.
+    Uses %APPDATA%\Jarvis\jarvis_config.json when running compiled or when APPDATA exists,
+    falling back to local jarvis_config.json next to source files.
+    """
+    import sys
+    if explicit_path:
+        return explicit_path
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
+    if not getattr(sys, "frozen", False) and os.path.exists(local_path):
+        return local_path
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    jarvis_dir = os.path.join(appdata, "Jarvis")
+    try:
+        os.makedirs(jarvis_dir, exist_ok=True)
+    except Exception:
+        pass
+    appdata_path = os.path.join(jarvis_dir, "jarvis_config.json")
+    if os.path.exists(appdata_path) or getattr(sys, "frozen", False):
+        return appdata_path
+    return local_path
+
+
 def load_config(path=None):
     cfg = Config()
-    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
+    path = get_config_path(path)
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:

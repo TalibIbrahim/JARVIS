@@ -23,6 +23,13 @@ def build():
         "--hidden-import", "speech_recognition",
         "--hidden-import", "pyttsx3.drivers",
         "--hidden-import", "pyttsx3.drivers.sapi5",
+        "--hidden-import", "keyring",
+        "--hidden-import", "keyring.backends.Windows",
+        "--hidden-import", "win32cred",
+        "--hidden-import", "pywintypes",
+        "--hidden-import", "certifi",
+        "--hidden-import", "requests",
+        "--collect-data", "certifi",
         "main.py"
     ]
 

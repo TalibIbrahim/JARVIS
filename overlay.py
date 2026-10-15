@@ -42,7 +42,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.2.1"
+    APP_VERSION = "1.2.2"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -1812,8 +1812,11 @@ class SettingsWindow(QDialog):
         # Strict safeguard: Never write any API key, token, or secret to config file
         if any(s in key.lower() for s in ("key", "secret", "token", "password")):
             return
-        setattr(self.cfg, key, value)
-        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
+        try:
+            from config import get_config_path
+            cfg_path = get_config_path()
+        except Exception:
+            cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
         try:
             data = {}
             if os.path.exists(cfg_path):
