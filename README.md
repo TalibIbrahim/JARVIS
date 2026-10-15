@@ -194,6 +194,8 @@ python main.py --preview
 ### CLI Arguments
 - `python main.py`: Starts Jarvis in normal background mode with the Dynamic Island overlay.
 - `python main.py --preview`: Opens the camera HUD window showing hand skeletons and live telemetry.
+- `python main.py --test-mic`: Runs interactive microphone and speech recognition diagnostics.
+- `python main.py --diagnose`: Runs jitter, latency, anchor point, and pre-click drift benchmarks.
 - `python main.py --no-voice`: Disables speech recognition for silent/presentation environments.
 - `python main.py --camera 1`: Selects an alternate camera index.
 

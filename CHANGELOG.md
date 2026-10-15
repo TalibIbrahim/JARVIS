@@ -174,3 +174,17 @@
   - 24x24 px Target Hit Rate: **10 / 10 (100%)** with **2.2 px mean distance** (winner vs Pinch's 3.6 px).
   - Failsafe Release: 100% button release on hand loss, sleep, or exit.
 
+---
+
+### 19. Intelligent Microphone Auto-Detection, Live Audio Level Meter & GUI Polish
+- **Issue**: Voice commands failed to trigger on systems with Virtual Audio Cable or multiple capture drivers; PyAudio defaulted to a silent virtual line (`RMS: 0.5`) rather than the active physical microphone.
+- **Root Cause**: `speech_recognition.Microphone()` was initialized without specifying a `device_index`, defaulting to whichever virtual/mapper audio driver Windows ordered first.
+- **Fix**:
+  - Implemented `find_best_microphone()` in `voice.py`: probes all audio inputs, filters out silent virtual audio cables (`Virtual Audio Cable`, `Sound Mapper`), and auto-selects the physical hardware microphone with healthy signal (`Microphone Array (Intel SST)`).
+  - Added `mic_device_index`, `mic_energy_threshold`, and `mic_dynamic_energy` to `config.py`.
+  - Added **Microphone Input Device** combobox to Settings $\rightarrow$ Voice tab.
+  - Added **Live Audio Input Signal Meter** (`QProgressBar` with real-time level indicator) updating at 80 ms to provide instant visual confirmation that Jarvis is hearing the user speak.
+  - Added **Test Microphone & Recognition** interactive test tool in the UI and via CLI `python main.py --test-mic`.
+  - Removed all emojis from the GUI, ensuring a clean, polished, first-party Apple HIG aesthetic.
+
+

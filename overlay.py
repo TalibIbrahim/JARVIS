@@ -31,7 +31,7 @@ try:
         QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
         QLabel, QSlider, QCheckBox, QPushButton, QComboBox,
         QGroupBox, QSystemTrayIcon, QMenu, QStackedWidget,
-        QListWidget, QListWidgetItem, QScrollArea, QFrame
+        QListWidget, QListWidgetItem, QScrollArea, QFrame, QProgressBar
     )
     PYSIDE6_AVAILABLE = True
 except ImportError:
@@ -42,6 +42,14 @@ try:
     from updater import APP_VERSION
 except ImportError:
     APP_VERSION = "1.1.0"
+
+try:
+    from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
+except ImportError:
+    list_microphones = lambda: []
+    find_best_microphone = lambda cfg=None: (None, "Default Microphone")
+    probe_mic_level = lambda dev=None: (0.0, 0.0)
+    test_microphone_recognition = lambda dev=None: {"success": False, "error": "Voice module unavailable"}
 
 
 # =====================================================================
@@ -854,12 +862,12 @@ class SettingsWindow(QDialog):
         """)
 
         categories = [
-            ("General", "⚙️  General"),
-            ("Gestures", "✋  Gestures"),
-            ("Pointer", "🎯  Pointer & Dwell"),
-            ("Voice", "🎙️  Voice"),
-            ("Display", "🖥️  Display"),
-            ("About", "ℹ️  About")
+            ("General", "General"),
+            ("Gestures", "Gestures"),
+            ("Pointer", "Pointer & Dwell"),
+            ("Voice", "Voice"),
+            ("Display", "Display"),
+            ("About", "About")
         ]
         for cid, label in categories:
             item = QListWidgetItem(label)
@@ -1092,20 +1100,157 @@ class SettingsWindow(QDialog):
         self.stack.addWidget(page)
 
     def _build_voice_page(self):
-        page, layout = self._build_page_container("Voice", "Speech recognition and spoken feedback")
+        page, layout = self._build_page_container("Voice", "Speech recognition and audio input diagnostics")
         card = GroupedCard()
 
+        # 1. Voice Commands Toggle
         sw_voice = AppleSwitch(self.cfg.voice_enabled)
         sw_voice.toggled.connect(lambda v: self._save("voice_enabled", v))
         card.add_row("Voice Commands", "Listen for Jarvis wake-word and actions", sw_voice)
 
+        # 2. Spoken Responses Toggle
         sw_speak = AppleSwitch(self.cfg.speak)
         sw_speak.toggled.connect(lambda v: self._save("speak", v))
         card.add_row("Spoken Responses", "Jarvis replies with voice confirmations", sw_speak)
 
+        # 3. Microphone Input Device Selector
+        mics = list_microphones()
+        best_idx, best_name = find_best_microphone(self.cfg)
+        self.mic_combo = QComboBox()
+        self.mic_combo.setMinimumWidth(260)
+        
+        # Add Auto option
+        self.mic_combo.addItem(f"Auto-detect ({best_name[:22]}...)", -1)
+        selected_combo_idx = 0
+        
+        for idx, m in enumerate(mics):
+            tag = " [Active]" if m["index"] == best_idx else ""
+            self.mic_combo.addItem(f"[{m['index']}] {m['name'][:28]}{tag}", m["index"])
+            if self.cfg.mic_device_index == m["index"]:
+                selected_combo_idx = idx + 1
+
+        self.mic_combo.setCurrentIndex(selected_combo_idx)
+
+        def on_mic_selected(c_idx):
+            dev_val = self.mic_combo.itemData(c_idx)
+            val_to_save = None if dev_val == -1 else dev_val
+            self._save("mic_device_index", val_to_save)
+            self.cfg.mic_device_index = val_to_save
+
+        self.mic_combo.currentIndexChanged.connect(on_mic_selected)
+        card.add_row("Input Microphone", "Select physical audio capture device", self.mic_combo)
+
+        # 4. Trigger Energy Sensitivity Slider
+        self._slider_row(card, "Trigger Sensitivity", "Energy threshold for speech activation (lower = more sensitive)",
+                         getattr(self.cfg, "mic_energy_threshold", 400), 100.0, 2000.0, "",
+                         lambda v: self._save("mic_energy_threshold", int(v)))
+
         layout.addWidget(card)
+
+        # 5. Live Audio Input Level Meter Card
+        meter_card = GroupedCard()
+        meter_widget = QWidget()
+        meter_layout = QVBoxLayout(meter_widget)
+        meter_layout.setContentsMargins(0, 0, 0, 0)
+        meter_layout.setSpacing(6)
+
+        bar_row = QHBoxLayout()
+        self.mic_level_bar = QProgressBar()
+        self.mic_level_bar.setRange(0, 100)
+        self.mic_level_bar.setValue(0)
+        self.mic_level_bar.setTextVisible(False)
+        self.mic_level_bar.setFixedHeight(8)
+        self.mic_level_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #2c2c2e;
+                border-radius: 4px;
+            }
+            QProgressBar::chunk {
+                background-color: #34c759;
+                border-radius: 4px;
+            }
+        """)
+
+        self.mic_level_lbl = QLabel("0%")
+        self.mic_level_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #34c759; min-width: 35px;")
+
+        bar_row.addWidget(self.mic_level_bar, stretch=1)
+        bar_row.addWidget(self.mic_level_lbl)
+        meter_layout.addLayout(bar_row)
+
+        self.mic_status_lbl = QLabel("Listening for input signal...")
+        self.mic_status_lbl.setStyleSheet("font-size: 11px; color: #8e8e93;")
+        meter_layout.addWidget(self.mic_status_lbl)
+
+        meter_card.add_row("Microphone Signal Level", "Real-time acoustic audio meter", meter_widget)
+
+        # 6. Interactive Microphone & Recognition Test
+        test_widget = QWidget()
+        test_layout = QVBoxLayout(test_widget)
+        test_layout.setContentsMargins(0, 0, 0, 0)
+        test_layout.setSpacing(6)
+
+        self.btn_test_mic = QPushButton("Test Microphone & Recognition")
+        self.lbl_test_result = QLabel("Click above to test microphone audio recording and speech recognition.")
+        self.lbl_test_result.setStyleSheet("font-size: 11px; color: #8e8e93;")
+        self.lbl_test_result.setWordWrap(True)
+
+        def run_mic_test_thread():
+            self.btn_test_mic.setEnabled(False)
+            self.btn_test_mic.setText("Recording (3.5s)... Speak now!")
+            self.lbl_test_result.setText("Listening... Say something like 'Jarvis, open Chrome' or 'what time is it'.")
+            self.lbl_test_result.setStyleSheet("font-size: 11px; color: #007aff;")
+
+            def worker():
+                chosen_dev = self.cfg.mic_device_index
+                res = test_microphone_recognition(device_index=chosen_dev, duration=3.5)
+
+                def update_ui():
+                    self.btn_test_mic.setEnabled(True)
+                    self.btn_test_mic.setText("Test Microphone & Recognition")
+                    if res["success"]:
+                        self.lbl_test_result.setText(f"Success! Heard: \"{res['text']}\" (Audio signal: {res['avg_level']:.0f})")
+                        self.lbl_test_result.setStyleSheet("font-size: 12px; font-weight: 600; color: #34c759;")
+                    else:
+                        err_msg = res.get("error", "Unknown error")
+                        self.lbl_test_result.setText(f"Notice: {err_msg} (Audio signal: {res['avg_level']:.0f})")
+                        self.lbl_test_result.setStyleSheet("font-size: 11px; color: #ff9500;")
+
+                QTimer.singleShot(0, update_ui)
+
+            import threading
+            threading.Thread(target=worker, daemon=True).start()
+
+        self.btn_test_mic.clicked.connect(run_mic_test_thread)
+        test_layout.addWidget(self.btn_test_mic)
+        test_layout.addWidget(self.lbl_test_result)
+        meter_card.add_row("Audio Test Tool", "Speak a command to verify transcription accuracy", test_widget)
+
+        layout.addWidget(meter_card)
         layout.addStretch()
         self.stack.addWidget(page)
+
+        # Setup periodic audio level timer (runs smoothly when settings is open)
+        self.mic_timer = QTimer(self)
+        self.mic_timer.setInterval(80)
+
+        def update_mic_level():
+            if not self.isVisible() or self.stack.currentWidget() != page:
+                return
+            chosen_dev = self.cfg.mic_device_index
+            norm, rms = probe_mic_level(chosen_dev)
+            val = int(norm * 100)
+            self.mic_level_bar.setValue(val)
+            self.mic_level_lbl.setText(f"{val}%")
+            if rms > 15.0:
+                self.mic_status_lbl.setText(f"Microphone active (Signal: {rms:.0f})")
+                self.mic_status_lbl.setStyleSheet("font-size: 11px; color: #34c759;")
+            else:
+                self.mic_status_lbl.setText("No audio signal detected. Speak louder or select another microphone.")
+                self.mic_status_lbl.setStyleSheet("font-size: 11px; color: #8e8e93;")
+
+        self.mic_timer.timeout.connect(update_mic_level)
+        self.mic_timer.start()
 
     def _build_display_page(self):
         page, layout = self._build_page_container("Display & Materials", "Liquid glass appearance and animations")

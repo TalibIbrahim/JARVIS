@@ -110,11 +110,17 @@ def main():
     parser.add_argument("--no-voice", action="store_true", help="disable voice commands")
     parser.add_argument("--camera", type=int, default=None, help="camera index (default 0)")
     parser.add_argument("--diagnose", action="store_true", help="run diagnostic jitter, latency, and precision measurement")
+    parser.add_argument("--test-mic", action="store_true", help="test microphone input levels and speech recognition")
     args = parser.parse_args()
 
     if args.diagnose:
         from diagnose import run_diagnose
         run_diagnose()
+        sys.exit(0)
+
+    if args.test_mic:
+        import subprocess
+        subprocess.run([sys.executable, "voice.py"])
         sys.exit(0)
 
     from config import load_config

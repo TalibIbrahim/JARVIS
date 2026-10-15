@@ -14,11 +14,11 @@ import time
 
 class DwellClicker:
     RADIAL_SECTORS = [
-        {"id": "click", "label": "Click", "icon": "👆"},
-        {"id": "double_click", "label": "Double Click", "icon": "✌️"},
-        {"id": "right_click", "label": "Right Click", "icon": "👉"},
-        {"id": "drag", "label": "Drag / Drop", "icon": "✊"},
-        {"id": "scroll", "label": "Scroll Mode", "icon": "📜"},
+        {"id": "click", "label": "Click", "icon": ""},
+        {"id": "double_click", "label": "Double Click", "icon": ""},
+        {"id": "right_click", "label": "Right Click", "icon": ""},
+        {"id": "drag", "label": "Drag / Drop", "icon": ""},
+        {"id": "scroll", "label": "Scroll Mode", "icon": ""},
     ]
 
     def __init__(self, cfg):

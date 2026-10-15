@@ -86,6 +86,9 @@ class Config:
     wake_word: str = "jarvis"
     wake_aliases: list = field(default_factory=lambda: ["jarvis", "jarvas", "jervis", "gervais"])
     command_window: float = 6.0         # seconds Jarvis keeps listening after "Jarvis?"
+    mic_device_index: int = None        # specific microphone device index, or None for auto-detect
+    mic_energy_threshold: int = 400     # minimum audio energy threshold for speech trigger (lower = more sensitive)
+    mic_dynamic_energy: bool = True     # adapt threshold dynamically to ambient noise
 
     # --- ui / apple hig appearance ---
     theme_mode: str = "auto"            # "auto" (follows Windows), "dark", "light"

@@ -629,13 +629,13 @@ Fingertip anchors (landmark 8) suffer from bio-mechanical tremor and severe disp
 
 | Anchor Candidate | Landmarks Used | Jitter Std Dev (px) | Jitter vs Raw Tip | Stability During Hand Closure |
 | :--- | :--- | :---: | :---: | :--- |
-| **Raw Index Tip** | 8 | {anchor_results['tip']:.2f} px | Baseline | ❌ Displaces 20–35 px when closing |
-| **Index PIP Joint** | 6 | {anchor_results['pip']:.2f} px | {(1.0 - anchor_results['pip']/anchor_results['tip'])*100:.1f}% lower | ⚠️ Slight shift during finger curl |
-| **Weighted Blend (PIP+Tip)** | 6 (35%) + 8 (65%) | {anchor_results['blend']:.2f} px | {(1.0 - anchor_results['blend']/anchor_results['tip'])*100:.1f}% lower | ⚠️ Displaces during pinch |
-| **Palm Center** | 0 & 9 | {anchor_results['palm_center']:.2f} px | {(1.0 - anchor_results['palm_center']/anchor_results['tip'])*100:.1f}% lower | ✔️ Very stable |
-| **Metacarpal Centroid** | 0, 5, 9, 13, 17 | {anchor_results['centroid']:.2f} px | {(1.0 - anchor_results['centroid']/anchor_results['tip'])*100:.1f}% lower | ✔️ High stability |
-| **Index MCP Knuckle** | 5 | {anchor_results['index_mcp']:.2f} px | {(1.0 - anchor_results['index_mcp']/anchor_results['tip'])*100:.1f}% lower | ✔️ Completely rigid |
-| **Knuckles (4 MCP Average)** | **5, 9, 13, 17** | **{anchor_results['knuckles']:.2f} px** | **{(1.0 - anchor_results['knuckles']/anchor_results['tip'])*100:.1f}% lower** | **🏆 Rock-solid: ZERO displacement during fist** |
+| **Raw Index Tip** | 8 | {anchor_results['tip']:.2f} px | Baseline | Displaces 20-35 px when closing |
+| **Index PIP Joint** | 6 | {anchor_results['pip']:.2f} px | {(1.0 - anchor_results['pip']/anchor_results['tip'])*100:.1f}% lower | Slight shift during finger curl |
+| **Weighted Blend (PIP+Tip)** | 6 (35%) + 8 (65%) | {anchor_results['blend']:.2f} px | {(1.0 - anchor_results['blend']/anchor_results['tip'])*100:.1f}% lower | Displaces during pinch |
+| **Palm Center** | 0 & 9 | {anchor_results['palm_center']:.2f} px | {(1.0 - anchor_results['palm_center']/anchor_results['tip'])*100:.1f}% lower | Very stable |
+| **Metacarpal Centroid** | 0, 5, 9, 13, 17 | {anchor_results['centroid']:.2f} px | {(1.0 - anchor_results['centroid']/anchor_results['tip'])*100:.1f}% lower | High stability |
+| **Index MCP Knuckle** | 5 | {anchor_results['index_mcp']:.2f} px | {(1.0 - anchor_results['index_mcp']/anchor_results['tip'])*100:.1f}% lower | Completely rigid |
+| **Knuckles (4 MCP Average)** | **5, 9, 13, 17** | **{anchor_results['knuckles']:.2f} px** | **{(1.0 - anchor_results['knuckles']/anchor_results['tip'])*100:.1f}% lower** | **Optimal: ZERO displacement during fist** |
 
 > **Benchmark Conclusion**: **Knuckles (MCP joints 5, 9, 13, 17)** achieves the lowest jitter and maximum biomechanical stability. The knuckles form the rigid skeletal frame of the palm and do not move when the four fingers curl into a fist.
 
