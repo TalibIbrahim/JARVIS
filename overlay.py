@@ -1636,9 +1636,123 @@ class SettingsWindow(QDialog):
         layout.addWidget(card)
 
         if self.updater:
+            update_card = GroupedCard()
+            update_widget = QWidget()
+            u_vbox = QVBoxLayout(update_widget)
+            u_vbox.setContentsMargins(0, 0, 0, 0)
+            u_vbox.setSpacing(8)
+
+            u_hbox = QHBoxLayout()
+            u_hbox.setSpacing(10)
+
             btn_chk = QPushButton("Check for Updates")
-            btn_chk.clicked.connect(lambda: self.updater.check_async(notify_if_latest=True))
-            layout.addWidget(btn_chk)
+            btn_restart = QPushButton("Restart to Update")
+            btn_restart.setVisible(False)
+            btn_restart.setStyleSheet("""
+                QPushButton {
+                    background-color: #34c759;
+                    color: #ffffff;
+                    font-weight: 600;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #30d158;
+                }
+            """)
+
+            lbl_up_status = QLabel(f"Current version is v{APP_VERSION}.")
+            lbl_up_status.setStyleSheet("font-size: 11px; color: #8e8e93;")
+
+            prog_bar = QProgressBar()
+            prog_bar.setRange(0, 100)
+            prog_bar.setValue(0)
+            prog_bar.setFixedHeight(6)
+            prog_bar.setTextVisible(False)
+            prog_bar.setVisible(False)
+            prog_bar.setStyleSheet("""
+                QProgressBar {
+                    background-color: #2c2c2e;
+                    border-radius: 3px;
+                }
+                QProgressBar::chunk {
+                    background-color: #007aff;
+                    border-radius: 3px;
+                }
+            """)
+
+            u_hbox.addWidget(btn_chk)
+            u_hbox.addWidget(btn_restart)
+            u_hbox.addWidget(lbl_up_status, stretch=1)
+            u_vbox.addLayout(u_hbox)
+            u_vbox.addWidget(prog_bar)
+
+            update_card.add_row("Software Update", "Automatic GitHub release detection and seamless restart", update_widget)
+            layout.addWidget(update_card)
+
+            def on_updater_event(state, **kwargs):
+                def update_ui():
+                    if state == "checking":
+                        btn_chk.setEnabled(False)
+                        btn_restart.setVisible(False)
+                        prog_bar.setVisible(False)
+                        lbl_up_status.setText("Checking for updates...")
+                        lbl_up_status.setStyleSheet("font-size: 11px; color: #007aff;")
+                    elif state == "up-to-date":
+                        btn_chk.setEnabled(True)
+                        btn_restart.setVisible(False)
+                        prog_bar.setVisible(False)
+                        lbl_up_status.setText(f"Jarvis is up to date (v{APP_VERSION}).")
+                        lbl_up_status.setStyleSheet("font-size: 11px; color: #34c759;")
+                    elif state == "available":
+                        btn_chk.setEnabled(True)
+                        ver = kwargs.get("info", {}).get("version", "New Version")
+                        lbl_up_status.setText(f"Update available: {ver}")
+                        lbl_up_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #ff9f0a;")
+                        btn_restart.setText(f"Download & Update to {ver}")
+                        btn_restart.setEnabled(True)
+                        btn_restart.setVisible(True)
+                    elif state == "downloading":
+                        pct = kwargs.get("percent", 0)
+                        prog_bar.setVisible(True)
+                        prog_bar.setValue(pct)
+                        lbl_up_status.setText(f"Downloading update... {pct}%")
+                        lbl_up_status.setStyleSheet("font-size: 11px; color: #007aff;")
+                        btn_restart.setEnabled(False)
+                    elif state == "downloaded":
+                        prog_bar.setVisible(False)
+                        lbl_up_status.setText("Update downloaded! Ready to restart.")
+                        lbl_up_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #34c759;")
+                        btn_restart.setText("Restart Now to Apply Update")
+                        btn_restart.setEnabled(True)
+                        btn_restart.setVisible(True)
+                    elif state == "error":
+                        btn_chk.setEnabled(True)
+                        btn_restart.setEnabled(True)
+                        prog_bar.setVisible(False)
+                        msg = kwargs.get("message", "Error checking for updates")
+                        lbl_up_status.setText(f"Notice: {msg[:60]}")
+                        lbl_up_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
+
+                QTimer.singleShot(0, update_ui)
+
+            self.updater.add_listener(on_updater_event)
+
+            def on_check_clicked():
+                self.updater.check_async(notify_if_latest=True)
+
+            def on_restart_clicked():
+                if self.updater:
+                    if self.updater.downloaded_path and os.path.exists(self.updater.downloaded_path):
+                        btn_restart.setEnabled(False)
+                        lbl_up_status.setText("Applying update and restarting...")
+                        self.updater.apply_update_and_restart()
+                    else:
+                        btn_restart.setEnabled(False)
+                        lbl_up_status.setText("Starting download...")
+                        self.updater.download_async()
+
+            btn_chk.clicked.connect(on_check_clicked)
+            btn_restart.clicked.connect(on_restart_clicked)
 
         layout.addStretch()
         self.stack.addWidget(page)
@@ -1780,6 +1894,10 @@ class JarvisTray(QSystemTrayIcon):
         menu.addAction(act_dwell)
 
         menu.addSeparator()
+        act_update = QAction("Check for Updates…", menu)
+        act_update.triggered.connect(self._check_updates)
+        menu.addAction(act_update)
+
         act_settings = QAction("Settings…", menu)
         act_settings.triggered.connect(lambda: self.mgr.open_settings())
         menu.addAction(act_settings)
@@ -1789,6 +1907,10 @@ class JarvisTray(QSystemTrayIcon):
         menu.addAction(act_quit)
 
         self.setContextMenu(menu)
+
+    def _check_updates(self):
+        if self.mgr.updater:
+            self.mgr.updater.check_async(notify_if_latest=True)
 
     def _toggle_active(self):
         if self.mgr.ctx:
