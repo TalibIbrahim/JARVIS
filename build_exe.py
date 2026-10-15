@@ -17,6 +17,8 @@ def build():
         "--noconfirm",
         "--collect-data", "mediapipe",
         "--copy-metadata", "mediapipe",
+        "--icon=assets/jarvis.ico",
+        "--add-data=assets;assets",
         "--hidden-import", "PySide6",
         "--hidden-import", "speech_recognition",
         "--hidden-import", "pyttsx3.drivers",

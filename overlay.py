@@ -52,6 +52,18 @@ except ImportError:
     test_microphone_recognition = lambda dev=None: {"success": False, "error": "Voice module unavailable"}
 
 
+def get_app_icon():
+    """Finds and returns the high-resolution J.A.R.V.I.S. QIcon."""
+    if not PYSIDE6_AVAILABLE:
+        return None
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in ("jarvis.ico", "jarvis.png", "jarvis_tray.png"):
+        p = os.path.join(base_dir, "assets", name)
+        if os.path.exists(p):
+            return QIcon(p)
+    return None
+
+
 # =====================================================================
 # Windows 10/11 Native Glass Backdrop & Theme Detection
 # =====================================================================
@@ -206,6 +218,9 @@ class AppleDynamicIsland(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowTitle("JARVIS_DYNAMIC_ISLAND")
+        icon = get_app_icon()
+        if icon:
+            self.setWindowIcon(icon)
 
         # Dimensions & Springs
         self.spring_w = Spring(120.0, 190.0, 22.0)
@@ -783,6 +798,9 @@ class SettingsWindow(QDialog):
         self.updater = updater
 
         self.setWindowTitle("J.A.R.V.I.S. Settings")
+        icon = get_app_icon()
+        if icon:
+            self.setWindowIcon(icon)
         self.setFixedSize(720, 580)
         self.setStyleSheet("""
             QDialog {
@@ -1368,6 +1386,10 @@ class JarvisTray(QSystemTrayIcon):
         self.show()
 
     def _init_icon(self):
+        icon = get_app_icon()
+        if icon and not icon.isNull():
+            self.setIcon(icon)
+            return
         pix = QPixmap(32, 32)
         pix.fill(Qt.GlobalColor.transparent)
         p = QPainter(pix)
@@ -1462,6 +1484,9 @@ class Overlay:
 
         if PYSIDE6_AVAILABLE:
             self.app = QApplication.instance() or QApplication(sys.argv)
+            self.app_icon = get_app_icon()
+            if self.app_icon and not self.app_icon.isNull():
+                self.app.setWindowIcon(self.app_icon)
             self.island = AppleDynamicIsland(self)
             self.cursor_overlay = CursorFeedbackOverlay()
             self.tray = JarvisTray(self, self.app)

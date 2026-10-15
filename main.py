@@ -19,6 +19,11 @@ def _enable_dpi_awareness():
                     ctypes.windll.user32.SetProcessDPIAware()
                 except Exception:
                     pass
+        # Explicit Windows AppUserModelID so taskbar displays our custom icon instead of generic Python/window icon
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("JARVIS.TouchlessPC.Control.1.1")
+        except Exception:
+            pass
 
 
 class Context:
