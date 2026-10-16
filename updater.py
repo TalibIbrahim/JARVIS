@@ -151,6 +151,7 @@ class AutoUpdater:
         threading.Thread(target=self._download_worker, args=(progress_callback, completion_callback), daemon=True).start()
 
     def _download_worker(self, progress_callback, completion_callback):
+        import shutil
         self.is_downloading = True
         self.download_progress = 0
         self._notify("downloading", percent=0)
@@ -158,37 +159,86 @@ class AutoUpdater:
         temp_dir = os.path.join(tempfile.gettempdir(), "jarvis_updater")
         os.makedirs(temp_dir, exist_ok=True)
         dest_file = os.path.join(temp_dir, self.latest_info.get("asset_name") or "JARVIS_update.exe")
+        part_file = dest_file + ".part"
+        expected_size = int(self.latest_info.get("asset_size", 0))
+
+        retries = 8
+        success = False
+        last_error = ""
+
+        while retries > 0:
+            downloaded = os.path.getsize(part_file) if os.path.exists(part_file) else 0
+            if expected_size > 0 and downloaded >= expected_size:
+                success = True
+                break
+
+            headers = {"User-Agent": "Jarvis-AutoUpdater"}
+            if downloaded > 0:
+                headers["Range"] = f"bytes={downloaded}-"
+
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    status = resp.status if hasattr(resp, "status") else resp.getcode()
+                    content_len = int(resp.headers.get("Content-Length", 0))
+                    total_size = (downloaded + content_len) if status == 206 else (content_len or expected_size)
+
+                    if status == 200 and downloaded > 0:
+                        # Server does not support Range; restart from byte 0
+                        downloaded = 0
+
+                    mode = "ab" if (downloaded > 0 and status == 206) else "wb"
+                    chunk_size = 256 * 1024
+
+                    with open(part_file, mode) as f:
+                        while True:
+                            chunk = resp.read(chunk_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0:
+                                percent = min(100, int((downloaded / total_size) * 100))
+                                if percent != self.download_progress:
+                                    self.download_progress = percent
+                                    self._notify("downloading", percent=percent)
+                                    if progress_callback:
+                                        progress_callback(percent)
+
+                # Verify integrity
+                if expected_size > 0:
+                    if downloaded >= expected_size:
+                        success = True
+                        break
+                    else:
+                        raise IOError(f"Truncated download ({downloaded}/{expected_size} bytes)")
+                else:
+                    success = True
+                    break
+
+            except Exception as exc:
+                last_error = str(exc)
+                retries -= 1
+                time.sleep(2)
 
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Jarvis-AutoUpdater"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                total_size = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                chunk_size = 64 * 1024
-
-                with open(dest_file, "wb") as f:
-                    while True:
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            percent = int((downloaded / total_size) * 100)
-                            if percent != self.download_progress:
-                                self.download_progress = percent
-                                self._notify("downloading", percent=percent)
-                                if progress_callback:
-                                    progress_callback(percent)
-
-            self.downloaded_path = dest_file
-            self._notify("downloaded", path=dest_file, version=self.latest_info["version"])
-            if completion_callback:
-                completion_callback(dest_file)
-            if self.overlay:
-                self.overlay.post("say", text="Update downloaded! Ready to restart.")
+            if success and os.path.exists(part_file):
+                if os.path.exists(dest_file):
+                    try:
+                        os.remove(dest_file)
+                    except Exception:
+                        pass
+                shutil.move(part_file, dest_file)
+                self.downloaded_path = dest_file
+                self._notify("downloaded", path=dest_file, version=self.latest_info["version"])
+                if completion_callback:
+                    completion_callback(dest_file)
+                if self.overlay:
+                    self.overlay.post("say", text="Update downloaded! Ready to restart.")
+            else:
+                self._notify("error", message=f"Download failed: {last_error or 'Incomplete file'}")
         except Exception as exc:
-            self._notify("error", message=f"Download failed: {exc}")
+            self._notify("error", message=f"Download finalization failed: {exc}")
         finally:
             self.is_downloading = False
 
