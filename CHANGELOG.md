@@ -279,4 +279,25 @@
   - Added `piper-tts>=1.8.0` and `sounddevice>=0.5.0` to `requirements.txt`.
   - Added hidden imports and data collection for `piper`, `sounddevice`, and `onnxruntime` to `jarvis.spec` and `build_exe.py`.
 
+---
+
+### 25. Release v1.2.5: Voice Audio Fidelity Fix, Siri-Style Dynamic Island Speech & GUI Redesign
+- **Paul Bettany Neural Audio Fidelity & Anti-Crackle Pipeline (`voice.py`)**:
+  - Eliminated audio crackle caused by MME driver sample rate mismatch by dynamically resampling Piper audio (22,050 Hz) to the hardware output device's native rate (44,100 Hz / 48,000 Hz) via `scipy.signal.resample_poly`.
+  - Eliminated 0 dBFS digital clipping and DAC intersample distortion by applying $-1.2\text{ dB}$ headroom scaling ($0.88\times$).
+  - Eliminated chunk boundary DC offset clicks by adding $5\text{ ms}$ linear micro-fades and $60\text{ ms}$ inter-sentence pauses.
+  - Isolated PortAudio stream initialization under `_PORTAUDIO_LOCK` with `latency="high"` buffering.
+- **Siri-Style Dynamic Island Text-to-Speech (`overlay.py`, `main.py`)**:
+  - Every message, status, or alert displayed on the Apple Dynamic Island is now automatically spoken aloud by Paul Bettany's neural voice engine.
+  - Dynamically scales Island display duration based on spoken sentence length ($\max(3.5\text{s}, \text{length} \times 0.08\text{s})$).
+  - Automatically speaks updater notices, AI warnings, and voice command confirmations.
+- **Settings GUI Redesign & Full Window Resizeability (`overlay.py`)**:
+  - Removed fixed dialog geometry; enabled dynamic window resizing with minimum $820 \times 580\text{ px}$ and default $920 \times 640\text{ px}$.
+  - Added standard Windows minimize, maximize, and restore window buttons.
+  - Redesigned with Apple HIG Dark Glass design system: semantic primary (`#007aff`), destructive (`#ff453a`), and success (`#34c759`) action buttons with clear hover/pressed states.
+  - Added custom chevron drop-downs (`QComboBox`) with dark glass menus and focus glowing text inputs (`QLineEdit`).
+  - Added $1\text{px}$ hairline row dividers to `GroupedCard` containers.
+  - Added backwards-compatible `.checked` property to `AppleSwitch`.
+
+
 

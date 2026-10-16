@@ -33,6 +33,8 @@ def build():
         "--hidden-import", "sounddevice",
         "--hidden-import", "_sounddevice",
         "--hidden-import", "onnxruntime",
+        "--hidden-import", "scipy",
+        "--hidden-import", "scipy.signal",
         "--collect-data", "certifi",
         "--collect-data", "piper",
         "main.py"

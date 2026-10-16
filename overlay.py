@@ -44,7 +44,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.2.4"
+    APP_VERSION = "1.2.5"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -847,6 +847,10 @@ class AppleSwitch(QWidget):
     def isChecked(self):
         return self._checked
 
+    @property
+    def checked(self):
+        return self._checked
+
     def setChecked(self, checked):
         if self._checked != checked:
             self._checked = checked
@@ -952,14 +956,22 @@ class GroupedCard(QFrame):
             GroupedCard {
                 background-color: rgba(255, 255, 255, 0.04);
                 border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 10px;
+                border-radius: 12px;
             }
         """)
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(16, 12, 16, 12)
-        self.layout.setSpacing(12)
+        self.layout.setContentsMargins(18, 14, 18, 14)
+        self.layout.setSpacing(10)
+        self._row_count = 0
 
     def add_row(self, title, desc, widget):
+        if self._row_count > 0:
+            divider = QFrame()
+            divider.setFrameShape(QFrame.Shape.HLine)
+            divider.setFrameShadow(QFrame.Shadow.Plain)
+            divider.setStyleSheet("background-color: rgba(255, 255, 255, 0.06); min-height: 1px; max-height: 1px; border: none; margin: 2px 0px;")
+            self.layout.addWidget(divider)
+
         row = QHBoxLayout()
         vbox = QVBoxLayout()
         vbox.setSpacing(2)
@@ -971,11 +983,13 @@ class GroupedCard(QFrame):
         if desc:
             lbl_d = QLabel(desc)
             lbl_d.setStyleSheet("font-size: 11px; color: #8e8e93;")
+            lbl_d.setWordWrap(True)
             vbox.addWidget(lbl_d)
 
         row.addLayout(vbox, stretch=1)
         row.addWidget(widget)
         self.layout.addLayout(row)
+        self._row_count += 1
 
 
 # =====================================================================
@@ -1007,12 +1021,19 @@ class SettingsWindow(QDialog):
         icon = get_app_icon()
         if icon:
             self.setWindowIcon(icon)
-        self.setFixedSize(720, 580)
+        # Resizable window with proper min and default geometry (Apple HIG System Settings style)
+        self.setMinimumSize(820, 580)
+        self.resize(920, 640)
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowMinMaxButtonsHint |
+            Qt.WindowType.WindowCloseButtonHint
+        )
         self.setStyleSheet("""
             QDialog {
-                background-color: #121214;
+                background-color: #141416;
                 color: #f5f5f7;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             }
             QLabel {
                 color: #f5f5f7;
@@ -1028,42 +1049,140 @@ class SettingsWindow(QDialog):
             }
             QSlider::handle:horizontal {
                 background: #ffffff;
-                width: 14px;
-                margin-top: -5px;
-                margin-bottom: -5px;
-                border-radius: 7px;
+                width: 16px;
+                height: 16px;
+                margin-top: -6px;
+                margin-bottom: -6px;
+                border-radius: 8px;
             }
             QPushButton {
                 background-color: rgba(255, 255, 255, 0.08);
                 border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 6px;
+                border-radius: 7px;
                 color: #f5f5f7;
                 padding: 6px 14px;
                 font-size: 12px;
                 font-weight: 500;
+                outline: none;
             }
             QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.14);
+                border-color: rgba(255, 255, 255, 0.22);
+            }
+            QPushButton:pressed {
+                background-color: rgba(255, 255, 255, 0.05);
+            }
+            QPushButton:disabled {
+                color: rgba(255, 255, 255, 0.35);
+                background-color: rgba(255, 255, 255, 0.03);
+                border-color: rgba(255, 255, 255, 0.05);
+            }
+            QPushButton[accent="primary"] {
                 background-color: #007aff;
+                border-color: #0062cc;
+                color: #ffffff;
+                font-weight: 600;
+            }
+            QPushButton[accent="primary"]:hover {
+                background-color: #006fe6;
+                border-color: #005bbd;
+            }
+            QPushButton[accent="primary"]:pressed {
+                background-color: #005bbd;
+            }
+            QPushButton[accent="danger"] {
+                background-color: rgba(255, 69, 58, 0.12);
+                border-color: rgba(255, 69, 58, 0.32);
+                color: #ff453a;
+            }
+            QPushButton[accent="danger"]:hover {
+                background-color: #ff453a;
+                border-color: #d70015;
                 color: #ffffff;
             }
+            QPushButton[accent="danger"]:pressed {
+                background-color: #d70015;
+            }
+            QPushButton[accent="success"] {
+                background-color: #34c759;
+                border-color: #28a745;
+                color: #ffffff;
+                font-weight: 600;
+            }
+            QPushButton[accent="success"]:hover {
+                background-color: #30d158;
+            }
+            QPushButton[accent="success"]:pressed {
+                background-color: #28a745;
+            }
             QComboBox {
-                background-color: #1c1c1e;
+                background-color: #1c1c1f;
                 border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 6px;
+                border-radius: 7px;
                 color: #f5f5f7;
-                padding: 4px 10px;
+                padding: 5px 28px 5px 12px;
                 font-size: 12px;
+            }
+            QComboBox:hover {
+                border-color: rgba(255, 255, 255, 0.22);
+                background-color: #222226;
+            }
+            QComboBox:focus {
+                border: 1px solid #007aff;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 24px;
+                border-left-width: 0px;
+                border-top-right-radius: 7px;
+                border-bottom-right-radius: 7px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                width: 0;
+                height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #8e8e93;
+                margin-right: 8px;
+            }
+            QComboBox::down-arrow:hover {
+                border-top: 5px solid #ffffff;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e1e22;
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 8px;
+                color: #f5f5f7;
+                selection-background-color: #007aff;
+                selection-color: #ffffff;
+                padding: 4px;
+                outline: none;
+            }
+            QComboBox QAbstractItemView::item {
+                height: 28px;
+                padding-left: 8px;
+                border-radius: 5px;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #007aff;
             }
             QLineEdit {
-                background-color: #1c1c1e;
+                background-color: #1c1c1f;
                 border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 6px;
+                border-radius: 7px;
                 color: #f5f5f7;
-                padding: 4px 10px;
+                padding: 6px 12px;
                 font-size: 12px;
+                selection-background-color: #007aff;
+            }
+            QLineEdit:hover {
+                border-color: rgba(255, 255, 255, 0.22);
             }
             QLineEdit:focus {
-                border: 1px solid #007aff;
+                border: 1.5px solid #007aff;
+                background-color: #222226;
             }
         """)
 
@@ -1073,21 +1192,26 @@ class SettingsWindow(QDialog):
 
         # 1. Left Sidebar
         self.sidebar = QListWidget()
-        self.sidebar.setFixedWidth(190)
+        self.sidebar.setFixedWidth(210)
         self.sidebar.setStyleSheet("""
             QListWidget {
                 background-color: #18181b;
                 border: none;
                 border-right: 1px solid rgba(255, 255, 255, 0.08);
-                padding: 12px 8px;
+                padding: 14px 10px;
             }
             QListWidget::item {
-                height: 32px;
-                border-radius: 6px;
-                color: #8e8e93;
+                height: 36px;
+                border-radius: 8px;
+                color: #a1a1aa;
                 font-size: 13px;
                 font-weight: 500;
-                padding-left: 10px;
+                padding-left: 12px;
+                margin-bottom: 2px;
+            }
+            QListWidget::item:hover {
+                background-color: rgba(255, 255, 255, 0.05);
+                color: #f5f5f7;
             }
             QListWidget::item:selected {
                 background-color: #007aff;
@@ -1510,8 +1634,9 @@ class SettingsWindow(QDialog):
         )
 
         btn_test_tts = QPushButton("Test Voice")
-        btn_test_tts.setFixedHeight(28)
-        btn_test_tts.setFixedWidth(85)
+        btn_test_tts.setProperty("accent", "primary")
+        btn_test_tts.setFixedHeight(30)
+        btn_test_tts.setFixedWidth(95)
         btn_test_tts.clicked.connect(
             lambda: self.ctx.say("At your service, sir. All systems are fully operational.") if self.ctx else None
         )
@@ -1612,6 +1737,8 @@ class SettingsWindow(QDialog):
         test_layout.setSpacing(6)
 
         self.btn_test_mic = QPushButton("Test Microphone & Recognition")
+        self.btn_test_mic.setProperty("accent", "primary")
+        self.btn_test_mic.setFixedHeight(32)
         self.lbl_test_result = QLabel("Click above to test microphone audio recording and speech recognition.")
         self.lbl_test_result.setStyleSheet("font-size: 11px; color: #8e8e93;")
         self.lbl_test_result.setWordWrap(True)
@@ -1708,10 +1835,12 @@ class SettingsWindow(QDialog):
         btn_toggle_key.clicked.connect(toggle_key_mask)
 
         btn_save_key = QPushButton("Save")
-        btn_save_key.setFixedWidth(54)
+        btn_save_key.setProperty("accent", "primary")
+        btn_save_key.setFixedWidth(58)
 
         btn_remove_key = QPushButton("Remove")
-        btn_remove_key.setFixedWidth(64)
+        btn_remove_key.setProperty("accent", "danger")
+        btn_remove_key.setFixedWidth(68)
 
         key_hlayout.addWidget(self.key_input)
         key_hlayout.addWidget(btn_toggle_key)
@@ -1735,7 +1864,7 @@ class SettingsWindow(QDialog):
 
         def save_key_action():
             val = self.key_input.text().strip()
-            save_to_cfg = self.sw_save_cfg.checked
+            save_to_cfg = self.sw_save_cfg.isChecked()
             if val:
                 set_api_key(val, persist_to_config=save_to_cfg)
                 self._save("groq_api_key", val if save_to_cfg else "")
@@ -1807,6 +1936,7 @@ class SettingsWindow(QDialog):
         test_hbox = QHBoxLayout()
         test_hbox.setSpacing(10)
         btn_test_conn = QPushButton("Test Connection")
+        btn_test_conn.setProperty("accent", "primary")
         lbl_conn_status = QLabel("Ready to test")
         lbl_conn_status.setStyleSheet("font-size: 11px; color: #8e8e93;")
         test_hbox.addWidget(btn_test_conn)
@@ -1910,19 +2040,10 @@ class SettingsWindow(QDialog):
             u_hbox.setSpacing(10)
 
             btn_chk = QPushButton("Check for Updates")
+            btn_chk.setProperty("accent", "primary")
             btn_restart = QPushButton("Restart to Update")
+            btn_restart.setProperty("accent", "success")
             btn_restart.setVisible(False)
-            btn_restart.setStyleSheet("""
-                QPushButton {
-                    background-color: #34c759;
-                    color: #ffffff;
-                    font-weight: 600;
-                    border: none;
-                }
-                QPushButton:hover {
-                    background-color: #30d158;
-                }
-            """)
 
             lbl_up_status = QLabel(f"Current version is v{APP_VERSION}.")
             lbl_up_status.setStyleSheet("font-size: 11px; color: #8e8e93;")
@@ -2248,21 +2369,30 @@ class Overlay:
                     self.tray.update_status(d["active"])
                     self.cursor_overlay.update_state(d)
                 elif kind == "say":
-                    self.island.say_text = d["text"]
-                    self.island.say_until = now + 4.2
+                    text = d.get("text", "")
+                    self.island.say_text = text
+                    self.island.say_until = now + max(3.5, len(text) * 0.08)
+                    if d.get("speak", True) and text and self.ctx and hasattr(self.ctx, "speaker"):
+                        self.ctx.speaker.say(text)
                 elif kind == "listening":
                     self.island.listening = True
                     self.island.listening_until = d.get("until", now + 5.0)
                 elif kind == "thinking":
                     self.island.thinking = d.get("active", True)
                 elif kind == "ai_error":
-                    self.island.error_text = d.get("text", "AI Error")
+                    err_text = d.get("text", "AI Error")
+                    self.island.error_text = err_text
                     self.island.error_until = now + 4.5
                     self.island.is_ai_error = True
+                    if d.get("speak", True) and err_text and self.ctx and hasattr(self.ctx, "speaker"):
+                        self.ctx.speaker.say(f"Notice: {err_text}")
                 elif kind == "error":
-                    self.island.error_text = d.get("text", "Error")
+                    err_text = d.get("text", "Error")
+                    self.island.error_text = err_text
                     self.island.error_until = now + 5.0
                     self.island.is_ai_error = False
+                    if d.get("speak", False) and err_text and self.ctx and hasattr(self.ctx, "speaker"):
+                        self.ctx.speaker.say(f"Alert: {err_text}")
                 elif kind == "cursor_dwell":
                     self.cursor_overlay.update_dwell(d)
                 elif kind == "open_settings":

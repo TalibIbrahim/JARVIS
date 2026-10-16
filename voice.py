@@ -392,9 +392,54 @@ class Speaker(threading.Thread):
             chunks = list(voice.synthesize(text))
             if not chunks:
                 return
-            sample_rate = chunks[0].sample_rate
-            audio = np.concatenate([c.audio_float_array for c in chunks])
-            sd.play(audio, sample_rate)
+            raw_sr = chunks[0].sample_rate
+
+            # 1. Clean DC offsets and prevent inter-chunk boundary clicks
+            fade_len = int(raw_sr * 0.005)  # 5ms micro-fade
+            silence = np.zeros(int(raw_sr * 0.06), dtype=np.float32)  # 60ms natural pause between sentences
+            processed_chunks = []
+            for c in chunks:
+                arr = c.audio_float_array.copy()
+                if len(arr) > fade_len * 2:
+                    ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                    arr[:fade_len] *= ramp
+                    arr[-fade_len:] *= ramp[::-1]
+                processed_chunks.append(arr)
+                processed_chunks.append(silence)
+
+            audio = np.concatenate(processed_chunks)
+
+            # 2. Headroom scaling: Prevent digital inter-sample clipping on DAC / Windows mixer
+            # Piper normalizes audio to 1.0 (0 dBFS), which causes clipping/crackling during playback & resampling.
+            # 0.88x provides ~1.2 dB of headroom.
+            audio = np.clip(audio * 0.88, -0.95, 0.95).astype(np.float32)
+
+            # 3. Resample to hardware output device's native sample rate (e.g. 44100 / 48000 Hz)
+            # Modern Windows drivers (Realtek) do not natively render 22050 Hz under MME/DirectSound.
+            # Real-time driver resampling causes buffer underruns, jitter, and crackling.
+            target_sr = raw_sr
+            try:
+                out_dev = sd.query_devices(kind="output")
+                dev_sr = int(out_dev.get("default_samplerate", 44100))
+                if dev_sr > 0:
+                    target_sr = dev_sr
+            except Exception:
+                target_sr = 44100
+
+            if raw_sr != target_sr:
+                try:
+                    import scipy.signal as signal
+                    audio = signal.resample_poly(audio, up=target_sr, down=raw_sr).astype(np.float32)
+                except Exception:
+                    # Fallback linear interpolation
+                    old_indices = np.linspace(0, len(audio) - 1, len(audio))
+                    new_len = int(len(audio) * target_sr / raw_sr)
+                    new_indices = np.linspace(0, len(audio) - 1, new_len)
+                    audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
+
+            # 4. Play with high latency buffer to avoid starvation under CPU load
+            with _PORTAUDIO_LOCK:
+                sd.play(audio, samplerate=target_sr, latency="high")
             sd.wait()
         except Exception as exc:
             print(f"[voice] Piper synthesis/playback error: {exc}, falling back to system TTS")

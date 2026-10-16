@@ -37,8 +37,9 @@ class Context:
         self.updater = updater
 
     def say(self, text):
-        self.overlay.post("say", text=text)
-        self.speaker.say(text)
+        if not text:
+            return
+        self.overlay.post("say", text=text, speak=True)
 
     def set_active(self, want):
         if want is False:

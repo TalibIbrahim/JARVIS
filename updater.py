@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 GITHUB_REPO = "TalibIbrahim/JARVIS"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
