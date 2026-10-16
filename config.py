@@ -108,8 +108,10 @@ class Config:
     # --- ai / groq intelligence ---
     ai_enabled: bool = False
     ai_provider: str = "groq"
-    ai_llm_model: str = "llama-3.1-8b-instant"
+    ai_llm_model: str = "openai/gpt-oss-120b"
     ai_stt_model: str = "whisper-large-v3-turbo"
+    ai_vision_model: str = "qwen/qwen3.8-27b"
+    ai_vision_enabled: bool = True
     ai_timeout: int = 10
     ai_max_history: int = 6
     groq_api_key: str = ""              # optional saved Groq API key persisted in config file

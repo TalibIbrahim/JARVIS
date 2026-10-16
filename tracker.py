@@ -90,9 +90,21 @@ class Tracker(threading.Thread):
         self.ctx = ctx
         self.stop = stop_event
         self._fps = 0.0
-        self._last_frame_t = time.time()
         self._grabber = None
         self._inference_ms = 0.0
+        self._frame_lock = threading.Lock()
+        self._latest_raw_frame = None
+
+    def get_latest_frame(self, unmirrored: bool = True):
+        """Returns the latest captured camera frame (BGR) for vision inspection."""
+        if self._grabber:
+            frame, _ = self._grabber.get_latest()
+            if frame is not None:
+                return frame.copy() if unmirrored else cv2.flip(frame, 1)
+        with self._frame_lock:
+            if self._latest_raw_frame is not None:
+                return self._latest_raw_frame.copy() if unmirrored else cv2.flip(self._latest_raw_frame, 1)
+        return None
 
     def run(self):
         cfg = self.cfg
@@ -163,6 +175,8 @@ class Tracker(threading.Thread):
                     time.sleep(0.03)
                     continue
                 failures = 0
+                with self._frame_lock:
+                    self._latest_raw_frame = frame.copy()
 
             frame = cv2.flip(frame, 1)                       # mirror, so moving right moves right
             

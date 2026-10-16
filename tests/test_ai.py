@@ -223,7 +223,8 @@ class TestKeyStorage(unittest.TestCase):
             self.assertNotIn("secret", key.lower())
             self.assertNotIn("token", key.lower())
 
-    def test_groq_api_key_persistence(self):
+    @patch("keyring.get_password", return_value=None)
+    def test_groq_api_key_persistence(self, mock_keyring):
         cfg = Config(groq_api_key="gsk_test12345")
         self.assertEqual(cfg.groq_api_key, "gsk_test12345")
         key = get_api_key(cfg)
@@ -482,6 +483,56 @@ class TestVADSilenceRejection(unittest.TestCase):
              patch.object(GroqClient, "transcribe") as mock_transcribe:
             voice._recognition_worker(MagicMock(), MagicMock())
             mock_transcribe.assert_not_called()
+
+
+class TestVisionAnalysis(unittest.TestCase):
+    """Tests visual query detection and Groq vision analysis."""
+
+    def test_visual_query_detection(self):
+        from commands import is_visual_query
+        self.assertTrue(is_visual_query("what is this"))
+        self.assertTrue(is_visual_query("what's that"))
+        self.assertTrue(is_visual_query("what am I holding"))
+        self.assertTrue(is_visual_query("Jarvis, look at this"))
+        self.assertTrue(is_visual_query("what do you see in front of the camera"))
+        self.assertTrue(is_visual_query("identify this"))
+        self.assertTrue(is_visual_query("read this"))
+        self.assertFalse(is_visual_query("open chrome"))
+        self.assertFalse(is_visual_query("volume up"))
+        self.assertFalse(is_visual_query("what is the weather in Paris"))
+
+    @patch("requests.post")
+    def test_describe_image_with_numpy_array(self, mock_post):
+        import numpy as np
+        mock_post.return_value = MockResponse(
+            status_code=200,
+            json_data={"choices": [{"message": {"content": "That is a Rubik's cube, sir."}}]}
+        )
+        client = GroqClient(api_key="gsk_test_key")
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        reply = client.describe_image(img, prompt="what is this?")
+        self.assertEqual(reply, "That is a Rubik's cube, sir.")
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+        payload = kwargs["json"]
+        self.assertIn("qwen", payload["model"].lower())
+        self.assertTrue(payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+
+    @patch("commands.get_api_key", return_value="gsk_valid_key")
+    @patch.object(GroqClient, "describe_image", return_value="That is a Rubik's cube, sir.")
+    def test_run_command_visual_query_dispatches_to_vision(self, mock_desc, mock_key):
+        import numpy as np
+        ctx = MagicMock()
+        cfg = Config()
+        cfg.ai_enabled = True
+        cfg.ai_vision_enabled = True
+        ctx.engine.cfg = cfg
+        mock_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        ctx.tracker.get_latest_frame.return_value = mock_frame
+
+        reply = run_command("what is this", ctx)
+        self.assertEqual(reply, "That is a Rubik's cube, sir.")
+        mock_desc.assert_called_once()
 
 
 if __name__ == "__main__":

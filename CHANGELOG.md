@@ -299,5 +299,21 @@
   - Added $1\text{px}$ hairline row dividers to `GroupedCard` containers.
   - Added backwards-compatible `.checked` property to `AppleSwitch`.
 
+---
+
+### 26. Release v1.2.6: Groq Camera Vision & Real-Time Scene Inspection
+- **Multimodal Visual Scene Understanding (`ai.py`, `commands.py`, `tracker.py`)**:
+  - Integrated Groq's multimodal vision endpoint using `qwen/qwen3.8-27b`.
+  - Added `Tracker.get_latest_frame()` to expose real-time, non-blocking camera frame snapshots from `FrameGrabber`.
+  - Added `is_visual_query()` intent detection for conversational inquiries (e.g. *"what is this"*, *"what am I holding"*, *"look at this"*, *"what do you see"*).
+  - Jarvis captures the webcam frame, encodes it to JPEG in memory, passes it to Groq Vision, and delivers a concise spoken description via Paul Bettany's voice (e.g., *"That appears to be a Rubik's cube, sir."*).
+- **Vision Model Selection & Settings Controls (`overlay.py`, `config.py`)**:
+  - Added `ai_vision_model` and `ai_vision_enabled` configuration properties.
+  - Added "Vision Model" selector and "Camera Vision Analysis" toggle switch in Settings $\rightarrow$ AI & Intelligence.
+- **Upgraded Default Models (`ai.py`, `config.py`)**:
+  - Transitioned default conversational LLM to `openai/gpt-oss-120b` and `openai/gpt-oss-20b` following Groq's model lifecycle update.
+  - Added full test coverage for visual query recognition and image description (`TestVisionAnalysis`).
+
+
 
 

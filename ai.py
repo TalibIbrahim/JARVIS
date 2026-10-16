@@ -32,8 +32,9 @@ SERVICE_NAME = "JARVIS"
 KEY_USERNAME = "groq_api_key"
 
 # Default models
-DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
+DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
 DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
+DEFAULT_VISION_MODEL = "qwen/qwen3.8-27b"
 
 # Whitelist of actions the LLM is permitted to request
 WHITELIST_ACTIONS = {
@@ -364,6 +365,90 @@ class GroqClient:
         except Exception as exc:
             raise InvalidResponseError("Failed to parse chat completion response") from exc
 
+    def describe_image(self, image_input: Any, prompt: Optional[str] = None,
+                       model: str = DEFAULT_VISION_MODEL) -> str:
+        """
+        Submits an image to Groq's multimodal vision endpoint for real-time visual scene analysis.
+        Accepts:
+        - numpy BGR array (OpenCV webcam frame)
+        - raw JPEG bytes
+        - base64 data URL string
+        """
+        self.rate_limiter.acquire()
+        headers = self._get_headers()
+        headers["Content-Type"] = "application/json"
+        url = f"{self.base_url}/chat/completions"
+
+        # Prepare base64 data URL
+        if isinstance(image_input, str) and image_input.startswith("data:image"):
+            image_url = image_input
+        elif isinstance(image_input, (bytes, bytearray)):
+            import base64
+            b64 = base64.b64encode(image_input).decode("utf-8")
+            image_url = f"data:image/jpeg;base64,{b64}"
+        elif hasattr(image_input, "shape"):  # numpy array (OpenCV BGR frame)
+            import cv2
+            import base64
+            # Resize frame to max dimension 720 for low-latency transmission while maintaining crisp clarity
+            h, w = image_input.shape[:2]
+            max_dim = 720
+            if max(h, w) > max_dim:
+                scale = max_dim / float(max(h, w))
+                new_w, new_h = int(w * scale), int(h * scale)
+                frame_to_send = cv2.resize(image_input, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                frame_to_send = image_input
+
+            ok, buf = cv2.imencode(".jpg", frame_to_send, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                raise AIError("Failed to encode camera frame into JPEG")
+            b64 = base64.b64encode(buf).decode("utf-8")
+            image_url = f"data:image/jpeg;base64,{b64}"
+        else:
+            raise AIError("Unsupported image input format")
+
+        system_instruction = (
+            "You are J.A.R.V.I.S., the witty, brilliant AI assistant from Iron Man. "
+            "The user is showing an object or their surroundings to your camera. "
+            "Accurately identify what you see, answer their question, and address the user as 'sir'. "
+            "Be concise, natural, and limit your spoken reply to 1-2 sentences maximum."
+        )
+
+        user_content = []
+        user_prompt = prompt.strip() if prompt and prompt.strip() else "Identify what is in front of the camera, sir."
+        user_content.append({"type": "text", "text": f"{system_instruction}\n\nUser asks: {user_prompt}"})
+        user_content.append({"type": "image_url", "image_url": {"url": image_url}})
+
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user_content
+                }
+            ],
+            "max_tokens": 120,
+            "temperature": 0.2
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+        except requests.exceptions.Timeout as exc:
+            raise TimeoutError(f"Vision analysis timed out after {self.timeout}s") from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise OfflineError("Network offline: unable to reach Groq vision service") from exc
+        except requests.exceptions.RequestException as exc:
+            raise AIError(f"Network error during vision analysis: {exc}") from exc
+
+        if resp.status_code != 200:
+            self._handle_response_error(resp)
+
+        try:
+            res_json = resp.json()
+            return res_json["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            raise InvalidResponseError("Failed to parse vision response") from exc
+
     def list_models(self) -> List[str]:
         """
         Queries available models from Groq.
@@ -393,13 +478,14 @@ class GroqClient:
             raise InvalidResponseError("Failed to parse models response") from exc
 
     def get_categorized_models(self) -> Dict[str, List[str]]:
-        """Returns models partitioned into 'llm' and 'stt'."""
+        """Returns models partitioned into 'llm', 'vision', and 'stt'."""
         try:
             models = self.list_models()
         except Exception:
             models = []
 
         stt_models = [m for m in models if "whisper" in m.lower()]
+        vision_models = [m for m in models if any(k in m.lower() for k in ("vision", "qwen"))]
         llm_models = [m for m in models if "whisper" not in m.lower()]
 
         # Ensure defaults are present even if offline or list is empty
@@ -408,13 +494,16 @@ class GroqClient:
         if "whisper-large-v3" not in stt_models:
             stt_models.append("whisper-large-v3")
 
+        if DEFAULT_VISION_MODEL not in vision_models:
+            vision_models.insert(0, DEFAULT_VISION_MODEL)
+
         if DEFAULT_LLM_MODEL not in llm_models:
             llm_models.insert(0, DEFAULT_LLM_MODEL)
-        for fallback in ("llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "mixtral-8x7b-32768"):
-            if fallback not in llm_models:
+        for fallback in ("openai/gpt-oss-20b", "qwen/qwen3.8-27b", "allam-2-7b"):
+            if fallback not in llm_models and fallback in models:
                 llm_models.append(fallback)
 
-        return {"llm": sorted(llm_models), "stt": sorted(stt_models)}
+        return {"llm": sorted(llm_models), "vision": sorted(vision_models), "stt": sorted(stt_models)}
 
     def validate_key(self) -> Tuple[bool, str]:
         """

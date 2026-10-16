@@ -11,6 +11,7 @@ from ai import (
     get_api_key,
     GroqClient,
     DEFAULT_LLM_MODEL,
+    DEFAULT_VISION_MODEL,
     get_conversation_manager,
     reset_ai_history,
     build_system_prompt,
@@ -195,8 +196,34 @@ def run_command(text, ctx):
     return _handle_ai_query(text, ctx)
 
 
+def is_visual_query(text: str) -> bool:
+    """Detects if the user's query asks to identify or inspect something in front of the camera."""
+    t = text.lower().strip()
+    visual_patterns = [
+        r"\bwhat(?:'s| is) this\b",
+        r"\bwhat(?:'s| is) that\b",
+        r"\bwhat am i holding\b",
+        r"\bwhat(?:'s| is) in my hand\b",
+        r"\bwhat am i showing\b",
+        r"\blook at this\b",
+        r"\blook here\b",
+        r"\bcan you see this\b",
+        r"\bdo you see this\b",
+        r"\bwhat do you see\b",
+        r"\bdescribe what you see\b",
+        r"\bwhat(?:'s| is) in front of (?:the|your) camera\b",
+        r"\bidentify this\b",
+        r"\btell me what this is\b",
+        r"\bwhat object is this\b",
+        r"\bwhat does this say\b",
+        r"\bread this\b",
+        r"\binspect this\b",
+    ]
+    return any(re.search(pat, t) for pat in visual_patterns)
+
+
 def _handle_ai_query(user_text: str, ctx: Any) -> str:
-    """Dispatches unhandled user utterances to the Groq LLM if enabled."""
+    """Dispatches unhandled user utterances to the Groq LLM or Vision endpoint if enabled."""
     cfg = None
     if ctx:
         if hasattr(ctx, "engine") and hasattr(ctx.engine, "cfg"):
@@ -216,6 +243,46 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
             ctx.overlay.post("thinking", active=True)
         except Exception:
             pass
+
+    # Visual scene query inspection
+    if is_visual_query(user_text) and getattr(cfg, "ai_vision_enabled", True):
+        tracker = getattr(ctx, "tracker", None) if ctx else None
+        frame = tracker.get_latest_frame() if tracker else None
+        if frame is not None:
+            try:
+                vision_model = getattr(cfg, "ai_vision_model", DEFAULT_VISION_MODEL) if cfg else DEFAULT_VISION_MODEL
+                timeout = getattr(cfg, "ai_timeout", 12) if cfg else 12
+                client = GroqClient(api_key=api_key, timeout=timeout)
+                reply = client.describe_image(frame, prompt=user_text, model=vision_model)
+                conv_mgr = get_conversation_manager()
+                conv_mgr.add_turn(user_text, reply)
+                return reply
+            except AuthenticationError:
+                if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                    try:
+                        ctx.overlay.post("ai_error", text="Invalid Groq Key")
+                    except Exception:
+                        pass
+                return "My Groq API key appears to be invalid, sir. Please check your settings."
+            except RateLimitError:
+                if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                    try:
+                        ctx.overlay.post("ai_error", text="Groq Rate Limited")
+                    except Exception:
+                        pass
+                return "Groq rate limit reached, sir. Please stand by a moment."
+            except (OfflineError, TimeoutError):
+                if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                    try:
+                        ctx.overlay.post("ai_error", text="Groq Offline")
+                    except Exception:
+                        pass
+                return "I am unable to reach the visual service right now, sir."
+            except Exception as exc:
+                print(f"[ai] vision query exception: {exc}")
+                return "I was unable to analyze the camera feed, sir."
+        else:
+            return "My optical sensor is currently unavailable, sir. I cannot view what you are holding."
 
     try:
         timeout = getattr(cfg, "ai_timeout", 10) if cfg else 10

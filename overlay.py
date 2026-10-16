@@ -44,7 +44,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.2.5"
+    APP_VERSION = "1.2.6"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -1308,6 +1308,16 @@ class SettingsWindow(QDialog):
                 self.stt_combo.setCurrentText(cur_s)
             self.stt_combo.blockSignals(False)
 
+        if ok and models_data and hasattr(self, "vision_combo"):
+            cur_v = self.vision_combo.currentText()
+            self.vision_combo.blockSignals(True)
+            self.vision_combo.clear()
+            for vm in models_data.get("vision", []):
+                self.vision_combo.addItem(vm)
+            if cur_v in models_data.get("vision", []):
+                self.vision_combo.setCurrentText(cur_v)
+            self.vision_combo.blockSignals(False)
+
     def _on_test_mic_result(self, res):
         if hasattr(self, "btn_test_mic"):
             self.btn_test_mic.setEnabled(True)
@@ -1905,8 +1915,8 @@ class SettingsWindow(QDialog):
 
         # LLM Model dropdown
         self.llm_combo = QComboBox()
-        default_llms = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"]
-        cur_llm = getattr(self.cfg, "ai_llm_model", "llama-3.1-8b-instant")
+        default_llms = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "allam-2-7b"]
+        cur_llm = getattr(self.cfg, "ai_llm_model", "openai/gpt-oss-120b")
         if cur_llm not in default_llms:
             default_llms.insert(0, cur_llm)
         for m in default_llms:
@@ -1914,6 +1924,23 @@ class SettingsWindow(QDialog):
         self.llm_combo.setCurrentText(cur_llm)
         self.llm_combo.currentTextChanged.connect(lambda v: self._save("ai_llm_model", v))
         card_models.add_row("Language Model", "Model for command interpretation and conversational responses", self.llm_combo)
+
+        # Vision Model dropdown
+        self.vision_combo = QComboBox()
+        default_visions = ["qwen/qwen3.8-27b"]
+        cur_vision = getattr(self.cfg, "ai_vision_model", "qwen/qwen3.8-27b")
+        if cur_vision not in default_visions:
+            default_visions.insert(0, cur_vision)
+        for m in default_visions:
+            self.vision_combo.addItem(m)
+        self.vision_combo.setCurrentText(cur_vision)
+        self.vision_combo.currentTextChanged.connect(lambda v: self._save("ai_vision_model", v))
+        card_models.add_row("Vision Model", "Multimodal model for camera scene inspection and object identification", self.vision_combo)
+
+        # Camera Vision Toggle
+        sw_vision = AppleSwitch(getattr(self.cfg, "ai_vision_enabled", True))
+        sw_vision.toggled.connect(lambda v: self._save("ai_vision_enabled", v))
+        card_models.add_row("Camera Vision Analysis", "Allows Jarvis to inspect camera feed when asked 'what is this' or 'look at this'", sw_vision)
 
         # Speech Model dropdown
         self.stt_combo = QComboBox()

@@ -29,12 +29,13 @@ def _enable_dpi_awareness():
 class Context:
     """Small bundle shared by the tracker, voice commands and hotkeys."""
 
-    def __init__(self, engine, overlay, speaker, stop, updater=None):
+    def __init__(self, engine, overlay, speaker, stop, updater=None, tracker=None):
         self.engine = engine
         self.overlay = overlay
         self.speaker = speaker
         self.stop = stop
         self.updater = updater
+        self.tracker = tracker
 
     def say(self, text):
         if not text:
@@ -168,6 +169,7 @@ def main():
     updater.start_periodic_check(interval_hours=4)
 
     tracker = Tracker(cfg, engine, controller, overlay, ctx, stop)
+    ctx.tracker = tracker
     tracker.start()
     if cfg.voice_enabled:
         Voice(cfg, ctx, stop).start()
