@@ -231,11 +231,15 @@ class Tracker(threading.Thread):
 
         # Draw active tracking boundary box
         m = self.cfg.box_margin
-        x1, y1 = int(m * w), int(m * h)
-        x2, y2 = int((1 - m) * w), int((1 - m) * h)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (70, 70, 30), 1)
-        cv2.putText(frame, f"TRACKING ZONE ({100 - int(2*m*100)}%)", (x1 + 4, y1 + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, dim_gray, 1, cv2.LINE_AA)
+        if m > 0.005:
+            x1, y1 = int(m * w), int(m * h)
+            x2, y2 = int((1 - m) * w), int((1 - m) * h)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (70, 70, 30), 1)
+            cv2.putText(frame, f"TRACKING ZONE ({100 - int(2*m*100)}%)", (x1 + 4, y1 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, dim_gray, 1, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, "TRACKING ZONE: FULL (100%)", (12, 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, green, 1, cv2.LINE_AA)
 
         # Draw hand skeletons
         for hand in hands:

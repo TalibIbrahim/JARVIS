@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 GITHUB_REPO = "TalibIbrahim/JARVIS"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -56,6 +56,13 @@ class AutoUpdater:
 
     def add_listener(self, callback):
         self._listeners.append(callback)
+
+    def remove_listener(self, callback):
+        if callback in self._listeners:
+            try:
+                self._listeners.remove(callback)
+            except ValueError:
+                pass
 
     def _notify(self, state, **kwargs):
         self.status = state

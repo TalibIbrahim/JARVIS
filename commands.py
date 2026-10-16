@@ -54,62 +54,64 @@ def run_command(text, ctx):
     """Returns the reply Jarvis should speak, or None if nothing matched."""
     import pyautogui
     t = text.lower().strip(" ,.!?")
+    # Strip conversational filler prefixes
+    clean_t = re.sub(r"^(?:please\s+|can you\s+(?:please\s+)?|could you\s+(?:please\s+)?|would you\s+(?:please\s+)?|hey\s+|ok\s+|okay\s+|just\s+)", "", t).strip()
 
     # --- power / mode ---
-    if _any(t, "shut down jarvis", "quit jarvis", "exit jarvis", "power down", "goodbye"):
+    if _any(clean_t, "shut down jarvis", "quit jarvis", "exit jarvis", "power down", "goodbye"):
         ctx.quit()
         return "Powering down. Goodbye, sir."
-    if _any(t, "go to sleep", "sleep mode", "standby", "stand by"):
+    if _any(clean_t, "go to sleep", "sleep mode", "sleep", "take a nap", "standby", "stand by", "rest"):
         ctx.set_active(False)
         reset_ai_history()
         return "Going to standby, sir."
-    if _any(t, "wake up", "activate", "come online", "i'm back", "im back", "online"):
+    if _any(clean_t, "wake up", "activate", "come online", "i'm back", "im back", "online"):
         ctx.set_active(True)
         return "Online. At your service, sir."
 
     # --- ai setup ---
-    if _any(t, "set up ai", "setup ai", "configure ai", "ai settings", "open ai settings"):
+    if _any(clean_t, "set up ai", "setup ai", "configure ai", "ai settings", "open ai settings"):
         if hasattr(ctx, "overlay") and ctx.overlay:
             ctx.overlay.open_settings("AI")
             return "Opening AI settings, sir."
         return "Settings overlay is unavailable, sir."
 
     # --- dwell & pointer modes ---
-    if _any(t, "dwell on", "enable dwell", "turn on dwell", "dwell click on"):
+    if _any(clean_t, "dwell on", "enable dwell", "turn on dwell", "dwell click on"):
         ctx.engine.cfg.dwell_mode = "click"
         return "Dwell click enabled, sir."
-    if _any(t, "dwell off", "disable dwell", "turn off dwell", "dwell click off"):
+    if _any(clean_t, "dwell off", "disable dwell", "turn off dwell", "dwell click off"):
         ctx.engine.cfg.dwell_mode = "off"
         return "Dwell click disabled, sir."
-    if _any(t, "dwell menu", "dwell radial", "radial menu on", "radial mode"):
+    if _any(clean_t, "dwell menu", "dwell radial", "radial menu on", "radial mode"):
         ctx.engine.cfg.dwell_mode = "radial"
         return "Dwell radial menu enabled, sir."
-    if _any(t, "precision mode on", "enable precision", "fine aim on"):
+    if _any(clean_t, "precision mode on", "enable precision", "fine aim on"):
         ctx.engine.cfg.precision_mode = True
         return "Precision fine-aim mode enabled, sir."
-    if _any(t, "precision mode off", "disable precision", "fine aim off"):
+    if _any(clean_t, "precision mode off", "disable precision", "fine aim off"):
         ctx.engine.cfg.precision_mode = False
         return "Precision fine-aim mode disabled, sir."
-    if _any(t, "relative mode", "trackpad mode"):
+    if _any(clean_t, "relative mode", "trackpad mode"):
         ctx.engine.cfg.tracking_mode = "relative"
         return "Relative trackpad mode active, sir."
-    if _any(t, "absolute mode", "screen mode"):
+    if _any(clean_t, "absolute mode", "screen mode"):
         ctx.engine.cfg.tracking_mode = "absolute"
         return "Absolute screen mapping active, sir."
 
     # --- chatter ---
-    if t in ("hello", "hi", "hey", "good morning", "good evening", "good afternoon"):
+    if clean_t in ("hello", "hi", "hey", "good morning", "good evening", "good afternoon"):
         return "Welcome back, sir."
-    if _any(t, "status", "report", "how are you"):
+    if _any(clean_t, "status", "report", "how are you"):
         state = "online" if ctx.engine.active else "on standby"
         return f"All systems nominal. Hand tracking is {state}, sir."
-    if re.search(r"\b(time|what time|current time)\b", t):
+    if re.search(r"\b(time|what time|current time)\b", clean_t):
         return "It is " + datetime.datetime.now().strftime("%I:%M %p").lstrip("0") + ", sir."
-    if _any(t, "date", "what day"):
+    if _any(clean_t, "date", "what day"):
         return "Today is " + datetime.datetime.now().strftime("%A, %B %d") + "."
 
     # --- apps and web ---
-    m = re.match(r"(?:open|launch|start)\s+(.+)", t)
+    m = re.match(r"(?:open|launch|start|run|bring up|go to)\s+(?:up\s+)?(?:the\s+)?(.+)", clean_t)
     if m:
         name = m.group(1).strip()
         if name in SITES:
@@ -119,28 +121,28 @@ def run_command(text, ctx):
             _launch(APPS[name])
             return f"Opening {name}."
         return f"I don't know how to open {name} yet, sir."
-    m = re.match(r"(?:search(?: for)?|google|look up)\s+(.+)", t)
+    m = re.match(r"(?:search(?: for)?|google|look up)\s+(.+)", clean_t)
     if m:
         webbrowser.open("https://www.google.com/search?q=" + m.group(1).strip().replace(" ", "+"))
         return f"Searching for {m.group(1).strip()}."
 
     # --- media / volume ---
-    if _any(t, "volume up", "louder"):
+    if _any(clean_t, "volume up", "turn up", "turn the volume up", "turn volume up", "increase volume", "raise volume", "louder"):
         pyautogui.press("volumeup", presses=5, _pause=False)
         return "Volume up."
-    if _any(t, "volume down", "quieter", "lower the volume"):
+    if _any(clean_t, "volume down", "turn down", "turn the volume down", "turn volume down", "decrease volume", "lower the volume", "lower volume", "quieter"):
         pyautogui.press("volumedown", presses=5, _pause=False)
         return "Volume down."
-    if re.search(r"\b(mute|unmute)\b", t):
+    if re.search(r"\b(mute|unmute)\b", clean_t):
         pyautogui.press("volumemute", _pause=False)
         return "Muted."
-    if _any(t, "play", "pause", "resume"):
+    if _any(clean_t, "play", "pause", "resume"):
         pyautogui.press("playpause", _pause=False)
         return "Done."
-    if _any(t, "next track", "next song", "skip"):
+    if _any(clean_t, "next track", "next song", "skip"):
         pyautogui.press("nexttrack", _pause=False)
         return "Skipping."
-    if _any(t, "previous track", "previous song", "go back a song"):
+    if _any(clean_t, "previous track", "previous song", "go back a song"):
         pyautogui.press("prevtrack", _pause=False)
         return "Going back."
 

@@ -106,6 +106,55 @@ class TestSettingsWindowInteractions(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(self.stop.is_set())
 
+    def test_full_camera_tracking_and_mapping(self):
+        from gestures import GestureEngine
+        cfg = Config()
+        self.assertEqual(cfg.box_margin, 0.0)
+        engine = GestureEngine(cfg)
+        # Verify 0.0 box margin maps the entire frame from edge to edge
+        x_min, y_min = engine._map(0.0, 0.0)
+        x_max, y_max = engine._map(1.0, 1.0)
+        self.assertEqual((x_min, y_min), (0.0, 0.0))
+        self.assertEqual((x_max, y_max), (1.0, 1.0))
+
+    def test_voice_mic_settings_defaults(self):
+        cfg = Config()
+        self.assertFalse(cfg.mic_dynamic_energy)
+        self.assertEqual(cfg.mic_pause_threshold, 1.0)
+        self.assertEqual(cfg.mic_energy_threshold, 300)
+        self.assertEqual(cfg.mic_phrase_time_limit, 10.0)
+
+    def test_probe_mic_level_uses_live_voice_rms(self):
+        import time
+        from voice import Voice, probe_mic_level
+        Voice._latest_rms = 450.0
+        Voice._latest_time = time.time()
+        norm, rms = probe_mic_level()
+        self.assertEqual(rms, 450.0)
+        self.assertGreater(norm, 0.0)
+
+    def test_groq_api_key_save_in_settings(self):
+        self.overlay.open_settings()
+        dlg = self.overlay.settings_dlg
+        dlg._save("groq_api_key", "gsk_persisted_key_123")
+        self.assertEqual(self.cfg.groq_api_key, "gsk_persisted_key_123")
+
+    def test_open_settings_from_worker_thread_dispatches_safely(self):
+        dispatched = threading.Event()
+
+        def background_caller():
+            self.overlay.open_settings("AI")
+            dispatched.set()
+
+        t = threading.Thread(target=background_caller)
+        t.start()
+        t.join(timeout=1.0)
+        self.assertTrue(dispatched.is_set())
+        # Check event queued in overlay
+        item = self.overlay.q.get_nowait()
+        self.assertEqual(item[0], "open_settings")
+        self.assertEqual(item[1].get("initial_tab"), "AI")
+
 
 if __name__ == "__main__":
     unittest.main()

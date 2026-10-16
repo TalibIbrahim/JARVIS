@@ -36,8 +36,8 @@ class Config:
     pose_debounce_frames: int = 2       # frames required to confirm pose transition
 
     # --- tracking box & anchor ---
-    # Fraction of the camera frame ignored on every edge.
-    box_margin: float = 0.18
+    # Fraction of the camera frame ignored on every edge (0.0 = 100% full camera frame tracking).
+    box_margin: float = 0.0
     anchor_point: str = "blend"         # used when in pinch scheme: "blend", "tip", "pip", "mcp", "palm_offset"
     anchor_blend_weight: float = 0.65   # blend ratio: 65% tip + 35% PIP
 
@@ -84,11 +84,15 @@ class Config:
     voice_enabled: bool = True
     speak: bool = True                  # spoken replies
     wake_word: str = "jarvis"
-    wake_aliases: list = field(default_factory=lambda: ["jarvis", "jarvas", "jervis", "gervais"])
+    wake_aliases: list = field(default_factory=lambda: [
+        "jarvis", "jarvas", "jervis", "gervais", "javis", "jarviz", "travis", "service", "harvest", "charvis", "darvis", "jar is"
+    ])
     command_window: float = 6.0         # seconds Jarvis keeps listening after "Jarvis?"
     mic_device_index: int = None        # specific microphone device index, or None for auto-detect
-    mic_energy_threshold: int = 400     # minimum audio energy threshold for speech trigger (lower = more sensitive)
-    mic_dynamic_energy: bool = True     # adapt threshold dynamically to ambient noise
+    mic_energy_threshold: int = 300     # minimum audio energy threshold for speech trigger (lower = more sensitive)
+    mic_dynamic_energy: bool = False    # adapt threshold dynamically (False prevents runaway threshold on laptop mics)
+    mic_pause_threshold: float = 1.0    # seconds of silence before finishing phrase (prevents cutting off mid-sentence)
+    mic_phrase_time_limit: float = 10.0 # maximum seconds per voice command phrase
 
     # --- ui / apple hig appearance ---
     theme_mode: str = "auto"            # "auto" (follows Windows), "dark", "light"
@@ -106,6 +110,7 @@ class Config:
     ai_stt_model: str = "whisper-large-v3-turbo"
     ai_timeout: int = 10
     ai_max_history: int = 6
+    groq_api_key: str = ""              # optional saved Groq API key persisted in config file
 
 
 def get_config_path(explicit_path=None):

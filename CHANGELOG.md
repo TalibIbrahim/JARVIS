@@ -236,4 +236,25 @@
 - **PyInstaller Build Bundling**:
   - Added hidden imports for `keyring`, `certifi`, `requests`, and `win32cred` directly to `build_exe.py`.
 
+---
+
+### 23. Release v1.2.3: Audio Pipeline Stability, Groq Key Persistence, Full-Frame Tracking & Whisper Biasing
+- **PortAudio Stream Lifecycle & Thread Safety (`voice.py`)**:
+  - Moved `with mic as source:` outside the 1-second timeout loop. The hardware audio stream remains persistently open instead of being repeatedly initialized and terminated, eliminating heap corruption crashes (`0xc0000374`).
+  - Replaced secondary `probe_mic_level()` hardware capture streams with non-invasive streaming RMS taps on `source.stream.read`, preventing concurrent audio hardware contention.
+- **Qt Worker Thread Marshaling (`overlay.py`)**:
+  - Added `SettingsBridge(QObject)` with Qt signals to marshal background worker callbacks (API test connection, mic test, updater events) safely to the main GUI thread, eliminating Qt abort crashes (`0xc0000409`).
+  - Added event queue marshaling to `Overlay.open_settings()` and proper listener teardown on dialog close.
+- **Groq API Key File Persistence (`config.py`, `ai.py`, `overlay.py`)**:
+  - Added "Save Key to Config" option allowing users to save the Groq API key persistently to `%APPDATA%\Jarvis\jarvis_config.json` alongside Windows Credential Manager (`keyring`).
+- **Full Camera Tracking Area (`config.py`, `gestures.py`, `tracker.py`, `overlay.py`)**:
+  - Defaulted `box_margin = 0.0` (100% full camera frame tracking).
+  - Added "Tracking Area" selector in Settings $\rightarrow$ General ("Full Frame (100%)" vs "Inner Box (80%)").
+  - Updated OpenCV HUD to display `TRACKING ZONE: FULL (100%)`.
+- **Speech Recognition Sensitivity & Natural Conversation (`config.py`, `voice.py`, `ai.py`, `commands.py`)**:
+  - Set `mic_dynamic_energy = False` to prevent laptop fan and background noise from inflating speech thresholds.
+  - Increased `mic_pause_threshold = 1.0s` (from 0.6s) to prevent audio cutting off mid-sentence during natural pauses.
+  - Injected domain vocabulary biasing prompt into Groq Whisper transcription (`prompt="Jarvis, open Chrome, YouTube, Spotify..."`).
+  - Added conversational prefix stripping (`can you please`, `could you`, etc.) and expanded action synonyms.
+
 

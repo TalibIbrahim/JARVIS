@@ -375,7 +375,7 @@ class GestureEngine:
         # 3. Cursor Motion (Wrist + 4 MCP Knuckles Anchor)
         anchor = self._compute_palm_anchor(lm)
         m = cfg.box_margin
-        in_box = (m <= anchor[0] <= 1.0 - m) and (m <= anchor[1] <= 1.0 - m)
+        in_box = True if m <= 0.001 else ((m <= anchor[0] <= 1.0 - m) and (m <= anchor[1] <= 1.0 - m))
         clutch_enabled = getattr(cfg, "clutch_enabled", True)
 
         frozen = (now < self.reopen_freeze_until) or (cur_pose != "OPEN" and not self.dragging)
@@ -589,7 +589,7 @@ class GestureEngine:
 
         anchor = self._compute_anchor(lm)
         m = cfg.box_margin
-        in_box = (m <= anchor[0] <= 1.0 - m) and (m <= anchor[1] <= 1.0 - m)
+        in_box = True if m <= 0.001 else ((m <= anchor[0] <= 1.0 - m) and (m <= anchor[1] <= 1.0 - m))
         clutch_enabled = getattr(cfg, "clutch_enabled", True)
 
         if pointing and not (closing or self.rp_down):
@@ -715,4 +715,6 @@ class GestureEngine:
     def _map(self, x, y):
         m = self.cfg.box_margin
         s = 1.0 - 2.0 * m
+        if s <= 0.001:
+            return min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
         return min(max((x - m) / s, 0.0), 1.0), min(max((y - m) / s, 0.0), 1.0)

@@ -102,11 +102,13 @@ class InvalidResponseError(AIError):
 # Secure Key Storage (Keyring + Windows Credential Manager)
 # =====================================================================
 
-def get_api_key() -> Optional[str]:
+def get_api_key(cfg=None) -> Optional[str]:
     """
-    Retrieves the Groq API key from Windows Credential Manager via keyring.
-    Falls back to the GROQ_API_KEY environment variable.
-    Returns None if no key is configured. NEVER logs or persists key to file.
+    Retrieves the Groq API key:
+    1. From Windows Credential Manager via keyring
+    2. From persistent config (cfg.groq_api_key or jarvis_config.json)
+    3. From GROQ_API_KEY environment variable.
+    Returns None if no key is configured.
     """
     try:
         import keyring
@@ -116,6 +118,17 @@ def get_api_key() -> Optional[str]:
     except Exception as exc:
         print(f"[ai] keyring read note: {exc}")
 
+    if cfg and getattr(cfg, "groq_api_key", None):
+        return cfg.groq_api_key.strip()
+
+    try:
+        from config import load_config
+        c = load_config()
+        if getattr(c, "groq_api_key", None):
+            return c.groq_api_key.strip()
+    except Exception:
+        pass
+
     env_key = os.environ.get("GROQ_API_KEY")
     if env_key and env_key.strip():
         return env_key.strip()
@@ -123,20 +136,55 @@ def get_api_key() -> Optional[str]:
     return None
 
 
-def set_api_key(api_key: str) -> None:
-    """Saves the API key to Windows Credential Manager via keyring."""
+def set_api_key(api_key: str, persist_to_config: bool = True) -> None:
+    """
+    Saves the API key to Windows Credential Manager via keyring,
+    and optionally persists to jarvis_config.json.
+    """
     if not api_key or not api_key.strip():
         delete_api_key()
         return
-    import keyring
-    keyring.set_password(SERVICE_NAME, KEY_USERNAME, api_key.strip())
+
+    clean_key = api_key.strip()
+    try:
+        import keyring
+        keyring.set_password(SERVICE_NAME, KEY_USERNAME, clean_key)
+    except Exception as exc:
+        print(f"[ai] keyring write note: {exc}")
+
+    if persist_to_config:
+        try:
+            from config import get_config_path
+            cfg_path = get_config_path()
+            data = {}
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data["groq_api_key"] = clean_key
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception as exc:
+            print(f"[ai] save key to config note: {exc}")
 
 
 def delete_api_key() -> None:
-    """Removes the API key from Windows Credential Manager."""
+    """Removes the API key from Windows Credential Manager and config."""
     try:
         import keyring
         keyring.delete_password(SERVICE_NAME, KEY_USERNAME)
+    except Exception:
+        pass
+
+    try:
+        from config import get_config_path
+        cfg_path = get_config_path()
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "groq_api_key" in data:
+                del data["groq_api_key"]
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4)
     except Exception:
         pass
 
@@ -201,7 +249,10 @@ class GroqClient:
     """
 
     def __init__(self, api_key: Optional[str] = None, timeout: int = 10, base_url: str = GROQ_BASE_URL):
-        self.api_key = api_key or get_api_key()
+        if api_key is not None:
+            self.api_key = api_key.strip()
+        else:
+            self.api_key = get_api_key()
         self.timeout = timeout
         self.base_url = base_url.rstrip("/")
         self.rate_limiter = SimpleRateLimiter(max_requests_per_minute=25)
@@ -235,10 +286,12 @@ class GroqClient:
                 msg = resp.text
             raise AIError(f"Groq API error ({resp.status_code}): {msg}")
 
-    def transcribe(self, wav_bytes: bytes, model: str = DEFAULT_STT_MODEL, language: str = "en") -> str:
+    def transcribe(self, wav_bytes: bytes, model: str = DEFAULT_STT_MODEL,
+                   language: str = "en", prompt: Optional[str] = None) -> str:
         """
         Transcribes 16 kHz in-memory WAV audio bytes using Groq Whisper.
         Endpoint: POST /audio/transcriptions
+        Uses acoustic vocabulary biasing prompt to boost recognition of Jarvis wake words and PC commands.
         """
         self.rate_limiter.acquire()
         headers = self._get_headers()
@@ -246,10 +299,14 @@ class GroqClient:
         files = {
             "file": ("audio.wav", wav_bytes, "audio/wav")
         }
+        if prompt is None:
+            prompt = "Jarvis, open Chrome, YouTube, Spotify, volume up, volume down, mute, screenshot, scroll down, zoom in, sleep, wake up."
+
         data = {
             "model": model,
             "language": language,
-            "response_format": "json"
+            "response_format": "json",
+            "prompt": prompt,
         }
 
         try:

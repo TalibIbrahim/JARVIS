@@ -19,6 +19,7 @@ import math
 import os
 import queue
 import sys
+import threading
 import time
 
 try:
@@ -42,7 +43,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.2.2"
+    APP_VERSION = "1.2.3"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -857,6 +858,13 @@ class GroupedCard(QFrame):
 # macOS System Settings Style Dialog
 # =====================================================================
 
+if PYSIDE6_AVAILABLE:
+    class SettingsBridge(QObject):
+        test_conn_result = Signal(bool, str, dict)
+        test_mic_result = Signal(dict)
+        updater_event = Signal(str, dict)
+
+
 class SettingsWindow(QDialog):
     """Apple HIG System Settings Window with Sidebar and Grouped Inset Cards."""
 
@@ -865,6 +873,11 @@ class SettingsWindow(QDialog):
         self.cfg = cfg
         self.ctx = ctx
         self.updater = updater
+        if PYSIDE6_AVAILABLE:
+            self.bridge = SettingsBridge(self)
+            self.bridge.test_conn_result.connect(self._on_test_conn_result)
+            self.bridge.test_mic_result.connect(self._on_test_mic_result)
+            self.bridge.updater_event.connect(self._on_updater_event_gui)
 
         self.setWindowTitle("J.A.R.V.I.S. Settings")
         icon = get_app_icon()
@@ -1007,12 +1020,103 @@ class SettingsWindow(QDialog):
     def closeEvent(self, event):
         if hasattr(self, "mic_timer") and self.mic_timer.isActive():
             self.mic_timer.stop()
+        if self.updater and hasattr(self, "_updater_cb"):
+            self.updater.remove_listener(self._updater_cb)
         super().closeEvent(event)
 
     def reject(self):
         if hasattr(self, "mic_timer") and self.mic_timer.isActive():
             self.mic_timer.stop()
+        if self.updater and hasattr(self, "_updater_cb"):
+            self.updater.remove_listener(self._updater_cb)
         super().reject()
+
+    def _on_test_conn_result(self, ok, message, models_data):
+        if hasattr(self, "btn_test_conn"):
+            self.btn_test_conn.setEnabled(True)
+        if hasattr(self, "lbl_conn_status"):
+            if ok:
+                self.lbl_conn_status.setText(f"Connected: {message}")
+                self.lbl_conn_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #30d158;")
+            else:
+                self.lbl_conn_status.setText(f"Failed: {message}")
+                self.lbl_conn_status.setStyleSheet("font-size: 11px; font-weight: 500; color: #ff9f0a;")
+        if ok and models_data and hasattr(self, "llm_combo") and hasattr(self, "stt_combo"):
+            cur_l = self.llm_combo.currentText()
+            self.llm_combo.blockSignals(True)
+            self.llm_combo.clear()
+            for lm in models_data.get("llm", []):
+                self.llm_combo.addItem(lm)
+            if cur_l in models_data.get("llm", []):
+                self.llm_combo.setCurrentText(cur_l)
+            self.llm_combo.blockSignals(False)
+
+            cur_s = self.stt_combo.currentText()
+            self.stt_combo.blockSignals(True)
+            self.stt_combo.clear()
+            for sm in models_data.get("stt", []):
+                self.stt_combo.addItem(sm)
+            if cur_s in models_data.get("stt", []):
+                self.stt_combo.setCurrentText(cur_s)
+            self.stt_combo.blockSignals(False)
+
+    def _on_test_mic_result(self, res):
+        if hasattr(self, "btn_test_mic"):
+            self.btn_test_mic.setEnabled(True)
+            self.btn_test_mic.setText("Test Microphone & Recognition")
+        if hasattr(self, "lbl_test_result"):
+            if res.get("success"):
+                self.lbl_test_result.setText(f"Success! Heard: \"{res['text']}\" (Audio signal: {res.get('avg_level', 0):.0f})")
+                self.lbl_test_result.setStyleSheet("font-size: 12px; font-weight: 600; color: #34c759;")
+            else:
+                err_msg = res.get("error", "Unknown error")
+                self.lbl_test_result.setText(f"Notice: {err_msg} (Audio signal: {res.get('avg_level', 0):.0f})")
+                self.lbl_test_result.setStyleSheet("font-size: 11px; color: #ff9500;")
+
+    def _on_updater_event_gui(self, state, kwargs):
+        if not hasattr(self, "btn_chk") or not hasattr(self, "lbl_up_status"):
+            return
+        if state == "checking":
+            self.btn_chk.setEnabled(False)
+            self.btn_restart.setVisible(False)
+            self.prog_bar.setVisible(False)
+            self.lbl_up_status.setText("Checking for updates...")
+            self.lbl_up_status.setStyleSheet("font-size: 11px; color: #007aff;")
+        elif state == "up-to-date":
+            self.btn_chk.setEnabled(True)
+            self.btn_restart.setVisible(False)
+            self.prog_bar.setVisible(False)
+            self.lbl_up_status.setText(f"Jarvis is up to date (v{APP_VERSION}).")
+            self.lbl_up_status.setStyleSheet("font-size: 11px; color: #34c759;")
+        elif state == "available":
+            self.btn_chk.setEnabled(True)
+            ver = kwargs.get("info", {}).get("version", "New Version")
+            self.lbl_up_status.setText(f"Update available: {ver}")
+            self.lbl_up_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #ff9f0a;")
+            self.btn_restart.setText(f"Download & Update to {ver}")
+            self.btn_restart.setEnabled(True)
+            self.btn_restart.setVisible(True)
+        elif state == "downloading":
+            pct = kwargs.get("percent", 0)
+            self.prog_bar.setVisible(True)
+            self.prog_bar.setValue(pct)
+            self.lbl_up_status.setText(f"Downloading update... {pct}%")
+            self.lbl_up_status.setStyleSheet("font-size: 11px; color: #007aff;")
+            self.btn_restart.setEnabled(False)
+        elif state == "downloaded":
+            self.prog_bar.setVisible(False)
+            self.lbl_up_status.setText("Update downloaded! Ready to restart.")
+            self.lbl_up_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #34c759;")
+            self.btn_restart.setText("Restart Now to Apply Update")
+            self.btn_restart.setEnabled(True)
+            self.btn_restart.setVisible(True)
+        elif state == "error":
+            self.btn_chk.setEnabled(True)
+            self.btn_restart.setEnabled(True)
+            self.prog_bar.setVisible(False)
+            msg = kwargs.get("message", "Error checking for updates")
+            self.lbl_up_status.setText(f"Notice: {msg[:60]}")
+            self.lbl_up_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
 
     def select_tab(self, tab):
         """Selects tab by integer index or case-insensitive category string."""
@@ -1097,6 +1201,17 @@ class SettingsWindow(QDialog):
         ], current=f"{self.cfg.frame_width}x{self.cfg.frame_height}")
         res_ctrl.valueChanged.connect(self._on_res_change)
         card.add_row("Resolution", "Higher resolution improves small target tracking", res_ctrl)
+
+        # Tracking Area
+        track_ctrl = SegmentedControl([
+            ("full", "Full Frame (100%)"),
+            ("margin", "Inner Box (80%)")
+        ], current="full" if getattr(self.cfg, "box_margin", 0.0) <= 0.005 else "margin")
+        def on_track_change(v):
+            margin_val = 0.0 if v == "full" else 0.18
+            self._save("box_margin", margin_val)
+        track_ctrl.valueChanged.connect(on_track_change)
+        card.add_row("Tracking Area", "Full frame tracks hand across entire camera sensor", track_ctrl)
 
         # Model Complexity
         comp_ctrl = SegmentedControl([
@@ -1279,14 +1394,24 @@ class SettingsWindow(QDialog):
         self.mic_combo.currentIndexChanged.connect(on_mic_selected)
         card.add_row("Input Microphone", "Select physical audio capture device", self.mic_combo)
 
-        # 4. Trigger Energy Sensitivity Slider
+        # 4. Dynamic Noise Adaptation Toggle
+        sw_dyn = AppleSwitch(getattr(self.cfg, "mic_dynamic_energy", False))
+        sw_dyn.toggled.connect(lambda v: self._save("mic_dynamic_energy", v))
+        card.add_row("Dynamic Noise Adapt", "Auto-adapts threshold (keep OFF for laptop mics to prevent cutoff)", sw_dyn)
+
+        # 5. Silence Cutoff Timeout Slider
+        self._slider_row(card, "Silence Cutoff Timeout", "Seconds of pause before finishing sentence (prevents mid-speech cutoff)",
+                         getattr(self.cfg, "mic_pause_threshold", 1.0), 0.5, 2.5, "s",
+                         lambda v: self._save("mic_pause_threshold", float(v)))
+
+        # 6. Trigger Energy Sensitivity Slider
         self._slider_row(card, "Trigger Sensitivity", "Energy threshold for speech activation (lower = more sensitive)",
-                         getattr(self.cfg, "mic_energy_threshold", 400), 100.0, 2000.0, "",
+                         getattr(self.cfg, "mic_energy_threshold", 300), 50.0, 1500.0, "",
                          lambda v: self._save("mic_energy_threshold", int(v)))
 
         layout.addWidget(card)
 
-        # 5. Live Audio Input Level Meter Card
+        # 7. Live Audio Input Level Meter Card
         meter_card = GroupedCard()
         meter_widget = QWidget()
         meter_layout = QVBoxLayout(meter_widget)
@@ -1323,7 +1448,7 @@ class SettingsWindow(QDialog):
 
         meter_card.add_row("Microphone Signal Level", "Real-time acoustic audio meter", meter_widget)
 
-        # 6. Interactive Microphone & Recognition Test
+        # 8. Interactive Microphone & Recognition Test
         test_widget = QWidget()
         test_layout = QVBoxLayout(test_widget)
         test_layout.setContentsMargins(0, 0, 0, 0)
@@ -1343,19 +1468,7 @@ class SettingsWindow(QDialog):
             def worker():
                 chosen_dev = self.cfg.mic_device_index
                 res = test_microphone_recognition(device_index=chosen_dev, duration=3.5)
-
-                def update_ui():
-                    self.btn_test_mic.setEnabled(True)
-                    self.btn_test_mic.setText("Test Microphone & Recognition")
-                    if res["success"]:
-                        self.lbl_test_result.setText(f"Success! Heard: \"{res['text']}\" (Audio signal: {res['avg_level']:.0f})")
-                        self.lbl_test_result.setStyleSheet("font-size: 12px; font-weight: 600; color: #34c759;")
-                    else:
-                        err_msg = res.get("error", "Unknown error")
-                        self.lbl_test_result.setText(f"Notice: {err_msg} (Audio signal: {res['avg_level']:.0f})")
-                        self.lbl_test_result.setStyleSheet("font-size: 11px; color: #ff9500;")
-
-                QTimer.singleShot(0, update_ui)
+                self.bridge.test_mic_result.emit(res)
 
             import threading
             threading.Thread(target=worker, daemon=True).start()
@@ -1420,7 +1533,7 @@ class SettingsWindow(QDialog):
         self.key_input.setPlaceholderText("gsk_...")
         self.key_input.setFixedWidth(200)
 
-        existing_key = get_api_key() or ""
+        existing_key = get_api_key(self.cfg) or ""
         if existing_key:
             self.key_input.setText(existing_key)
 
@@ -1458,27 +1571,47 @@ class SettingsWindow(QDialog):
         lbl_link.setStyleSheet("font-size: 11px;")
         key_vlayout.addWidget(lbl_link)
 
+        # Option to save key to config file
+        has_cfg_key = bool(getattr(self.cfg, "groq_api_key", ""))
+        self.sw_save_cfg = AppleSwitch(has_cfg_key or bool(existing_key))
+        card_general.add_row("Save Key to Config", "Save key in jarvis_config.json so it persists across folders and restarts", self.sw_save_cfg)
+
         def save_key_action():
             val = self.key_input.text().strip()
+            save_to_cfg = self.sw_save_cfg.checked
             if val:
-                set_api_key(val)
-                lbl_key_status.setText("API key saved securely to Windows Credential Manager.")
+                set_api_key(val, persist_to_config=save_to_cfg)
+                self._save("groq_api_key", val if save_to_cfg else "")
+                storage_loc = "Credential Manager & config file" if save_to_cfg else "Windows Credential Manager"
+                lbl_key_status.setText(f"API key saved to {storage_loc}.")
                 lbl_key_status.setStyleSheet("font-size: 11px; color: #30d158;")
             else:
                 delete_api_key()
+                self._save("groq_api_key", "")
                 lbl_key_status.setText("Empty key removed.")
                 lbl_key_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
 
         def remove_key_action():
             delete_api_key()
+            self._save("groq_api_key", "")
             self.key_input.clear()
-            lbl_key_status.setText("API key removed from Windows Credential Manager.")
+            lbl_key_status.setText("API key removed from Credential Manager & config.")
             lbl_key_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
 
+        def on_save_config_toggled(checked):
+            val = self.key_input.text().strip()
+            if checked and val:
+                self._save("groq_api_key", val)
+                set_api_key(val, persist_to_config=True)
+            elif not checked:
+                self._save("groq_api_key", "")
+
+        self.sw_save_cfg.toggled.connect(on_save_config_toggled)
         btn_save_key.clicked.connect(save_key_action)
+        self.key_input.returnPressed.connect(save_key_action)
         btn_remove_key.clicked.connect(remove_key_action)
 
-        card_general.add_row("Groq API Key", "Stored in Windows Credential Manager (never logged or saved to disk)", key_widget)
+        card_general.add_row("Groq API Key", "Stored in Windows Credential Manager and optionally in local config", key_widget)
         layout.addWidget(card_general)
 
         # 2. Models & Connectivity Card
@@ -1524,8 +1657,11 @@ class SettingsWindow(QDialog):
         test_hbox.addStretch()
         test_vbox.addLayout(test_hbox)
 
+        self.btn_test_conn = btn_test_conn
+        self.lbl_conn_status = lbl_conn_status
+
         def run_test_connection():
-            key_to_test = self.key_input.text().strip() or get_api_key()
+            key_to_test = self.key_input.text().strip() or get_api_key(self.cfg)
             if not key_to_test:
                 lbl_conn_status.setText("No API key entered")
                 lbl_conn_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
@@ -1536,7 +1672,6 @@ class SettingsWindow(QDialog):
             lbl_conn_status.setStyleSheet("font-size: 11px; color: #007aff;")
 
             def worker():
-                import threading
                 client = GroqClient(api_key=key_to_test, timeout=8)
                 ok, message = client.validate_key()
                 models_data = None
@@ -1545,35 +1680,7 @@ class SettingsWindow(QDialog):
                         models_data = client.get_categorized_models()
                     except Exception:
                         pass
-
-                def update_test_ui():
-                    btn_test_conn.setEnabled(True)
-                    if ok:
-                        lbl_conn_status.setText(f"Connected: {message}")
-                        lbl_conn_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #30d158;")
-                        if models_data:
-                            cur_l = self.llm_combo.currentText()
-                            self.llm_combo.blockSignals(True)
-                            self.llm_combo.clear()
-                            for lm in models_data.get("llm", []):
-                                self.llm_combo.addItem(lm)
-                            if cur_l in models_data.get("llm", []):
-                                self.llm_combo.setCurrentText(cur_l)
-                            self.llm_combo.blockSignals(False)
-
-                            cur_s = self.stt_combo.currentText()
-                            self.stt_combo.blockSignals(True)
-                            self.stt_combo.clear()
-                            for sm in models_data.get("stt", []):
-                                self.stt_combo.addItem(sm)
-                            if cur_s in models_data.get("stt", []):
-                                self.stt_combo.setCurrentText(cur_s)
-                            self.stt_combo.blockSignals(False)
-                    else:
-                        lbl_conn_status.setText(f"Failed: {message}")
-                        lbl_conn_status.setStyleSheet("font-size: 11px; font-weight: 500; color: #ff9f0a;")
-
-                QTimer.singleShot(0, update_test_ui)
+                self.bridge.test_conn_result.emit(ok, message, models_data or {})
 
             import threading
             threading.Thread(target=worker, daemon=True).start()
@@ -1680,6 +1787,11 @@ class SettingsWindow(QDialog):
                 }
             """)
 
+            self.btn_chk = btn_chk
+            self.btn_restart = btn_restart
+            self.lbl_up_status = lbl_up_status
+            self.prog_bar = prog_bar
+
             u_hbox.addWidget(btn_chk)
             u_hbox.addWidget(btn_restart)
             u_hbox.addWidget(lbl_up_status, stretch=1)
@@ -1690,51 +1802,9 @@ class SettingsWindow(QDialog):
             layout.addWidget(update_card)
 
             def on_updater_event(state, **kwargs):
-                def update_ui():
-                    if state == "checking":
-                        btn_chk.setEnabled(False)
-                        btn_restart.setVisible(False)
-                        prog_bar.setVisible(False)
-                        lbl_up_status.setText("Checking for updates...")
-                        lbl_up_status.setStyleSheet("font-size: 11px; color: #007aff;")
-                    elif state == "up-to-date":
-                        btn_chk.setEnabled(True)
-                        btn_restart.setVisible(False)
-                        prog_bar.setVisible(False)
-                        lbl_up_status.setText(f"Jarvis is up to date (v{APP_VERSION}).")
-                        lbl_up_status.setStyleSheet("font-size: 11px; color: #34c759;")
-                    elif state == "available":
-                        btn_chk.setEnabled(True)
-                        ver = kwargs.get("info", {}).get("version", "New Version")
-                        lbl_up_status.setText(f"Update available: {ver}")
-                        lbl_up_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #ff9f0a;")
-                        btn_restart.setText(f"Download & Update to {ver}")
-                        btn_restart.setEnabled(True)
-                        btn_restart.setVisible(True)
-                    elif state == "downloading":
-                        pct = kwargs.get("percent", 0)
-                        prog_bar.setVisible(True)
-                        prog_bar.setValue(pct)
-                        lbl_up_status.setText(f"Downloading update... {pct}%")
-                        lbl_up_status.setStyleSheet("font-size: 11px; color: #007aff;")
-                        btn_restart.setEnabled(False)
-                    elif state == "downloaded":
-                        prog_bar.setVisible(False)
-                        lbl_up_status.setText("Update downloaded! Ready to restart.")
-                        lbl_up_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #34c759;")
-                        btn_restart.setText("Restart Now to Apply Update")
-                        btn_restart.setEnabled(True)
-                        btn_restart.setVisible(True)
-                    elif state == "error":
-                        btn_chk.setEnabled(True)
-                        btn_restart.setEnabled(True)
-                        prog_bar.setVisible(False)
-                        msg = kwargs.get("message", "Error checking for updates")
-                        lbl_up_status.setText(f"Notice: {msg[:60]}")
-                        lbl_up_status.setStyleSheet("font-size: 11px; color: #ff9f0a;")
+                self.bridge.updater_event.emit(state, kwargs)
 
-                QTimer.singleShot(0, update_ui)
-
+            self._updater_cb = on_updater_event
             self.updater.add_listener(on_updater_event)
 
             def on_check_clicked():
@@ -1809,9 +1879,13 @@ class SettingsWindow(QDialog):
             print(f"[settings] target practice error: {exc}")
 
     def _save(self, key, value):
-        # Strict safeguard: Never write any API key, token, or secret to config file
-        if any(s in key.lower() for s in ("key", "secret", "token", "password")):
+        # Allow groq_api_key, block arbitrary secret/token/password injections
+        if key != "groq_api_key" and any(s in key.lower() for s in ("secret", "token", "password")):
             return
+        try:
+            setattr(self.cfg, key, value)
+        except Exception:
+            pass
         try:
             from config import get_config_path
             cfg_path = get_config_path()
@@ -1980,17 +2054,23 @@ class Overlay:
             self.root.mainloop()
 
     def open_settings(self, initial_tab=0):
-        if PYSIDE6_AVAILABLE and self.cfg and self.ctx:
-            if self.settings_dlg is None or not self.settings_dlg.isVisible():
-                self.settings_dlg = SettingsWindow(self.cfg, self.ctx, updater=self.updater)
-                self.settings_dlg.select_tab(initial_tab)
-                self.settings_dlg.show()
-                self.settings_dlg.raise_()
-                self.settings_dlg.activateWindow()
-            else:
-                self.settings_dlg.select_tab(initial_tab)
-                self.settings_dlg.raise_()
-                self.settings_dlg.activateWindow()
+        if not PYSIDE6_AVAILABLE or not self.cfg or not self.ctx:
+            return
+        # Thread-safe marshalling: if invoked from background voice/hotkey thread, queue to GUI loop
+        if threading.current_thread() is not threading.main_thread():
+            self.post("open_settings", initial_tab=initial_tab)
+            return
+        if self.settings_dlg is None or not self.settings_dlg.isVisible():
+            self.settings_dlg = SettingsWindow(self.cfg, self.ctx, updater=self.updater)
+            self.settings_dlg.select_tab(initial_tab)
+            self.settings_dlg.show()
+            self.settings_dlg.raise_()
+            self.settings_dlg.activateWindow()
+        else:
+            self.settings_dlg.select_tab(initial_tab)
+            self.settings_dlg.show()
+            self.settings_dlg.raise_()
+            self.settings_dlg.activateWindow()
 
     def quit_app(self):
         self.stop.set()
@@ -2027,6 +2107,8 @@ class Overlay:
                     self.island.is_ai_error = False
                 elif kind == "cursor_dwell":
                     self.cursor_overlay.update_dwell(d)
+                elif kind == "open_settings":
+                    self.open_settings(d.get("initial_tab", 0))
         except queue.Empty:
             pass
 

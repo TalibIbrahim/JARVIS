@@ -217,9 +217,17 @@ class TestKeyStorage(unittest.TestCase):
         cfg = Config()
         config_dict = cfg.__dict__
         for key in config_dict:
+            if key == "groq_api_key":
+                continue  # explicitly supported user option to persist groq api key
             self.assertNotIn("api_key", key.lower())
             self.assertNotIn("secret", key.lower())
             self.assertNotIn("token", key.lower())
+
+    def test_groq_api_key_persistence(self):
+        cfg = Config(groq_api_key="gsk_test12345")
+        self.assertEqual(cfg.groq_api_key, "gsk_test12345")
+        key = get_api_key(cfg)
+        self.assertEqual(key, "gsk_test12345")
 
 
 class TestJSONActionParsingAndWhitelist(unittest.TestCase):

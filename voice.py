@@ -155,9 +155,14 @@ def find_best_microphone(cfg=None):
 def probe_mic_level(device_index=None, chunk_samples=1024):
     """
     Reads a short frame from the microphone and returns normalized volume (0.0 to 1.0) and raw RMS.
-    Safe and lightweight for non-blocking UI polling timers. Uses shared PyAudio instance without termination.
-    Never blocks the caller if audio hardware is locked by another thread.
+    If Voice thread is active, returns its live RMS reading directly with zero hardware contention,
+    eliminating PortAudio stream thrashing and preventing ntdll heap corruption.
     """
+    if time.time() - getattr(Voice, "_latest_time", 0.0) < 1.0:
+        rms = float(getattr(Voice, "_latest_rms", 0.0))
+        norm = min(max((rms - 20.0) / 2500.0, 0.0), 1.0)
+        return norm, rms
+
     acquired = _PORTAUDIO_LOCK.acquire(blocking=False)
     if not acquired:
         return 0.0, 0.0
@@ -305,6 +310,8 @@ class Speaker(threading.Thread):
 
 class Voice(threading.Thread):
     """Say 'Jarvis, open Chrome' in one go, or say 'Jarvis' and wait for 'Yes, sir?'."""
+    _latest_rms = 0.0
+    _latest_time = 0.0
 
     def __init__(self, cfg, ctx, stop_event):
         super().__init__(daemon=True)
@@ -325,8 +332,10 @@ class Voice(threading.Thread):
             return
 
         recognizer = sr.Recognizer()
-        recognizer.dynamic_energy_threshold = getattr(self.cfg, "mic_dynamic_energy", True)
-        recognizer.pause_threshold = 0.6
+        recognizer.dynamic_energy_threshold = getattr(self.cfg, "mic_dynamic_energy", False)
+        recognizer.pause_threshold = getattr(self.cfg, "mic_pause_threshold", 1.0)
+        recognizer.phrase_threshold = 0.3
+        recognizer.non_speaking_duration = 0.5
 
         # Auto-detect best physical microphone
         dev_idx, dev_name = find_best_microphone(self.cfg)
@@ -334,57 +343,85 @@ class Voice(threading.Thread):
         self.current_mic_name = dev_name
         print(f"[voice] Connecting to microphone [{dev_idx}]: {dev_name}")
 
-        try:
-            with _PORTAUDIO_LOCK:
-                mic = sr.Microphone(device_index=dev_idx)
-            initial_thresh = getattr(self.cfg, "mic_energy_threshold", 400)
-            recognizer.energy_threshold = initial_thresh
-
-            with mic as source:
-                try:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.8)
-                    # Safety clamp: avoid floating into unreachable thresholds in background noise
-                    if recognizer.energy_threshold > 2500:
-                        recognizer.energy_threshold = 2000
-                    elif recognizer.energy_threshold < 150:
-                        recognizer.energy_threshold = 250
-                except Exception as e:
-                    print(f"[voice] ambient noise adjustment note: {e}")
-
-            print(f"[voice] Listening online on '{dev_name}' (trigger threshold: {recognizer.energy_threshold:.0f})")
-        except Exception as exc:
-            print(f"[voice] failed to initialize microphone [{dev_idx}]: {exc}")
-            self.ctx.say("I can't access the microphone, sir.")
-            return
-
         # Background worker for network recognition so microphone listening never stalls
         worker = threading.Thread(target=self._recognition_worker, args=(recognizer, sr), daemon=True)
         worker.start()
 
         while not self.stop.is_set():
-            # Check if user switched microphone device in settings
             configured_idx = getattr(self.cfg, "mic_device_index", None)
-            if configured_idx is not None and configured_idx != self.current_mic_index:
-                print(f"[voice] Switching microphone from [{self.current_mic_index}] to [{configured_idx}]...")
-                try:
-                    with _PORTAUDIO_LOCK:
-                        mic = sr.Microphone(device_index=configured_idx)
-                    self.current_mic_index = configured_idx
-                except Exception as switch_err:
-                    print(f"[voice] error switching microphone: {switch_err}")
+            active_idx = configured_idx if configured_idx is not None else self.current_mic_index
+
+            try:
+                with _PORTAUDIO_LOCK:
+                    mic = sr.Microphone(device_index=active_idx)
+                self.current_mic_index = active_idx
+            except Exception as exc:
+                print(f"[voice] failed to initialize microphone [{active_idx}]: {exc}")
+                time.sleep(1.0)
+                continue
 
             try:
                 with mic as source:
-                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=6)
-                try:
-                    self.audio_q.put_nowait(audio)
-                except queue.Full:
-                    pass  # drop older buffers if network lags to keep responses fresh
-            except sr.WaitTimeoutError:
-                continue
-            except Exception:
+                    # Initial ambient noise calibration with strict ceiling clamp
+                    try:
+                        recognizer.adjust_for_ambient_noise(source, duration=0.8)
+                        if recognizer.energy_threshold > 750:
+                            recognizer.energy_threshold = 600
+                        elif recognizer.energy_threshold < 150:
+                            recognizer.energy_threshold = 250
+                    except Exception as e:
+                        print(f"[voice] ambient noise adjustment note: {e}")
+
+                    # If dynamic energy is disabled, ensure configured threshold is respected
+                    if not getattr(self.cfg, "mic_dynamic_energy", False):
+                        recognizer.energy_threshold = getattr(self.cfg, "mic_energy_threshold", 300)
+
+                    print(f"[voice] Listening online on device [{active_idx}] (trigger threshold: {recognizer.energy_threshold:.0f}, pause: {recognizer.pause_threshold:.1f}s)")
+
+                    # Hook source.stream.read to monitor audio levels live without opening extra streams
+                    orig_read = source.stream.read
+                    def hooked_read(size):
+                        chunk = orig_read(size)
+                        if chunk:
+                            try:
+                                arr = np.frombuffer(chunk, dtype=np.int16)
+                                if len(arr) > 0:
+                                    Voice._latest_rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
+                                    Voice._latest_time = time.time()
+                            except Exception:
+                                pass
+                        return chunk
+                    source.stream.read = hooked_read
+
+                    while not self.stop.is_set():
+                        # Check if device changed in settings
+                        new_cfg_idx = getattr(self.cfg, "mic_device_index", None)
+                        if new_cfg_idx is not None and new_cfg_idx != self.current_mic_index:
+                            print(f"[voice] Switching microphone to [{new_cfg_idx}]...")
+                            break
+
+                        # Keep thresholds synced with config
+                        recognizer.dynamic_energy_threshold = getattr(self.cfg, "mic_dynamic_energy", False)
+                        recognizer.pause_threshold = getattr(self.cfg, "mic_pause_threshold", 1.0)
+                        if not recognizer.dynamic_energy_threshold:
+                            recognizer.energy_threshold = getattr(self.cfg, "mic_energy_threshold", 300)
+
+                        phrase_time_limit = getattr(self.cfg, "mic_phrase_time_limit", 10.0)
+                        try:
+                            audio = recognizer.listen(source, timeout=1, phrase_time_limit=phrase_time_limit)
+                            try:
+                                self.audio_q.put_nowait(audio)
+                            except queue.Full:
+                                pass
+                        except sr.WaitTimeoutError:
+                            continue
+                        except Exception as loop_err:
+                            print(f"[voice] listen cycle note: {loop_err}")
+                            time.sleep(0.3)
+                            break
+            except Exception as stream_err:
+                print(f"[voice] stream error: {stream_err}")
                 time.sleep(0.5)
-                continue
 
     def _fallback_google(self, recognizer, audio, sr):
         """Falls back to Google SpeechRecognition if Groq is unavailable."""
