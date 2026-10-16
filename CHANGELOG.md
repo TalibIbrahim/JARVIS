@@ -358,3 +358,13 @@
 - **Expanded Test Suite (`tests/test_decision_engine.py`, `tests/test_ai.py`, `tests/test_updater.py`)**:
   - Added 14 new unit tests covering sub-millisecond decision latency, intent prototype classification, whitelist execution, acoustic feature verification, and update notification debouncing.
   - Full suite now stands at **139 tests**, passing in ~2.8 seconds with 100% pass rate.
+
+---
+
+### 29. Release v1.3.1: Resilient Download Engine with HTTP Range Resumption & Atomic Replacement
+- **Resilient Chunked Downloader (`updater.py`)**:
+  - Implemented HTTP `Range` resumption (`Range: bytes={downloaded}-`): automatically resumes large binary downloads from the exact byte where a connection dropped, preventing corrupted PyInstaller packages.
+  - Added atomic staging: files are downloaded to `.part` files first and only moved over the live executable when `downloaded >= expected_size` and fully verified.
+  - Eliminated truncated binary replacement that triggered *"Could not load PyInstaller's embedded PKG archive"* on Windows.
+- **Update Voice Debouncing (`updater.py`)**:
+  - Eliminated duplicate spoken announcements; J.A.R.V.I.S. announces update availability strictly once with session-level tag tracking.
