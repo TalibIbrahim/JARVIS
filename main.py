@@ -152,7 +152,7 @@ def main():
     stop = threading.Event()
     engine = GestureEngine(cfg)
     controller = Controller(cfg)
-    speaker = Speaker(cfg.speak)
+    speaker = Speaker(enabled=cfg.speak, cfg=cfg)
     speaker.start()
 
     overlay = Overlay(stop, cfg=cfg)

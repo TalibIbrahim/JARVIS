@@ -29,7 +29,12 @@ def build():
         "--hidden-import", "pywintypes",
         "--hidden-import", "certifi",
         "--hidden-import", "requests",
+        "--hidden-import", "piper",
+        "--hidden-import", "sounddevice",
+        "--hidden-import", "_sounddevice",
+        "--hidden-import", "onnxruntime",
         "--collect-data", "certifi",
+        "--collect-data", "piper",
         "main.py"
     ]
 

@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 GITHUB_REPO = "TalibIbrahim/JARVIS"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -210,35 +210,54 @@ class AutoUpdater:
         # Create self-deleting Windows batch replacer
         bat_content = f"""@echo off
 chcp 65001 >nul
-echo [JARVIS Updater] Waiting for Jarvis process {pid} to terminate...
-:wait_loop
-taskkill /PID {pid} /F >nul 2>&1
-timeout /t 1 /nobreak >nul
-copy /y "{self.downloaded_path}" "{current_exe}" >nul 2>&1
-if errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto wait_loop
-)
+set RETRIES=0
 
-echo [JARVIS Updater] Update applied successfully! Relaunching...
+:kill_loop
+taskkill /F /T /PID {pid} >nul 2>&1
+taskkill /F /IM jarvis.exe >nul 2>&1
+timeout /t 1 /nobreak >nul
+
+:replace_step
+set /A RETRIES+=1
+if %RETRIES% GTR 30 goto fail
+
+rem Try direct copy first
+copy /y "{self.downloaded_path}" "{current_exe}" >nul 2>&1
+if not errorlevel 1 goto success
+
+rem If direct copy failed (likely file lock or OneDrive), move existing exe out of the way
+move /y "{current_exe}" "{current_exe}.old" >nul 2>&1
+copy /y "{self.downloaded_path}" "{current_exe}" >nul 2>&1
+if not errorlevel 1 goto success
+
+timeout /t 1 /nobreak >nul
+goto kill_loop
+
+:success
+del /f /q "{current_exe}.old" >nul 2>&1
+del /f /q "{self.downloaded_path}" >nul 2>&1
+timeout /t 1 /nobreak >nul
 start "" "{current_exe}"
-del "{self.downloaded_path}" >nul 2>&1
+(goto) 2>nul & del "%~f0"
+exit
+
+:fail
+rem If replacement ultimately failed, restore old executable and relaunch
+if exist "{current_exe}.old" move /y "{current_exe}.old" "{current_exe}" >nul 2>&1
+start "" "{current_exe}"
 (goto) 2>nul & del "%~f0"
 exit
 """
         with open(bat_script, "w", encoding="utf-8") as f:
             f.write(bat_content)
 
-        # Launch the updater script in a detached background process (elevating if in Program Files)
+        # Launch the updater script completely detached
         if "program files" in current_exe.lower() and sys.platform == "win32":
             ps_script = f'Start-Process cmd.exe -ArgumentList "/c `"{bat_script}`"" -Verb RunAs'
             subprocess.Popen(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script])
         else:
-            subprocess.Popen(
-                ["cmd.exe", "/c", bat_script],
-                creationflags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0,
-                close_fds=True
-            )
+            ps_script = f'Start-Process cmd.exe -ArgumentList "/c `"{bat_script}`"" -WindowStyle Hidden'
+            subprocess.Popen(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script])
 
         # Trigger clean application shutdown
         if self.ctx:

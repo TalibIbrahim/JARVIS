@@ -5,6 +5,7 @@ from PyInstaller.utils.hooks import copy_metadata
 datas = [('assets', 'assets')]
 datas += collect_data_files('mediapipe')
 datas += collect_data_files('certifi')
+datas += collect_data_files('piper')
 datas += copy_metadata('mediapipe')
 
 
@@ -13,7 +14,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['PySide6', 'speech_recognition', 'pyttsx3.drivers', 'pyttsx3.drivers.sapi5', 'keyring', 'keyring.backends.Windows', 'win32cred', 'pywintypes', 'certifi', 'requests'],
+    hiddenimports=['PySide6', 'speech_recognition', 'pyttsx3.drivers', 'pyttsx3.drivers.sapi5', 'keyring', 'keyring.backends.Windows', 'win32cred', 'pywintypes', 'certifi', 'requests', 'piper', 'sounddevice', '_sounddevice', 'onnxruntime'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

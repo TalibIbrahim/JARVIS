@@ -257,4 +257,26 @@
   - Injected domain vocabulary biasing prompt into Groq Whisper transcription (`prompt="Jarvis, open Chrome, YouTube, Spotify..."`).
   - Added conversational prefix stripping (`can you please`, `could you`, etc.) and expanded action synonyms.
 
+---
+
+### 24. Release v1.2.4: Paul Bettany Voice Clone, Wake/Standby Progress Pointer & Auto-Updater Fix
+- **Paul Bettany J.A.R.V.I.S. Voice Clone (`voice.py`, `config.py`, `overlay.py`)**:
+  - Integrated local, offline neural text-to-speech engine via `piper-tts` and `sounddevice`.
+  - Added direct Paul Bettany voice model (`jarvis-medium.onnx`, ~60.5 MB) trained on MCU dialogue with automatic Hugging Face verification/download.
+  - Added background pre-warming so responses synthesize with sub-200ms latency on CPU.
+  - Added "Voice Persona" selector and "Test Voice" button to Settings $\rightarrow$ Voice tab.
+- **On-Screen Wake & Standby Progress Pointer (`overlay.py`)**:
+  - Upgraded `CursorFeedbackOverlay` to follow hand anchor telemetry during Standby.
+  - Displays a high-visibility glowing pointer dot indicating active camera hand tracking.
+  - Sweeps a golden circular progress bar during open palm hold (0.8s) when waking up, and a blue progress bar during thumbs-up/palm hold when standing by.
+  - Emits a visual expansion ripple wave upon gesture completion.
+- **Auto-Updater Windows Multi-Process Fix (`updater.py`)**:
+  - Fixed PyInstaller `--onefile` auto-update hang where terminating only child PID left parent bootloader locking `JARVIS.exe`.
+  - Replaced single PID termination with full tree and image termination (`taskkill /F /T /PID` and `taskkill /F /IM jarvis.exe`).
+  - Implemented atomic file swap (`move` to `.old` before `copy`) to bypass transient OneDrive/Windows file locks.
+  - Added retry cap (up to 30s) and clean fallback to prevent infinite script loops.
+- **PyInstaller Spec & Dependency Updates (`jarvis.spec`, `build_exe.py`, `requirements.txt`)**:
+  - Added `piper-tts>=1.8.0` and `sounddevice>=0.5.0` to `requirements.txt`.
+  - Added hidden imports and data collection for `piper`, `sounddevice`, and `onnxruntime` to `jarvis.spec` and `build_exe.py`.
+
 

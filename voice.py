@@ -271,21 +271,54 @@ def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
     return result
 
 
-class Speaker(threading.Thread):
-    """Runs pyttsx3 on its own thread (the engine is not thread-safe)."""
+def ensure_piper_model(model_path, config_path):
+    """Verifies that the Piper model and config exist, downloading them if missing."""
+    if os.path.exists(model_path) and os.path.exists(config_path):
+        return True
+    try:
+        import requests
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        base_url = "https://huggingface.co/jgkawell/jarvis/resolve/main/en/en_GB/jarvis/medium"
+        print("[voice] Paul Bettany J.A.R.V.I.S. voice model not found locally. Downloading (~60MB)...")
+        for fname, dest in [("jarvis-medium.onnx.json", config_path), ("jarvis-medium.onnx", model_path)]:
+            if not os.path.exists(dest):
+                resp = requests.get(f"{base_url}/{fname}", stream=True, timeout=60)
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+        print("[voice] Paul Bettany J.A.R.V.I.S. voice model downloaded successfully.")
+        return True
+    except Exception as exc:
+        print(f"[voice] Could not download Paul Bettany model: {exc}")
+        return False
 
-    def __init__(self, enabled=True):
+
+class Speaker(threading.Thread):
+    """
+    Synthesizes and plays spoken feedback for J.A.R.V.I.S.
+    Supports:
+    - 'piper': Offline neural TTS with Paul Bettany voice clone (MCU J.A.R.V.I.S.) via sounddevice.
+    - 'system': System-native SAPI5 fallback via pyttsx3.
+    """
+
+    def __init__(self, enabled=True, cfg=None):
         super().__init__(daemon=True)
         self.enabled = enabled
+        self.cfg = cfg
         self.q = queue.Queue()
+        self._piper_voice = None
+        self._sapi_engine = None
 
     def say(self, text):
-        if self.enabled:
+        is_enabled = getattr(self.cfg, "speak", self.enabled) if self.cfg else self.enabled
+        if is_enabled and text:
             self.q.put(text)
 
-    def run(self):
-        if not self.enabled:
-            return
+    def _init_system_engine(self):
+        if self._sapi_engine is not None:
+            return self._sapi_engine
         try:
             import pyttsx3
             engine = pyttsx3.init()
@@ -294,18 +327,100 @@ class Speaker(threading.Thread):
                 if any(n in v.name for n in ("David", "Mark", "George", "James")):
                     engine.setProperty("voice", v.id)
                     break
+            self._sapi_engine = engine
+            return engine
         except Exception as exc:
-            print(f"[voice] text-to-speech unavailable: {exc}")
+            print(f"[voice] system text-to-speech unavailable: {exc}")
+            return None
+
+    def _say_system(self, text):
+        engine = self._init_system_engine()
+        if engine:
+            try:
+                engine.say(text)
+                engine.runAndWait()
+            except Exception as e:
+                print(f"[voice] system speech error: {e}")
+
+    def _get_piper_paths(self):
+        rel_model = getattr(self.cfg, "tts_model_path", "models/voice/jarvis-medium.onnx") if self.cfg else "models/voice/jarvis-medium.onnx"
+        if os.path.isabs(rel_model):
+            model_path = rel_model
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            candidate = os.path.join(base_dir, rel_model)
+            if os.path.exists(candidate):
+                model_path = candidate
+            else:
+                appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+                appdata_model = os.path.join(appdata, "Jarvis", rel_model)
+                if os.path.exists(appdata_model):
+                    model_path = appdata_model
+                else:
+                    model_path = candidate if not getattr(sys, "frozen", False) else appdata_model
+        config_path = model_path + ".json"
+        return model_path, config_path
+
+    def _init_piper(self):
+        model_path, config_path = self._get_piper_paths()
+        if self._piper_voice is not None and getattr(self, "_loaded_model_path", None) == model_path:
+            return self._piper_voice
+
+        if not (os.path.exists(model_path) and os.path.exists(config_path)):
+            ensure_piper_model(model_path, config_path)
+        if os.path.exists(model_path) and os.path.exists(config_path):
+            try:
+                from piper import PiperVoice
+                print(f"[voice] Loading Paul Bettany J.A.R.V.I.S. neural voice ({os.path.basename(model_path)})...")
+                voice = PiperVoice.load(model_path, config_path=config_path)
+                self._piper_voice = voice
+                self._loaded_model_path = model_path
+                print("[voice] Paul Bettany voice model loaded.")
+                return voice
+            except Exception as e:
+                print(f"[voice] PiperVoice initialization failed: {e}")
+        return None
+
+    def _say_piper(self, text):
+        voice = self._init_piper()
+        if voice is None:
+            self._say_system(text)
             return
+
+        try:
+            import sounddevice as sd
+            chunks = list(voice.synthesize(text))
+            if not chunks:
+                return
+            sample_rate = chunks[0].sample_rate
+            audio = np.concatenate([c.audio_float_array for c in chunks])
+            sd.play(audio, sample_rate)
+            sd.wait()
+        except Exception as exc:
+            print(f"[voice] Piper synthesis/playback error: {exc}, falling back to system TTS")
+            self._say_system(text)
+
+    def run(self):
+        # Pre-warm Piper model in background so spoken responses are instantaneous
+        engine_type = getattr(self.cfg, "tts_engine", "piper") if self.cfg else "piper"
+        if engine_type == "piper":
+            try:
+                self._init_piper()
+            except Exception as e:
+                print(f"[voice] Piper pre-warm note: {e}")
+
         while True:
             text = self.q.get()
             if text is None:
                 return
             try:
-                engine.say(text)
-                engine.runAndWait()
-            except Exception:
-                pass
+                engine_type = getattr(self.cfg, "tts_engine", "piper") if self.cfg else "piper"
+                if engine_type == "piper":
+                    self._say_piper(text)
+                else:
+                    self._say_system(text)
+            except Exception as exc:
+                print(f"[voice] speech output error: {exc}")
 
 
 class Voice(threading.Thread):

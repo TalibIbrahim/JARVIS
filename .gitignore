@@ -38,6 +38,9 @@ jarvis_config.json
 *.key
 *.secret
 
+# AI & Voice Models
+models/
+
 # PyInstaller
 *.manifest
 *.spec

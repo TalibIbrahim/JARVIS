@@ -26,7 +26,8 @@ try:
     from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, Signal, QObject
     from PySide6.QtGui import (
         QPainter, QColor, QPen, QBrush, QFont, QPainterPath,
-        QLinearGradient, QRadialGradient, QPixmap, QIcon, QAction, QPolygonF
+        QLinearGradient, QRadialGradient, QPixmap, QIcon, QAction, QPolygonF,
+        QCursor
     )
     from PySide6.QtWidgets import (
         QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
@@ -43,7 +44,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.2.3"
+    APP_VERSION = "1.2.4"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -566,7 +567,7 @@ class AppleDynamicIsland(QWidget):
 # =====================================================================
 
 class CursorFeedbackOverlay(QWidget):
-    """Transparent click-through ring overlay following the cursor position."""
+    """Transparent click-through ring overlay following cursor position, hand pointer, and gesture progress."""
 
     def __init__(self):
         super().__init__()
@@ -580,8 +581,8 @@ class CursorFeedbackOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowTitle("JARVIS_CURSOR_FEEDBACK")
 
-        self.cur_x = 0.0
-        self.cur_y = 0.0
+        self.cur_x = -999.0
+        self.cur_y = -999.0
         self.progress = 0.0
         self.latched = False
         self.flashing = False
@@ -589,6 +590,13 @@ class CursorFeedbackOverlay(QWidget):
         self.radial_open = False
         self.radial_hover = None
         self.radial_prog = 0.0
+
+        # Hand pointer & wake/standby telemetry
+        self.active = False
+        self.gesture_prog = 0.0
+        self.landmarks = []
+        self.hand_visible_standby = False
+        self.is_holding = False
 
         self.dark_mode, self.accent_color = get_system_theme()
         self.resize(160, 160)
@@ -604,6 +612,72 @@ class CursorFeedbackOverlay(QWidget):
             user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20 | 0x80 | 0x08000000)
         except Exception:
             pass
+
+    def update_state(self, data):
+        self.active = data.get("active", False)
+        new_prog = data.get("progress", 0.0)
+        self.landmarks = data.get("landmarks", [])
+
+        now = time.time()
+        was_holding = self.is_holding
+        self.is_holding = (new_prog > 0.01)
+
+        # Trigger expanding ripple on gesture completion
+        if was_holding and new_prog >= 0.95 and not self.flashing:
+            self.flash_start = now
+            self.flashing = True
+
+        self.gesture_prog = new_prog
+
+        if not self.active:
+            # Standby mode: map hand anchor to screen coordinates
+            if self.landmarks and len(self.landmarks) > 0 and len(self.landmarks[0]) > 9:
+                lm = self.landmarks[0]
+                if len(lm) > 17:
+                    hx = (lm[5][0] + lm[9][0] + lm[13][0] + lm[17][0]) / 4.0
+                    hy = (lm[5][1] + lm[9][1] + lm[13][1] + lm[17][1]) / 4.0
+                else:
+                    hx, hy = lm[9][0], lm[9][1]
+
+                screen = QApplication.primaryScreen()
+                geo = screen.geometry() if screen else QRectF(0, 0, 1920, 1080)
+                target_x = geo.x() + float(hx * geo.width())
+                target_y = geo.y() + float(hy * geo.height())
+
+                if self.cur_x < -100 or not self.hand_visible_standby:
+                    self.cur_x = target_x
+                    self.cur_y = target_y
+                else:
+                    self.cur_x += 0.40 * (target_x - self.cur_x)
+                    self.cur_y += 0.40 * (target_y - self.cur_y)
+                self.hand_visible_standby = True
+            else:
+                self.hand_visible_standby = False
+        else:
+            self.hand_visible_standby = False
+            if self.gesture_prog > 0.01:
+                pos = QCursor.pos()
+                self.cur_x = float(pos.x())
+                self.cur_y = float(pos.y())
+
+        should_render = (
+            self.radial_open or
+            (self.progress > 0.01 and not self.latched) or
+            (self.flashing or (now - self.flash_start < 0.35)) or
+            (not self.active and self.hand_visible_standby) or
+            (self.active and self.gesture_prog > 0.01)
+        )
+
+        if should_render and self.cur_x > -100:
+            sz = 220 if self.radial_open else 160
+            self.resize(sz, sz)
+            self.move(int(self.cur_x - sz / 2.0), int(self.cur_y - sz / 2.0))
+            if not self.isVisible():
+                self.show()
+            self.update()
+        elif not should_render and not (self.progress > 0.01) and not self.radial_open:
+            if self.isVisible() and not (now - self.flash_start < 0.35):
+                self.hide()
 
     def update_dwell(self, data):
         self.cur_x = data.get("x", self.cur_x)
@@ -621,9 +695,11 @@ class CursorFeedbackOverlay(QWidget):
         self.radial_hover = data.get("radial_hover")
         self.radial_prog = data.get("radial_progress", 0.0)
 
-        sz = 220 if self.radial_open else 120
+        sz = 220 if self.radial_open else 160
         self.resize(sz, sz)
         self.move(int(self.cur_x - sz / 2.0), int(self.cur_y - sz / 2.0))
+        if not self.isVisible():
+            self.show()
         self.update()
 
     def paintEvent(self, event):
@@ -636,18 +712,66 @@ class CursorFeedbackOverlay(QWidget):
         accent = QColor(self.accent_color)
         now = time.time()
 
-        # 1. Click Ripple Expansion Pulse
+        # 1. Click / Wake / Standby Ripple Expansion Pulse
         if self.flashing or (now - self.flash_start < 0.35):
             elapsed = now - self.flash_start
             frac = min(elapsed / 0.35, 1.0)
-            ripple_r = 14.0 + 20.0 * frac
-            ripple_alpha = int(220 * (1.0 - frac))
-            ripple_pen = QPen(QColor(accent.red(), accent.green(), accent.blue(), ripple_alpha), 2.0)
+            ripple_r = 16.0 + 26.0 * frac
+            ripple_alpha = int(240 * (1.0 - frac))
+            ripple_col = QColor(255, 195, 50) if not self.active else accent
+            ripple_pen = QPen(QColor(ripple_col.red(), ripple_col.green(), ripple_col.blue(), ripple_alpha), 2.2)
             p.setPen(ripple_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QPointF(cx, cy), ripple_r, ripple_r)
 
-        # 2. Radial Action Menu
+        # 2. Standby Hand Pointer & Wake-Up Circular Progress Bar
+        if not self.active and self.hand_visible_standby:
+            gold = QColor(255, 195, 50)
+            is_waking = self.gesture_prog > 0.02
+            dot_color = gold if is_waking else QColor(255, 255, 255)
+            halo_color = gold if is_waking else QColor(0, 229, 255)
+
+            # Outer soft glow halo
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(halo_color.red(), halo_color.green(), halo_color.blue(), 55)))
+            p.drawEllipse(QPointF(cx, cy), 13.0, 13.0)
+
+            # Inner sharp pointer dot
+            p.setBrush(QBrush(dot_color))
+            p.drawEllipse(QPointF(cx, cy), 4.5, 4.5)
+
+            # Circular Progress Bar for Waking Up
+            if self.gesture_prog > 0.01:
+                r_prog = 24.0
+                # Ambient background track
+                p.setPen(QPen(QColor(255, 255, 255, 50), 2.2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QPointF(cx, cy), r_prog, r_prog)
+
+                # Sweeping Golden Wake Progress Arc
+                prog_pen = QPen(gold, 3.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+                p.setPen(prog_pen)
+                box = QRectF(cx - r_prog, cy - r_prog, r_prog * 2.0, r_prog * 2.0)
+                p.drawArc(box, int(90 * 16), -int(self.gesture_prog * 360 * 16))
+            return
+
+        # 3. Active Standby Hold Circular Progress Bar (holding thumbs-up / palm to sleep)
+        if self.active and self.gesture_prog > 0.01:
+            r_prog = 24.0
+            # Ambient background track
+            p.setPen(QPen(QColor(255, 255, 255, 50), 2.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), r_prog, r_prog)
+
+            # Sweeping Sleep / Standby Arc
+            sleep_col = QColor(96, 165, 250)
+            prog_pen = QPen(sleep_col, 3.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            p.setPen(prog_pen)
+            box = QRectF(cx - r_prog, cy - r_prog, r_prog * 2.0, r_prog * 2.0)
+            p.drawArc(box, int(90 * 16), -int(self.gesture_prog * 360 * 16))
+            return
+
+        # 4. Radial Action Menu (when Dwell radial menu is open)
         if self.radial_open:
             sectors = [
                 ("click", "Click", 0),
@@ -686,7 +810,7 @@ class CursorFeedbackOverlay(QWidget):
 
             return
 
-        # 3. Dwell Progress Ring
+        # 5. Dwell Progress Ring
         if self.progress > 0.01 and not self.latched:
             r_dwell = 14.0
             # Ambient thin track
@@ -1366,6 +1490,39 @@ class SettingsWindow(QDialog):
         sw_speak = AppleSwitch(self.cfg.speak)
         sw_speak.toggled.connect(lambda v: self._save("speak", v))
         card.add_row("Spoken Responses", "Jarvis replies with voice confirmations", sw_speak)
+
+        # 3. Voice Persona / TTS Engine
+        self.tts_combo = QComboBox()
+        self.tts_combo.setMinimumWidth(200)
+        tts_options = [
+            ("piper", "Paul Bettany (MCU J.A.R.V.I.S. Neural)"),
+            ("system", "System Default (Windows SAPI5)"),
+        ]
+        cur_tts = getattr(self.cfg, "tts_engine", "piper")
+        selected_tts_idx = 0
+        for idx, (code, label) in enumerate(tts_options):
+            self.tts_combo.addItem(label, code)
+            if cur_tts == code:
+                selected_tts_idx = idx
+        self.tts_combo.setCurrentIndex(selected_tts_idx)
+        self.tts_combo.currentIndexChanged.connect(
+            lambda idx: self._save("tts_engine", self.tts_combo.itemData(idx))
+        )
+
+        btn_test_tts = QPushButton("Test Voice")
+        btn_test_tts.setFixedHeight(28)
+        btn_test_tts.setFixedWidth(85)
+        btn_test_tts.clicked.connect(
+            lambda: self.ctx.say("At your service, sir. All systems are fully operational.") if self.ctx else None
+        )
+
+        tts_widget = QWidget()
+        tts_hlayout = QHBoxLayout(tts_widget)
+        tts_hlayout.setContentsMargins(0, 0, 0, 0)
+        tts_hlayout.setSpacing(8)
+        tts_hlayout.addWidget(self.tts_combo, stretch=1)
+        tts_hlayout.addWidget(btn_test_tts, stretch=0)
+        card.add_row("Voice Persona", "AI voice model for J.A.R.V.I.S. spoken responses", tts_widget)
 
         # 3. Microphone Input Device Selector
         mics = list_microphones()
@@ -2089,6 +2246,7 @@ class Overlay:
                     self.island.landmarks = d.get("landmarks", [])
                     self.island.precision_active = d.get("precision", False)
                     self.tray.update_status(d["active"])
+                    self.cursor_overlay.update_state(d)
                 elif kind == "say":
                     self.island.say_text = d["text"]
                     self.island.say_until = now + 4.2

@@ -83,6 +83,8 @@ class Config:
     # --- voice ---
     voice_enabled: bool = True
     speak: bool = True                  # spoken replies
+    tts_engine: str = "piper"           # "piper" (Paul Bettany MCU) or "system" (pyttsx3 SAPI5)
+    tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
     wake_aliases: list = field(default_factory=lambda: [
         "jarvis", "jarvas", "jervis", "gervais", "javis", "jarviz", "travis", "service", "harvest", "charvis", "darvis", "jar is"
