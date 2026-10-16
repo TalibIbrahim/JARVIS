@@ -282,7 +282,7 @@ Run the complete unit test suite anytime:
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-All **138 tests** pass in ~2.6 seconds across the gesture state machine, dwell hover, single-instance mutex locks, auto-updater, Groq intelligence, vision analysis, Siri-style live display, Stark protocols, and the Laya-style System 1 decision engine.
+All **139 tests** pass in ~2.6 seconds across the gesture state machine, dwell hover, single-instance mutex locks, auto-updater, Groq intelligence, vision analysis, Siri-style live display, Stark protocols, and the Laya-style System 1 decision engine.
 
 ---
 

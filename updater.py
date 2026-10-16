@@ -53,6 +53,7 @@ class AutoUpdater:
         self.download_progress = 0
         self.status = "idle"
         self._listeners = []
+        self._announced_tags = set()
 
     def add_listener(self, callback):
         self._listeners.append(callback)
@@ -119,14 +120,22 @@ class AutoUpdater:
                     "asset_size": asset_size,
                 }
                 self._notify("available", info=self.latest_info)
-                if self.overlay:
-                    self.overlay.post("say", text=f"Update {tag_name} is available, sir.")
-                if self.ctx and getattr(self.ctx, "speaker", None):
-                    self.ctx.say(f"An update to Jarvis is available, sir. Version {tag_name.lstrip('v')}.")
+                # Announce verbally only once per version tag (or if explicitly requested by user)
+                if notify_if_latest or (tag_name not in self._announced_tags):
+                    self._announced_tags.add(tag_name)
+                    spoken_msg = f"Update {tag_name} is available, sir."
+                    if self.overlay:
+                        self.overlay.post("say", text=spoken_msg)
+                    elif self.ctx and hasattr(self.ctx, "say"):
+                        self.ctx.say(spoken_msg)
             else:
                 self._notify("up-to-date", current=APP_VERSION)
-                if notify_if_latest and self.overlay:
-                    self.overlay.post("say", text=f"Jarvis is up to date (v{APP_VERSION}).")
+                if notify_if_latest:
+                    spoken_msg = f"Jarvis is up to date (v{APP_VERSION})."
+                    if self.overlay:
+                        self.overlay.post("say", text=spoken_msg)
+                    elif self.ctx and hasattr(self.ctx, "say"):
+                        self.ctx.say(spoken_msg)
         except Exception as exc:
             self._notify("error", message=str(exc))
         finally:

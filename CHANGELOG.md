@@ -352,6 +352,9 @@
   - Added robust open palm wake detection (`Pose.palm`) alongside pinch and fist gestures.
   - Dynamic frame rate adaptation: standby loop instantly ramps to 30 FPS when a hand enters camera view.
   - Extended palm grace duration to 0.35s to prevent momentary tracking dropouts.
-- **Expanded Test Suite (`tests/test_decision_engine.py`, `tests/test_ai.py`)**:
-  - Added 13 new unit tests covering sub-millisecond decision latency, intent prototype classification, whitelist execution, and acoustic feature verification.
-  - Full suite now stands at **138 tests**, passing in ~2.8 seconds with 100% pass rate.
+- **Update Announcement Deduplication & Speech Debounce (`updater.py`, `tests/test_updater.py`)**:
+  - Fixed a redundant double-speech invocation in `_check_worker` where both `self.overlay.post("say", ...)` and `self.ctx.say(...)` queued back-to-back voice announcements.
+  - Added session tag debouncing (`self._announced_tags`): background checks only announce a discovered release once per session unless explicitly requested by the user.
+- **Expanded Test Suite (`tests/test_decision_engine.py`, `tests/test_ai.py`, `tests/test_updater.py`)**:
+  - Added 14 new unit tests covering sub-millisecond decision latency, intent prototype classification, whitelist execution, acoustic feature verification, and update notification debouncing.
+  - Full suite now stands at **139 tests**, passing in ~2.8 seconds with 100% pass rate.

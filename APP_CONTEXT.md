@@ -335,11 +335,11 @@ Run the test suite with:
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
-- **138 tests passing in ~2.8 seconds**:
+- **139 tests passing in ~2.8 seconds**:
   - `test_gestures.py` (26 tests): Open palm movement, fist clicks, double clicks, drag & drop, neutral zone deadband, wake/standby rules, handedness symmetry, anchor stability.
   - `test_dwell.py` (5 tests): Hover timing, radius bounds, latching, gesture pausing, radial sector selection.
   - `test_single_instance.py` (2 tests): Win32 mutex acquisition and multi-instance rejection.
-  - `test_updater.py` (5 tests): Semver comparisons, asset matching, download verification.
+  - `test_updater.py` (6 tests): Semver comparisons, asset matching, download verification, single spoken announcement and debouncing.
   - `test_ai.py` (41 tests): Groq API key validation (200, 401, 429, timeout, offline), Whisper STT, chat completions, sliding-window rate limiting, action whitelist enforcement, rejection of unauthorized shell calls, keyring credential manager storage with dev env fallback, Google SR fallback on network/quota failure, VAD silence rejection, and multi-turn history reset.
   - `test_ironman_voice.py` (46 tests): Siri-style live prompt posting, Stark telemetry reporting, system diagnostics, and action dispatch.
   - `test_decision_engine.py` (13 tests): Sub-15ms (< 1ms actual) non-autoregressive decision classification, volume/media/desktop/Iron Man protocol intent prototypes, System 1 reflex execution, System 2 fallback routing, and acoustic voice profile enrollment/verification.
