@@ -270,5 +270,132 @@ class TestVisualQueryTimeout(unittest.TestCase):
         self.assertFalse(overlay.island.thinking and (future < overlay.island.thinking_until))
 
 
+class TestVoiceProfileAndSpeakerVerification(unittest.TestCase):
+    """Verifies acoustic voice profiling, enrollment, speaker verification, and training commands."""
+
+    def setUp(self):
+        self.test_profile_path = "scratch_test_voice_profile.json"
+        from voice_profile import VoiceProfileManager
+        self.vpm = VoiceProfileManager(profile_path=self.test_profile_path)
+        self.ctx = MagicMock()
+
+    def tearDown(self):
+        import os
+        if os.path.exists(self.test_profile_path):
+            try:
+                os.remove(self.test_profile_path)
+            except Exception:
+                pass
+
+    def _generate_synthetic_voice(self, f0=135.0, duration=1.0, sr=16000):
+        import numpy as np
+        t = np.linspace(0, duration, int(sr * duration))
+        # Fundamental + harmonic overtones
+        signal = 0.5 * np.sin(2 * np.pi * f0 * t) + 0.3 * np.sin(2 * np.pi * 2 * f0 * t) + 0.2 * np.sin(2 * np.pi * 3 * f0 * t)
+        return (signal * 24000).astype(np.int16).tobytes()
+
+    def test_voice_feature_extraction(self):
+        raw = self._generate_synthetic_voice(f0=140.0)
+        feat = self.vpm.extract_features(raw)
+        self.assertIsNotNone(feat)
+        self.assertEqual(len(feat), 11)
+
+    def test_voice_enrollment_and_verification(self):
+        raw_owner = self._generate_synthetic_voice(f0=140.0)
+        ok, msg = self.vpm.enroll([raw_owner])
+        self.assertTrue(ok)
+        self.assertTrue(self.vpm.is_enrolled)
+
+        # Same voice must verify as match
+        match, score = self.vpm.verify(raw_owner)
+        self.assertTrue(match)
+        self.assertGreater(score, 0.70)
+
+        # Different voice with pitch 280 Hz must be rejected
+        raw_other = self._generate_synthetic_voice(f0=280.0)
+        match_other, score_other = self.vpm.verify(raw_other)
+        self.assertFalse(match_other)
+        self.assertLess(score_other, 0.55)
+
+    def test_train_my_voice_command(self):
+        raw = self._generate_synthetic_voice(f0=130.0)
+        Voice._last_raw_audio = raw
+        reply = run_command("train my voice", self.ctx)
+        self.assertIn("calibrated", reply.lower())
+
+    def test_passive_monitoring_does_not_popup_transcribing(self):
+        """When user has not said Jarvis, background audio worker does not leave transcribing on overlay."""
+        voice = Voice(Config(), self.ctx, MagicMock())
+        voice.listening_until = 0.0  # passive standby
+
+        audio = MagicMock()
+        audio.get_raw_data.return_value = self._generate_synthetic_voice()
+        voice.audio_q.put(audio)
+
+        with patch("voice.get_api_key", return_value=None):
+            with patch.object(voice, "_fallback_google", return_value="just ambient background sound"):
+                # Run one cycle
+                voice.stop.is_set.side_effect = [False, True]
+                voice._recognition_worker(MagicMock(), MagicMock())
+
+        # listening_done must have been posted to clean the island
+        self.ctx.overlay.post.assert_any_call("listening_done")
+
+
+class TestRobustHandGestureWake(unittest.TestCase):
+    """Verifies that natural open palm poses reliably wake J.A.R.V.I.S. from standby."""
+
+    def test_natural_webcam_open_palm_wakes(self):
+        from gestures import GestureEngine, Hand
+        cfg = Config(activate_hold=0.5, palm_grace=0.35)
+        engine = GestureEngine(cfg)
+        self.assertFalse(engine.active)
+
+        # Natural open hand: wrist at (0.5, 0.8), knuckles at (0.5, 0.6), tips at (0.5, 0.38)
+        # Ratio: (0.8 - 0.38) / (0.8 - 0.6) = 2.1 (open palm)
+        base = {
+            0: (0.50, 0.80), 5: (0.44, 0.62), 9: (0.50, 0.60), 13: (0.56, 0.62), 17: (0.61, 0.66),
+            8: (0.44, 0.38), 12: (0.50, 0.36), 16: (0.56, 0.38), 20: (0.61, 0.44), 4: (0.35, 0.62),
+        }
+        mock_lm = [(base[i] if i in base else (0.5, 0.5)) for i in range(21)]
+        hand = Hand(mock_lm)
+
+        actions = []
+        now = time.time()
+        for i in range(20):
+            t = now + i * 0.033
+            acts = engine.update([hand], t)
+            actions.extend(acts)
+
+        # Must trigger activate action
+        self.assertTrue(engine.active)
+        self.assertIn("activate", [a.kind for a in actions])
+
+
+class TestSiriStreamingAndTypewriter(unittest.TestCase):
+    """Verifies Siri-style live speech streaming and prompt animation in Dynamic Island."""
+
+    def test_live_speech_event_drains_and_animates(self):
+        stop = MagicMock()
+        stop.is_set.return_value = False
+        overlay = Overlay(stop, cfg=Config())
+        now = time.time()
+
+        overlay.post("live_speech", text="what is the", is_final=False)
+        overlay._drain(now)
+
+        self.assertEqual(overlay.island.user_prompt, "what is the")
+        self.assertTrue(overlay.island.is_live_speech)
+        self.assertTrue(overlay.island.listening)
+
+        # Final prompt event
+        overlay.post("prompt", text="what is the weather today")
+        overlay._drain(now + 0.1)
+
+        self.assertEqual(overlay.island.user_prompt, "what is the weather today")
+        self.assertFalse(overlay.island.is_live_speech)
+        self.assertFalse(overlay.island.listening)
+
+
 if __name__ == "__main__":
     unittest.main()

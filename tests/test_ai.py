@@ -420,6 +420,7 @@ class TestAICommandsDispatch(unittest.TestCase):
     def setUp(self):
         self.cfg = Config()
         self.cfg.ai_enabled = True
+        self.cfg.local_decision_engine = False
         self.ctx = MagicMock()
         self.ctx.engine.cfg = self.cfg
 

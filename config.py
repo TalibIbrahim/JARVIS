@@ -53,9 +53,9 @@ class Config:
     clutch_enabled: bool = True         # pause pose / leaving margin box stops cursor
 
     # --- gesture timing / thresholds (distances are relative to hand size) ---
-    activate_hold: float = 0.8          # seconds of open palm to wake up
+    activate_hold: float = 0.7          # seconds of open palm to wake up
     deactivate_hold: float = 1.5        # seconds of open palm to go to standby
-    palm_grace: float = 0.15            # grace period to absorb single-frame landmark flicker during palm hold
+    palm_grace: float = 0.35            # grace period to absorb multi-frame landmark flicker during palm hold
     pinch_down: float = 0.28            # thumb-index distance that counts as a pinch
     pinch_up: float = 0.42              # distance at which the pinch is released (hysteresis)
     pinch_freeze: float = 0.55          # cursor freezes while fingers close, so clicks don't drift
@@ -87,7 +87,10 @@ class Config:
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
     wake_aliases: list = field(default_factory=lambda: [
-        "jarvis", "jarvas", "jervis", "gervais", "javis", "jarviz", "travis", "service", "harvest", "charvis", "darvis", "jar is"
+        "jarvis", "hey jarvis", "ok jarvis", "okay jarvis", "hi jarvis", "hello jarvis",
+        "yo jarvis", "jarvis please", "jarvas", "jervis", "gervais", "javis", "jarviz",
+        "jarves", "jarv", "travis", "service", "harvest", "charvis", "darvis", "jar is",
+        "jar business"
     ])
     command_window: float = 6.0         # seconds Jarvis keeps listening after "Jarvis?"
     mic_device_index: int = None        # specific microphone device index, or None for auto-detect
@@ -95,6 +98,8 @@ class Config:
     mic_dynamic_energy: bool = False    # adapt threshold dynamically (False prevents runaway threshold on laptop mics)
     mic_pause_threshold: float = 1.0    # seconds of silence before finishing phrase (prevents cutting off mid-sentence)
     mic_phrase_time_limit: float = 10.0 # maximum seconds per voice command phrase
+    voice_profile_enabled: bool = True  # enable speaker recognition and voice profile
+    voice_speaker_verification: bool = False # strict speaker verification (filters out other voices when trained)
 
     # --- ui / apple hig appearance ---
     theme_mode: str = "auto"            # "auto" (follows Windows), "dark", "light"
@@ -115,6 +120,7 @@ class Config:
     ai_timeout: int = 10
     ai_max_history: int = 6
     groq_api_key: str = ""              # optional saved Groq API key persisted in config file
+    local_decision_engine: bool = True  # ultra-fast local semantic intent matcher (System 1 reflex)
 
 
 def get_config_path(explicit_path=None):

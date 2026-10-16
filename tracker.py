@@ -148,9 +148,10 @@ class Tracker(threading.Thread):
         last_processed_t = 0.0
         win_name = "JARVIS // VISION  (q to quit)"
 
+        hand_visible = False
         while not self.stop.is_set():
-            # CPU throttling: drop to ~10 FPS when on standby to save CPU on laptops
-            if not self.engine.active and not cfg.show_preview:
+            # CPU throttling: drop to ~10 FPS only when on standby and no hand is in view
+            if not self.engine.active and not cfg.show_preview and not hand_visible:
                 time.sleep(0.06)
 
             if use_threaded:
@@ -190,6 +191,7 @@ class Tracker(threading.Thread):
             if result.multi_hand_landmarks:
                 for lms in result.multi_hand_landmarks:
                     found.append(Hand([(p.x, p.y) for p in lms.landmark]))
+            hand_visible = bool(found)
 
             now = time.time()
             dt = max(now - self._last_frame_t, 1e-4)

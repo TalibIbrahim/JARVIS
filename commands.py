@@ -191,6 +191,22 @@ def run_command(text, ctx):
             webbrowser.open("https://www.google.com")
         return "Target practice range initialized, sir. Repulsor calibration ready."
 
+    # --- voice training & speaker profile ---
+    if _any(clean_t, "train my voice", "train voice", "enroll voice", "learn my voice", "calibrate voice", "voice training", "recognize my voice"):
+        try:
+            from voice_profile import get_voice_profile
+            from voice import Voice
+            vp = get_voice_profile()
+            latest = getattr(Voice, "_last_raw_audio", None)
+            if latest:
+                ok, msg = vp.enroll([latest])
+                if ok:
+                    vp.enabled = True
+                    return "Voice profile successfully calibrated, sir. I have committed your vocal signature to memory and will listen specifically for you."
+            return "Vocal training mode active, sir. Speak a sentence clearly and I will calibrate to your voice."
+        except Exception:
+            return "Voice training calibration encountered an issue, sir."
+
     # --- chatter & diagnostics ---
     if _any(clean_t, "diagnostic", "diagnostics", "run diagnostic", "run diagnostics", "system diagnostic", "suit diagnostic", "suit status", "power level", "power levels", "arc reactor", "telemetry"):
         return get_system_telemetry(ctx)
@@ -290,7 +306,28 @@ def run_command(text, ctx):
             return "Applying update and restarting Jarvis now, sir."
         return "No downloaded update is ready to install, sir."
 
-    # --- fallback: Groq AI query if enabled ---
+    # Visual queries immediately dispatch to camera vision
+    if is_visual_query(text):
+        return _handle_ai_query(text, ctx)
+
+    # --- local decision engine (System 1 Reflex: ~1-15ms) ---
+    cfg = None
+    if ctx:
+        if hasattr(ctx, "engine") and hasattr(ctx.engine, "cfg"):
+            cfg = ctx.engine.cfg
+        elif hasattr(ctx, "cfg"):
+            cfg = ctx.cfg
+
+    if cfg is None or getattr(cfg, "local_decision_engine", True):
+        try:
+            from decision_engine import evaluate_decision
+            decision_reply = evaluate_decision(text, ctx)
+            if decision_reply:
+                return decision_reply
+        except Exception as exc:
+            print(f"[commands] decision engine note: {exc}")
+
+    # --- fallback: Groq AI query if enabled (System 2 Deep Reasoning) ---
     return _handle_ai_query(text, ctx)
 
 

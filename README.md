@@ -148,12 +148,16 @@ Speak naturally after the wake word *"Jarvis"*:
 "run diagnostics"            "suit status"           "power levels"
 "house party protocol"       "stealth mode"          "clean slate protocol"
 "target practice"            "thank you jarvis"      "who are you"
+"train my voice"             "calibrate voice"       "learn my voice"
 "what time is it"            "what day is it"        "status"
 "wake up"                    "go to sleep"           "shut down Jarvis"
 ```
 
-### Siri-Style Prompt Display & Iron Man HUD
-- **Real-Time Prompt Telemetry**: Just like Siri on macOS and iOS, the Dynamic Island capsule displays the exact spoken prompt Jarvis received (`“<prompt>”`) with an Arc Reactor core badge, so you immediately know what directive was captured.
+### Siri-Style Streaming Prompt Display & Speaker Recognition
+- **Laya-Style System 1 Reflex Decision Engine**: Inspired by non-autoregressive decision models, un-regexed voice commands (*"crank up the audio"*, *"hide all my windows"*, *"go dark"*, *"bring up youtube"*) execute locally on-device in **< 1.0 ms** with zero cloud latency, zero API costs, and zero hallucinations. Knowledge queries (*"explain quantum computing"*) seamlessly route to Groq System 2 LLM.
+- **Live Progressive Typewriter Display**: Just like Siri, as words are spoken and recognized, they stream smoothly across the Dynamic Island capsule letter-by-letter with an animated cursor (`“<prompt>▍”`), eliminating sudden text popping.
+- **Voice Profile Calibration ("Train My Voice")**: Train Jarvis to recognize your unique vocal characteristics (pitch $F_0$, spectral formant envelope, centroid, rolloff). Simply say *"train my voice"* or *"calibrate voice"*, and Jarvis commits your vocal signature to memory.
+- **Silent Background Wake-Word Monitoring**: In passive standby, Jarvis monitors quietly for the wake-word without displaying false "Processing speech..." popups on background room noises, keyboard typing, or distant chatter.
 - **Hardware Telemetry Diagnostics**: Run `"diagnostics"` or `"suit status"` to receive real-time Windows hardware reports on physical RAM availability, AC/battery power levels, and 120 Hz repulsor tracking.
 - **Stark Defense Protocols**: Direct voice actuation for `"House Party Protocol"`, `"Stealth Mode"`, `"Clean Slate Protocol"`, and `"Target Practice"`.
 - **Iron Man Acoustic Cues**: Futuristic HUD frequency chimes for wake acknowledgment (880/1320 Hz) and directive confirmation (1046/1318 Hz).

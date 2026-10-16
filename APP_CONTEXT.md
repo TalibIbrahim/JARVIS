@@ -267,8 +267,14 @@ Many Windows PCs have Virtual Audio Cables installed (e.g. from OBS, VoiceMeeter
 - **Dual Speech Recognition Pipeline**:
   - *Primary (Groq Whisper)*: When `ai_enabled` is true and a Groq key is configured, audio is transcribed using Groq's high-speed Whisper service (`whisper-large-v3-turbo` with language hint `"en"`).
   - *Automatic Fallback (Google Speech API)*: If no key is set, the network is offline, or the API returns HTTP 401/429, the system automatically routes to Google SpeechRecognition and presents an amber Island error badge. Once connectivity or rate limit cooldown clears, Groq transcription automatically resumes.
+- **Siri-Style Progressive Speech Streaming**: As the user speaks, captured audio triggers progressive live word posting to the Dynamic Island overlay with a smooth blinking cyan cursor (`▍`).
+- **Speaker Verification & Voice Profiling ([`voice_profile.py`](file:///c:/Programming/Jarvis/voice_profile.py))**: Extracts an 11-dimensional acoustic feature vector ($F_0$ pitch via autocorrelation, 8-band formant spectral envelope, spectral centroid, rolloff). Users can train the model via `"train my voice"`. Verified speakers execute commands while background chatter from non-owners is suppressed.
 - **Local Dispatch First**: [`commands.py`](file:///c:/Programming/Jarvis/commands.py) always evaluates exact regex word boundary patterns (`\b...\b`) locally first for instant, zero-latency execution.
-- **Groq LLM Intelligence Fallback**: If no local regex matches and AI is enabled, the utterance is submitted to Groq LLM (`llama-3.1-8b-instant`). The system prompt injects dynamic contextual state (time, active/standby status, tracking mode, dwell mode) and enforces JSON action responses (`action`, `args`, `reply`).
+- **Laya-Style Local Decision Engine (System 1 Reflex Model, [`decision_engine.py`](file:///c:/Programming/Jarvis/decision_engine.py))**:
+  - Non-autoregressive exemplar matching with character 3-gram subword vectorization and IDF weighting.
+  - Classifies natural, un-regexed command variations (*"crank up the audio"*, *"hide all my windows"*, *"go dark"*, *"bring up youtube"*) in **< 1.0 ms** on CPU with zero cloud calls, zero network latency, and zero API costs.
+  - Uses margin thresholding ($S^* \ge 0.25$, $\Delta \ge 0.03$) to crisply separate desktop commands from general conversational queries.
+- **Groq LLM Intelligence Fallback (System 2 Deep Reasoning)**: If no local regex or reflex matches, the query is passed to Groq LLM (`openai/gpt-oss-120b`). The system prompt injects dynamic contextual state (time, active/standby status, tracking mode, dwell mode) and enforces JSON action responses (`action`, `args`, `reply`).
 - **Strict Action Whitelisting**: Actions returned by the LLM are validated against a strict whitelist (diagnostics, stealth mode, clean slate, house party, target practice, volume, media controls, whitelist-only app launching, whitelist-only sites, search, screenshot, workstation lock, window controls, mode switches, status). Arbitrary shell execution is impossible. If JSON parsing fails, the assistant speaks the reply text safely.
 - **In-Memory History**: Keeps up to 6 turns of conversation history in volatile RAM only. Resets automatically whenever Jarvis enters standby.
 - **Feedback**: Spoken responses delivered via an isolated background `pyttsx3` text-to-speech worker thread or Paul Bettany Piper neural voice.
@@ -281,6 +287,7 @@ Many Windows PCs have Virtual Audio Cables installed (e.g. from OBS, VoiceMeeter
 - **Media Controls**: `"volume up"`, `"volume down"`, `"mute"`, `"unmute"`, `"play"`, `"pause"`, `"next track"`, `"previous track"`
 - **App Launchers**: `"open Chrome"`, `"open Edge"`, `"open VS Code"`, `"open File Explorer"`, `"open Terminal"`, `"open Notepad"`, `"open Calculator"`, `"open Task Manager"`, `"open Spotify"`
 - **Web Navigation**: `"open YouTube"`, `"open GitHub"`, `"search for [query]"`
+- **Voice Training & Calibration**: `"train my voice"`, `"calibrate voice"`, `"learn my voice"`, `"enroll voice"`
 - **Stark Telemetry & Diagnostics**: `"run diagnostics"`, `"suit status"`, `"power levels"`, `"status report"`
 - **Stark Protocols**: `"house party protocol"`, `"stealth mode"`, `"clean slate protocol"`, `"target practice"`
 - **Stark Conversational Wits**: `"thank you jarvis"`, `"who are you"`, `"are you there"`
@@ -328,12 +335,14 @@ Run the test suite with:
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
-- **79 tests passing in ~0.53 seconds**:
+- **138 tests passing in ~2.8 seconds**:
   - `test_gestures.py` (26 tests): Open palm movement, fist clicks, double clicks, drag & drop, neutral zone deadband, wake/standby rules, handedness symmetry, anchor stability.
   - `test_dwell.py` (5 tests): Hover timing, radius bounds, latching, gesture pausing, radial sector selection.
   - `test_single_instance.py` (2 tests): Win32 mutex acquisition and multi-instance rejection.
   - `test_updater.py` (5 tests): Semver comparisons, asset matching, download verification.
   - `test_ai.py` (41 tests): Groq API key validation (200, 401, 429, timeout, offline), Whisper STT, chat completions, sliding-window rate limiting, action whitelist enforcement, rejection of unauthorized shell calls, keyring credential manager storage with dev env fallback, Google SR fallback on network/quota failure, VAD silence rejection, and multi-turn history reset.
+  - `test_ironman_voice.py` (46 tests): Siri-style live prompt posting, Stark telemetry reporting, system diagnostics, and action dispatch.
+  - `test_decision_engine.py` (13 tests): Sub-15ms (< 1ms actual) non-autoregressive decision classification, volume/media/desktop/Iron Man protocol intent prototypes, System 1 reflex execution, System 2 fallback routing, and acoustic voice profile enrollment/verification.
 
 ---
 

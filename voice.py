@@ -17,6 +17,7 @@ import time
 import numpy as np
 
 from commands import run_command
+from voice_profile import get_voice_profile
 from ai import (
     get_api_key,
     GroqClient,
@@ -472,6 +473,7 @@ class Voice(threading.Thread):
     """Say 'Jarvis, open Chrome' in one go, or say 'Jarvis' and wait for 'Yes, sir?'."""
     _latest_rms = 0.0
     _latest_time = 0.0
+    _last_raw_audio = None
 
     def __init__(self, cfg, ctx, stop_event):
         super().__init__(daemon=True)
@@ -603,6 +605,8 @@ class Voice(threading.Thread):
             return None
 
     def _recognition_worker(self, recognizer, sr):
+        vp = get_voice_profile()
+
         while not self.stop.is_set():
             try:
                 audio = self.audio_q.get(timeout=0.5)
@@ -615,20 +619,39 @@ class Voice(threading.Thread):
                 continue
             arr = np.frombuffer(raw_bytes, dtype=np.int16)
             rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
-            if rms < 30.0:
-                continue  # Discard silent acoustic flutter to protect quota
 
-            # Visual feedback: audio received, transcribing speech
+            now = time.time()
+            is_active_session = now < self.listening_until
+
+            # Noise gate: reject quiet acoustic flutter (< 35.0) and require clear speech (> 48.0) in standby
+            min_rms = 35.0 if is_active_session else 48.0
+            if rms < min_rms:
+                continue
+
+            # Speaker verification gate (if enrolled and enabled in config)
+            if vp.is_enrolled and getattr(self.cfg, "voice_speaker_verification", False):
+                is_match, sim = vp.verify(raw_bytes)
+                if not is_match:
+                    print(f"[voice] Speaker verification rejected non-owner audio (similarity: {sim:.2f})")
+                    continue
+
+            # Cache latest valid speech audio for profile enrollment ("train my voice")
+            Voice._last_raw_audio = raw_bytes
+
+            # Visual feedback:
+            # ONLY display "Processing speech…" on the screen if user is already in an active session (already said Jarvis)
+            # In passive standby, keep until=now (0 duration) so background noise does not disrupt the screen,
+            # while keeping event compatibility for test harnesses.
             if hasattr(self.ctx, "overlay") and self.ctx.overlay:
                 try:
-                    self.ctx.overlay.post("listening", until=time.time() + 4.0, transcribing=True)
+                    visual_until = (now + 4.0) if is_active_session else now
+                    self.ctx.overlay.post("listening", until=visual_until, transcribing=True)
                 except Exception:
                     pass
 
             text = None
             key = get_api_key()
             ai_enabled = getattr(self.cfg, "ai_enabled", False)
-            now = time.time()
             use_groq = bool(ai_enabled and key and now >= self.groq_cooldown_until)
 
             if use_groq:
@@ -693,7 +716,14 @@ class Voice(threading.Thread):
                     command = t[match.end():].strip(" ,.!?")
                     break
             if command is None:
-                return  # no wake word: ignore
+                # No wake word: ignore and clear any listening state on the island
+                if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+                    try:
+                        self.ctx.overlay.post("listening_done")
+                    except Exception:
+                        pass
+                return
+
             if not command:
                 self.listening_until = now + self.cfg.command_window
                 try:
@@ -709,6 +739,18 @@ class Voice(threading.Thread):
                 return
 
         self.listening_until = 0.0
+
+        # Continuously adapt voice profile on confirmed commands
+        if Voice._last_raw_audio:
+            try:
+                vp = get_voice_profile()
+                if vp.is_enrolled:
+                    feat = vp.extract_features(Voice._last_raw_audio)
+                    if feat is not None:
+                        vp.adapt(feat)
+            except Exception:
+                pass
+
         # Post recognized prompt to the screen immediately so the user sees what Jarvis received
         try:
             if hasattr(self.ctx, "overlay") and self.ctx.overlay:

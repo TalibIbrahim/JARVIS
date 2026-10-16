@@ -44,7 +44,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.2.7"
+    APP_VERSION = "1.3.0"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -270,8 +270,11 @@ class AppleDynamicIsland(QWidget):
         self.say_until = 0.0
         self.listening = False
         self.listening_until = 0.0
-        self.is_transcribing = False
         self.user_prompt = ""
+        self.target_prompt = ""
+        self.prompt_type_index = 0
+        self.last_type_time = 0.0
+        self.is_live_speech = False
         self.prompt_until = 0.0
         self.error_text = ""
         self.error_until = 0.0
@@ -321,6 +324,21 @@ class AppleDynamicIsland(QWidget):
         self.last_frame_t = now
 
         reduce_motion = getattr(self.mgr.cfg, "reduce_motion", False)
+
+        # Progressive streaming typewriter reveal for user prompt (like Siri)
+        if getattr(self, "target_prompt", ""):
+            if self.user_prompt != self.target_prompt:
+                if reduce_motion:
+                    self.user_prompt = self.target_prompt
+                    self.prompt_type_index = len(self.target_prompt)
+                else:
+                    if now - getattr(self, "last_type_time", 0.0) >= 0.016:
+                        step = max(1, int((now - self.last_type_time) / 0.016) * 2)
+                        self.prompt_type_index = min(len(self.target_prompt), self.prompt_type_index + step)
+                        self.user_prompt = self.target_prompt[:self.prompt_type_index]
+                        self.last_type_time = now
+            else:
+                self.prompt_type_index = len(self.target_prompt)
 
         # Target dimensions based on Apple HIG layout
         is_error = now < self.error_until
@@ -534,7 +552,10 @@ class AppleDynamicIsland(QWidget):
                 p.setFont(font_top)
                 p.setPen(text_primary)
                 prompt_disp = self.user_prompt.strip()
-                if len(prompt_disp) > 42:
+                if self.prompt_type_index < len(getattr(self, "target_prompt", "")):
+                    cursor = "▍" if int(now * 5.0) % 2 == 0 else ""
+                    prompt_disp = f"{prompt_disp}{cursor}"
+                elif len(prompt_disp) > 42:
                     prompt_disp = prompt_disp[:39] + "…"
                 p.drawText(int(tx), int(cy - 4), f'“{prompt_disp}”')
 
@@ -560,15 +581,23 @@ class AppleDynamicIsland(QWidget):
                 p.setFont(font_top)
                 p.setPen(text_primary)
                 prompt_disp = self.user_prompt.strip()
-                if len(prompt_disp) > 44:
+                is_typing = (self.prompt_type_index < len(getattr(self, "target_prompt", ""))) or getattr(self, "is_live_speech", False)
+                if is_typing:
+                    cursor = "▍" if int(now * 5.0) % 2 == 0 else ""
+                    prompt_disp = f"{prompt_disp}{cursor}"
+                elif len(prompt_disp) > 44:
                     prompt_disp = prompt_disp[:41] + "…"
                 p.drawText(int(tx), int(cy - 4), f'“{prompt_disp}”')
 
                 font_sub = QFont("Segoe UI", 8)
                 font_sub.setWeight(QFont.Weight.Medium)
                 p.setFont(font_sub)
-                p.setPen(QColor("#30d158" if self.dark_mode else "#248a3d"))
-                p.drawText(int(tx), int(cy + 11), "Directive confirmed")
+                if getattr(self, "is_live_speech", False):
+                    p.setPen(QColor("#00e5ff" if self.dark_mode else accent))
+                    p.drawText(int(tx), int(cy + 11), "Capturing speech…")
+                else:
+                    p.setPen(QColor("#30d158" if self.dark_mode else "#248a3d"))
+                    p.drawText(int(tx), int(cy + 11), "Directive confirmed")
 
                 rx = w - 24.0
                 p.setPen(Qt.PenStyle.NoPen)
@@ -2506,11 +2535,30 @@ class Overlay:
                 elif kind == "prompt":
                     prompt_txt = str(d.get("text", "")).strip()
                     if prompt_txt:
+                        self.island.target_prompt = prompt_txt
+                        self.island.prompt_type_index = len(prompt_txt)
+                        self.island.last_type_time = now
+                        self.island.is_live_speech = False
                         self.island.user_prompt = prompt_txt
                         self.island.prompt_until = now + max(4.0, len(prompt_txt) * 0.09)
                         self.island.listening = False
                         self.island.listening_until = 0.0
                         self.island.is_transcribing = False
+                elif kind == "live_speech":
+                    live_txt = str(d.get("text", "")).strip()
+                    if live_txt:
+                        self.island.target_prompt = live_txt
+                        self.island.user_prompt = live_txt
+                        self.island.prompt_type_index = len(live_txt)
+                        self.island.is_live_speech = not d.get("is_final", False)
+                        self.island.prompt_until = now + 4.0
+                        self.island.listening = True
+                        self.island.listening_until = now + 4.0
+                        self.island.is_transcribing = False
+                elif kind == "listening_done":
+                    self.island.listening = False
+                    self.island.listening_until = 0.0
+                    self.island.is_transcribing = False
                 elif kind == "say":
                     text = d.get("text", "")
                     self.island.say_text = text

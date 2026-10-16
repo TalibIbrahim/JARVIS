@@ -91,8 +91,18 @@ class Pose:
 
     @property
     def palm(self):
-        return (min(self.idx, self.mid, self.ring, self.pinky) > EXTENDED
-                and self.thumb_out > 0.8 and self.pinch_ti > 0.6)
+        # 1. Classical hyper-extended palm check (backward compatibility with test mocks)
+        classic_palm = (min(self.idx, self.mid, self.ring, self.pinky) > EXTENDED
+                        and self.thumb_out > 0.8 and self.pinch_ti > 0.6)
+        if classic_palm:
+            return True
+
+        # 2. Natural open palm facing camera (robust on real webcams with perspective distortion)
+        fingers_open = (self.openness >= 0.50) and (self.idx > 1.35 and self.mid > 1.35)
+        not_pinching = self.pinch_ti > 0.38
+        not_peace = not (self.idx > 1.35 and self.mid > 1.35 and self.ring < 1.25 and self.pinky < 1.25)
+        thumb_natural = self.thumb_out > 0.45
+        return fingers_open and not_pinching and not_peace and thumb_natural
 
     @property
     def peace(self):
@@ -298,7 +308,8 @@ class GestureEngine:
         # 2. Wake & Standby Rules
         if not self.active:
             # ONLY Open Palm wakes from standby! Fist or Neutral must never wake.
-            if cur_pose == "OPEN" and p.palm:
+            is_wake_palm = (cur_pose == "OPEN" and p.palm) or (p.palm and p.openness >= 0.50)
+            if is_wake_palm:
                 self.palm_last_seen = now
                 if not self.palm_latched:
                     if self.palm_since is None:
@@ -311,11 +322,11 @@ class GestureEngine:
                         self.palm_since = None
                         self.progress = 0.0
             else:
-                palm_grace = getattr(cfg, "palm_grace", 0.15)
+                palm_grace = getattr(cfg, "palm_grace", 0.35)
                 if self.palm_since is not None and (now - getattr(self, "palm_last_seen", now)) <= palm_grace:
                     pass
                 else:
-                    if cur_pose != "OPEN":
+                    if not is_wake_palm and cur_pose != "OPEN":
                         self.palm_latched = False
                     self.palm_since = None
                     self.progress = 0.0
@@ -519,7 +530,7 @@ class GestureEngine:
                     self.palm_since = None
                     self.progress = 0.0
         else:
-            palm_grace = getattr(cfg, "palm_grace", 0.15)
+            palm_grace = getattr(cfg, "palm_grace", 0.35)
             if self.palm_since is not None and (now - getattr(self, "palm_last_seen", now)) <= palm_grace:
                 pass
             else:
