@@ -39,6 +39,11 @@ DEFAULT_VISION_MODEL = "qwen/qwen3.8-27b"
 # Whitelist of actions the LLM is permitted to request
 WHITELIST_ACTIONS = {
     "none",
+    "diagnostics",
+    "house_party",
+    "stealth_mode",
+    "clean_slate",
+    "target_practice",
     "volume_up",
     "volume_down",
     "mute",
@@ -593,22 +598,72 @@ def build_system_prompt(ctx: Any = None) -> str:
             dwell_mode = getattr(cfg, "dwell_mode", "click")
             precision_mode = getattr(cfg, "precision_mode", True)
 
+    power_info = "AC connected"
+    mem_info = "nominal"
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            class SYSTEM_POWER_STATUS(ctypes.Structure):
+                _fields_ = [
+                    ('ACLineStatus', ctypes.c_ubyte),
+                    ('BatteryFlag', ctypes.c_ubyte),
+                    ('BatteryLifePercent', ctypes.c_ubyte),
+                    ('SystemStatusFlag', ctypes.c_ubyte),
+                    ('BatteryLifeTime', ctypes.c_ulong),
+                    ('BatteryFullLifeTime', ctypes.c_ulong),
+                ]
+            pwr = SYSTEM_POWER_STATUS()
+            if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(pwr)):
+                if pwr.BatteryLifePercent != 255 and pwr.BatteryLifePercent <= 100:
+                    power_info = f"{'AC mains' if pwr.ACLineStatus == 1 else 'Battery'} ({pwr.BatteryLifePercent}%)"
+        except Exception:
+            pass
+
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', ctypes.c_ulong),
+                    ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong),
+                    ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong),
+                    ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong),
+                    ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                ]
+            mem = MEMORYSTATUSEX()
+            mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+                mem_info = f"{mem.dwMemoryLoad}% load ({mem.ullAvailPhys / (1024**3):.1f} GB free)"
+        except Exception:
+            pass
+
     prompt = (
-        "You are J.A.R.V.I.S., Tony Stark's sophisticated, highly intelligent desktop AI assistant.\n"
+        "You are J.A.R.V.I.S., Tony Stark's sophisticated, highly intelligent desktop AI assistant from Iron Man.\n"
         f"Current system state: local time is {now_str}, hand tracking is {state_desc}, "
         f"tracking mode is {tracking_mode}, dwell mode is {dwell_mode}, "
-        f"precision fine-aim is {'enabled' if precision_mode else 'disabled'}.\n\n"
+        f"precision fine-aim is {'enabled' if precision_mode else 'disabled'}, "
+        f"hardware power is {power_info}, physical memory is {mem_info}.\n\n"
         "Instructions:\n"
-        "1. Be concise, witty, and natural, keeping your spoken reply to 1-2 spoken sentences maximum.\n"
-        "2. Address the user respectfully as 'sir' when appropriate.\n"
-        "3. You must respond ONLY with a valid JSON object matching this exact schema:\n"
+        "1. Persona: Speak like Paul Bettany's J.A.R.V.I.S.: impeccably polite, dry British wit, dignified, fiercely loyal, and brilliant.\n"
+        "2. Address the user respectfully as 'sir'. Do NOT call the user 'Mr. Stark' or 'Tony'.\n"
+        "3. Keep your spoken reply to 1-2 spoken sentences maximum so voice synthesis sounds snappy.\n"
+        "4. When answering questions (science, coding, engineering, trivia, general life), give sharp, witty, accurate answers with subtle Stark Industries elegance.\n"
+        "5. You must respond ONLY with a valid JSON object matching this exact schema:\n"
         "   {\n"
         '     "action": "<action_name or none>",\n'
         '     "args": { ... },\n'
         '     "reply": "<spoken response text>"\n'
         "   }\n"
-        "4. Available actions:\n"
+        "6. Available actions:\n"
         "   - 'none': General conversation or query with no PC command.\n"
+        "   - 'diagnostics': (args: {}) Run full system hardware, memory, power, and tracking diagnostics.\n"
+        "   - 'house_party': (args: {}) Bring all primary workstations and applications online.\n"
+        "   - 'stealth_mode': (args: {}) Mute audio, minimize active window, and dim telemetry.\n"
+        "   - 'clean_slate': (args: {}) Clear desktop, reset history, and enter standby.\n"
+        "   - 'target_practice': (args: {}) Open repulsor target practice canvas.\n"
         "   - 'volume_up' (args: {'steps': 5})\n"
         "   - 'volume_down' (args: {'steps': 5})\n"
         "   - 'mute' (args: {})\n"
@@ -630,7 +685,7 @@ def build_system_prompt(ctx: Any = None) -> str:
         "   - 'tracking_mode' (args: {'mode': 'relative' | 'absolute'})\n"
         "   - 'power_mode' (args: {'mode': 'standby' | 'wake' | 'quit'})\n"
         "   - 'status' (args: {})\n"
-        "5. Never output markdown fences (do not output ```json). Output raw JSON only."
+        "7. Never output markdown fences (do not output ```json). Output raw JSON only."
     )
     return prompt
 
@@ -816,6 +871,37 @@ def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> T
 
         elif action == "status":
             return True, "Status reported"
+
+        elif action == "diagnostics":
+            from commands import get_system_telemetry
+            telemetry = get_system_telemetry(ctx)
+            return True, f"Diagnostics: {telemetry}"
+
+        elif action == "house_party":
+            _launch("chrome")
+            return True, "House Party Protocol initiated"
+
+        elif action == "stealth_mode":
+            pyautogui.press("volumemute", _pause=False)
+            pyautogui.hotkey("win", "down", _pause=False)
+            return True, "Stealth mode engaged"
+
+        elif action == "clean_slate":
+            pyautogui.hotkey("win", "d", _pause=False)
+            reset_ai_history()
+            if ctx:
+                ctx.set_active(False)
+            return True, "Clean Slate Protocol executed"
+
+        elif action == "target_practice":
+            import webbrowser
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            target_html = os.path.join(base_dir, "tests", "target_practice.html")
+            if os.path.exists(target_html):
+                webbrowser.open(f"file:///{target_html}")
+            else:
+                webbrowser.open("https://www.google.com")
+            return True, "Target practice canvas opened"
 
     except Exception as exc:
         return False, f"Action execution error: {exc}"

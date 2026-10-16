@@ -51,6 +51,74 @@ def _launch(target):
     subprocess.Popen(f'start "" {target}', shell=True)
 
 
+def get_system_telemetry(ctx=None) -> str:
+    """Collects real Windows hardware and J.A.R.V.I.S. runtime telemetry for Iron Man diagnostics."""
+    parts = []
+    # 1. RAM / Physical Memory via Win32 API
+    try:
+        import ctypes
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        mem = MEMORYSTATUSEX()
+        mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+            load = mem.dwMemoryLoad
+            avail_gb = mem.ullAvailPhys / (1024 ** 3)
+            parts.append(f"Memory load is at {load}% with {avail_gb:.1f} gigabytes free")
+    except Exception:
+        pass
+
+    # 2. Power & Battery Status via Win32 API
+    try:
+        import ctypes
+        class SYSTEM_POWER_STATUS(ctypes.Structure):
+            _fields_ = [
+                ("ACLineStatus", ctypes.c_ubyte),
+                ("BatteryFlag", ctypes.c_ubyte),
+                ("BatteryLifePercent", ctypes.c_ubyte),
+                ("SystemStatusFlag", ctypes.c_ubyte),
+                ("BatteryLifeTime", ctypes.c_ulong),
+                ("BatteryFullLifeTime", ctypes.c_ulong),
+            ]
+        pwr = SYSTEM_POWER_STATUS()
+        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(pwr)):
+            if pwr.ACLineStatus == 1:
+                if pwr.BatteryLifePercent != 255 and pwr.BatteryLifePercent <= 100:
+                    parts.append(f"Power relays connected to AC mains at {pwr.BatteryLifePercent}% charge")
+                else:
+                    parts.append("Primary power relays connected to AC mains")
+            elif pwr.BatteryLifePercent != 255:
+                parts.append(f"Running on internal power cells at {pwr.BatteryLifePercent}%")
+    except Exception:
+        pass
+
+    # 3. Tracking Subsystems
+    state = "online"
+    mode = "relative trackpad"
+    if ctx and hasattr(ctx, "engine"):
+        state = "online" if getattr(ctx.engine, "active", False) else "on standby"
+        cfg = getattr(ctx.engine, "cfg", None)
+        if cfg:
+            mode = getattr(cfg, "tracking_mode", "relative")
+
+    parts.append(f"Repulsor tracking is {state} in {mode} mode at 120 hertz")
+
+    if parts:
+        telemetry_summary = ". ".join(parts) + "."
+        return f"All Mark systems operating nominally, sir. {telemetry_summary}"
+    return "All Mark systems operating nominally, sir. Hand tracking telemetry is calibrated."
+
+
 def run_command(text, ctx):
     """Returns the reply Jarvis should speak, or None if nothing matched."""
     import pyautogui
@@ -100,16 +168,46 @@ def run_command(text, ctx):
         ctx.engine.cfg.tracking_mode = "absolute"
         return "Absolute screen mapping active, sir."
 
-    # --- chatter ---
+    # --- Stark protocols ---
+    if _any(clean_t, "house party protocol", "house party", "protocol house party"):
+        _launch("chrome")
+        return "House Party Protocol initiated, sir. Bringing primary workstations online."
+    if _any(clean_t, "stealth mode", "protocol stealth", "go dark", "silent mode"):
+        pyautogui.press("volumemute", _pause=False)
+        pyautogui.hotkey("win", "down", _pause=False)
+        return "Stealth mode engaged, sir. Audio muted and visual signatures minimized."
+    if _any(clean_t, "clean slate protocol", "clean slate", "protocol clean slate", "wrap it up"):
+        pyautogui.hotkey("win", "d", _pause=False)
+        reset_ai_history()
+        if ctx:
+            ctx.set_active(False)
+        return "Clean Slate Protocol executed, sir. Have a pleasant evening."
+    if _any(clean_t, "target practice", "repulsor practice", "repulsor calibration", "aim test"):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        target_html = os.path.join(base_dir, "tests", "target_practice.html")
+        if os.path.exists(target_html):
+            webbrowser.open(f"file:///{target_html}")
+        else:
+            webbrowser.open("https://www.google.com")
+        return "Target practice range initialized, sir. Repulsor calibration ready."
+
+    # --- chatter & diagnostics ---
+    if _any(clean_t, "diagnostic", "diagnostics", "run diagnostic", "run diagnostics", "system diagnostic", "suit diagnostic", "suit status", "power level", "power levels", "arc reactor", "telemetry"):
+        return get_system_telemetry(ctx)
     if clean_t in ("hello", "hi", "hey", "good morning", "good evening", "good afternoon"):
         return "Welcome back, sir."
     if _any(clean_t, "status", "report", "how are you"):
-        state = "online" if ctx.engine.active else "on standby"
-        return f"All systems nominal. Hand tracking is {state}, sir."
+        return get_system_telemetry(ctx)
     if re.search(r"\b(time|what time|current time)\b", clean_t):
         return "It is " + datetime.datetime.now().strftime("%I:%M %p").lstrip("0") + ", sir."
     if _any(clean_t, "date", "what day"):
         return "Today is " + datetime.datetime.now().strftime("%A, %B %d") + "."
+    if _any(clean_t, "thank you jarvis", "thanks jarvis", "good job jarvis", "well done jarvis", "nice work jarvis"):
+        return "Always a pleasure watching you work, sir."
+    if _any(clean_t, "who are you", "what are you"):
+        return "I am J.A.R.V.I.S., Just A Rather Very Intelligent System. Configured to manage your computing environment and tactical telemetry, sir."
+    if _any(clean_t, "are you there", "you there jarvis"):
+        return "For you, sir, always."
 
     # --- apps and web ---
     m = re.match(r"(?:open|launch|start|run|bring up|go to)\s+(?:up\s+)?(?:the\s+)?(.+)", clean_t)
@@ -237,55 +335,58 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
     if not ai_enabled or not api_key:
         return "I didn't catch a command for that, sir."
 
-    # Notify overlay of thinking state
+    timeout = min(max(int(getattr(cfg, "ai_timeout", 8)), 3), 15) if cfg else 8
+
+    # Notify overlay of thinking state with watchdog timeout
     if ctx and hasattr(ctx, "overlay") and ctx.overlay:
         try:
             ctx.overlay.post("thinking", active=True)
         except Exception:
             pass
 
-    # Visual scene query inspection
-    if is_visual_query(user_text) and getattr(cfg, "ai_vision_enabled", True):
-        tracker = getattr(ctx, "tracker", None) if ctx else None
-        frame = tracker.get_latest_frame() if tracker else None
-        if frame is not None:
-            try:
-                vision_model = getattr(cfg, "ai_vision_model", DEFAULT_VISION_MODEL) if cfg else DEFAULT_VISION_MODEL
-                timeout = getattr(cfg, "ai_timeout", 12) if cfg else 12
-                client = GroqClient(api_key=api_key, timeout=timeout)
-                reply = client.describe_image(frame, prompt=user_text, model=vision_model)
-                conv_mgr = get_conversation_manager()
-                conv_mgr.add_turn(user_text, reply)
-                return reply
-            except AuthenticationError:
-                if ctx and hasattr(ctx, "overlay") and ctx.overlay:
-                    try:
-                        ctx.overlay.post("ai_error", text="Invalid Groq Key")
-                    except Exception:
-                        pass
-                return "My Groq API key appears to be invalid, sir. Please check your settings."
-            except RateLimitError:
-                if ctx and hasattr(ctx, "overlay") and ctx.overlay:
-                    try:
-                        ctx.overlay.post("ai_error", text="Groq Rate Limited")
-                    except Exception:
-                        pass
-                return "Groq rate limit reached, sir. Please stand by a moment."
-            except (OfflineError, TimeoutError):
-                if ctx and hasattr(ctx, "overlay") and ctx.overlay:
-                    try:
-                        ctx.overlay.post("ai_error", text="Groq Offline")
-                    except Exception:
-                        pass
-                return "I am unable to reach the visual service right now, sir."
-            except Exception as exc:
-                print(f"[ai] vision query exception: {exc}")
-                return "I was unable to analyze the camera feed, sir."
-        else:
-            return "My optical sensor is currently unavailable, sir. I cannot view what you are holding."
-
     try:
-        timeout = getattr(cfg, "ai_timeout", 10) if cfg else 10
+        # Visual scene query inspection
+        if is_visual_query(user_text) and getattr(cfg, "ai_vision_enabled", True):
+            tracker = getattr(ctx, "tracker", None) if ctx else None
+            frame = tracker.get_latest_frame() if tracker else None
+            if frame is not None:
+                try:
+                    vision_model = getattr(cfg, "ai_vision_model", DEFAULT_VISION_MODEL) if cfg else DEFAULT_VISION_MODEL
+                    # Enforce strict 6-8s timeout on vision queries so user is never stalled
+                    vision_timeout = min(timeout, 8)
+                    client = GroqClient(api_key=api_key, timeout=vision_timeout)
+                    reply = client.describe_image(frame, prompt=user_text, model=vision_model)
+                    conv_mgr = get_conversation_manager()
+                    conv_mgr.add_turn(user_text, reply)
+                    return reply
+                except AuthenticationError:
+                    if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                        try:
+                            ctx.overlay.post("ai_error", text="Invalid Groq Key")
+                        except Exception:
+                            pass
+                    return "My Groq API key appears to be invalid, sir. Please check your settings."
+                except RateLimitError:
+                    if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                        try:
+                            ctx.overlay.post("ai_error", text="Groq Rate Limited")
+                        except Exception:
+                            pass
+                    return "Groq rate limit reached, sir. Please stand by a moment."
+                except (OfflineError, TimeoutError):
+                    if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                        try:
+                            ctx.overlay.post("ai_error", text="Vision Timed Out")
+                        except Exception:
+                            pass
+                    return "Visual analysis timed out, sir. Please try again."
+                except Exception as exc:
+                    print(f"[ai] vision query exception: {exc}")
+                    return "I was unable to analyze the camera feed, sir."
+            else:
+                return "My optical sensor is currently unavailable, sir. I cannot view what you are holding."
+
+        # Text LLM query
         model = getattr(cfg, "ai_llm_model", DEFAULT_LLM_MODEL) if cfg else DEFAULT_LLM_MODEL
         max_history = getattr(cfg, "ai_max_history", 6) if cfg else 6
 

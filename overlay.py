@@ -44,7 +44,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.2.6"
+    APP_VERSION = "1.2.7"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -270,10 +270,14 @@ class AppleDynamicIsland(QWidget):
         self.say_until = 0.0
         self.listening = False
         self.listening_until = 0.0
+        self.is_transcribing = False
+        self.user_prompt = ""
+        self.prompt_until = 0.0
         self.error_text = ""
         self.error_until = 0.0
         self.precision_active = False
         self.thinking = False
+        self.thinking_until = 0.0
         self.is_ai_error = False
 
         self.t0 = time.time()
@@ -321,18 +325,31 @@ class AppleDynamicIsland(QWidget):
         # Target dimensions based on Apple HIG layout
         is_error = now < self.error_until
         is_speaking = now < self.say_until
-        is_thinking = self.thinking
+        is_thinking = self.thinking and (now < self.thinking_until)
         is_listening = now < self.listening_until
+        is_prompt = (now < self.prompt_until and bool(self.user_prompt)) or (is_thinking and bool(self.user_prompt))
         is_gesture = self.label in ("CLICK", "DOUBLE CLICK", "DRAG", "DROP", "RIGHT CLICK", "ZOOM IN", "ZOOM OUT", "SCROLL")
 
         if is_error:
             tw, th = 340.0, 46.0
+        elif is_prompt and is_speaking:
+            disp_len = max(len(self.user_prompt), len(self.say_text))
+            tw = min(560.0, max(360.0, 140.0 + disp_len * 6.8))
+            th = 56.0
+        elif is_prompt and is_thinking:
+            disp_len = max(len(self.user_prompt), 24)
+            tw = min(520.0, max(320.0, 140.0 + disp_len * 7.0))
+            th = 50.0
+        elif is_prompt:
+            tw = min(500.0, max(300.0, 130.0 + len(self.user_prompt) * 7.2))
+            th = 48.0
         elif is_thinking:
-            tw, th = 260.0, 42.0
+            tw, th = 280.0, 42.0
         elif is_speaking:
-            tw, th = 380.0, 52.0
+            tw = min(520.0, max(340.0, 120.0 + len(self.say_text) * 6.5))
+            th = 50.0
         elif is_listening:
-            tw, th = 260.0, 42.0
+            tw, th = 280.0, 42.0
         elif is_gesture:
             tw, th = 270.0, 40.0
         elif self.active:
@@ -365,7 +382,8 @@ class AppleDynamicIsland(QWidget):
         is_speaking = now < self.say_until
         is_listening = now < self.listening_until
         is_error = now < self.error_until
-        is_thinking = self.thinking
+        is_thinking = self.thinking and (now < self.thinking_until)
+        is_prompt = (now < self.prompt_until and bool(self.user_prompt)) or (is_thinking and bool(self.user_prompt))
 
         # 1. Soft Multi-Layered Drop Shadow
         pill_rect = QRectF(2, -18, w - 4, h + 16)
@@ -404,9 +422,9 @@ class AppleDynamicIsland(QWidget):
             else:
                 border_grad.setColorAt(0.0, QColor("#ff453a"))
                 border_grad.setColorAt(1.0, QColor("#d70015"))
-        elif is_thinking:
-            pulse_a = int(120 + 80 * math.sin(t * 6.0))
-            border_grad.setColorAt(0.0, QColor(255, 255, 255, pulse_a))
+        elif is_thinking or is_prompt:
+            arc_pulse = int(140 + 75 * math.sin(t * 6.0))
+            border_grad.setColorAt(0.0, QColor(0, 229, 255, arc_pulse))
             border_grad.setColorAt(1.0, QColor(0, 0, 0, 60))
         elif self.dark_mode:
             border_grad.setColorAt(0.0, QColor(255, 255, 255, 65))
@@ -423,24 +441,38 @@ class AppleDynamicIsland(QWidget):
         text_primary = QColor("#f5f5f7" if self.dark_mode else "#1c1c1e")
         text_secondary = QColor("#8e8e93" if self.dark_mode else "#6e6e73")
 
-        # Left Status Indicator Dot / Arc
+        # Left Status Indicator: Stark Arc Reactor Core
         dot_x = 18.0
         dot_r = 4.0
 
         if is_error:
             dot_col = QColor("#ff9f0a" if self.is_ai_error else "#ff453a")
-        elif is_thinking:
-            pulse = 0.5 + 0.5 * math.sin(t * 6.0)
-            dot_col = accent
-            dot_r = 3.5 + 1.5 * pulse
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(dot_x, cy), dot_r, dot_r)
+        elif is_thinking or is_prompt or is_listening:
+            # Iron Man Arc Reactor glyph
+            arc_cyan = QColor("#00e5ff")
+            ring_pen = QPen(arc_cyan, 1.3)
+            p.setPen(ring_pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(dot_x, cy), 5.5, 5.5)
+            # Pulsing luminous core
+            pulse = 0.65 + 0.35 * math.sin(t * 7.0)
+            core_r = 2.2 * pulse
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(255, 255, 255)))
+            p.drawEllipse(QPointF(dot_x, cy), core_r, core_r)
         elif self.active:
             dot_col = QColor("#30d158")  # Apple Emerald Green
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(dot_x, cy), dot_r, dot_r)
         else:
             dot_col = QColor("#8e8e93")
-
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(dot_col))
-        p.drawEllipse(QPointF(dot_x, cy), dot_r, dot_r)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(dot_x, cy), dot_r, dot_r)
 
         # Holding Palm Wake Ring around Dot
         cur_prog = self.spring_prog.value
@@ -470,6 +502,78 @@ class AppleDynamicIsland(QWidget):
                 p.setFont(font_sub)
                 p.setPen(text_primary)
                 p.drawText(int(tx), int(cy + 11), self.error_text or "Error")
+
+            elif is_prompt and is_speaking:
+                # Siri-style: Prompt on top, Jarvis reply on bottom
+                font_top = QFont("Segoe UI", 8)
+                font_top.setWeight(QFont.Weight.DemiBold)
+                p.setFont(font_top)
+                p.setPen(QColor("#00e5ff") if self.dark_mode else accent)
+                prompt_disp = self.user_prompt.strip()
+                if len(prompt_disp) > 42:
+                    prompt_disp = prompt_disp[:39] + "…"
+                p.drawText(int(tx), int(cy - 4), f'“{prompt_disp}”')
+
+                font_sub = QFont("Segoe UI", 8)
+                font_sub.setWeight(QFont.Weight.Medium)
+                p.setFont(font_sub)
+                p.setPen(text_primary)
+                disp = self.say_text if len(self.say_text) <= 45 else self.say_text[:42] + "…"
+                p.drawText(int(tx), int(cy + 11), disp)
+
+                # Fluid Speech Waveform on Right
+                wx = w - 48.0
+                for i in range(4):
+                    bar_h = 3.0 + 10.0 * abs(math.sin(t * 7.0 + i * 0.8))
+                    p.fillRect(QRectF(wx + i * 6, cy - bar_h / 2.0, 3.0, bar_h), accent)
+
+            elif is_prompt and is_thinking:
+                # Prompt on top, Analyzing directive on bottom
+                font_top = QFont("Segoe UI", 8)
+                font_top.setWeight(QFont.Weight.DemiBold)
+                p.setFont(font_top)
+                p.setPen(text_primary)
+                prompt_disp = self.user_prompt.strip()
+                if len(prompt_disp) > 42:
+                    prompt_disp = prompt_disp[:39] + "…"
+                p.drawText(int(tx), int(cy - 4), f'“{prompt_disp}”')
+
+                font_sub = QFont("Segoe UI", 8)
+                font_sub.setWeight(QFont.Weight.Medium)
+                p.setFont(font_sub)
+                p.setPen(QColor("#00e5ff") if self.dark_mode else accent)
+                p.drawText(int(tx), int(cy + 11), "Analyzing directive…")
+
+                # Subtle animated pulse indicators on right
+                rx = w - 42.0
+                for i in range(3):
+                    phase = t * 5.0 - i * 0.9
+                    alpha = int(70 + 185 * max(0.0, math.sin(phase)))
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QBrush(QColor(accent.red(), accent.green(), accent.blue(), alpha)))
+                    p.drawEllipse(QPointF(rx + i * 8, cy), 2.5, 2.5)
+
+            elif is_prompt:
+                # Direct Prompt display: user prompt on top, status on bottom
+                font_top = QFont("Segoe UI", 8)
+                font_top.setWeight(QFont.Weight.DemiBold)
+                p.setFont(font_top)
+                p.setPen(text_primary)
+                prompt_disp = self.user_prompt.strip()
+                if len(prompt_disp) > 44:
+                    prompt_disp = prompt_disp[:41] + "…"
+                p.drawText(int(tx), int(cy - 4), f'“{prompt_disp}”')
+
+                font_sub = QFont("Segoe UI", 8)
+                font_sub.setWeight(QFont.Weight.Medium)
+                p.setFont(font_sub)
+                p.setPen(QColor("#30d158" if self.dark_mode else "#248a3d"))
+                p.drawText(int(tx), int(cy + 11), "Directive confirmed")
+
+                rx = w - 24.0
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor("#00e5ff" if self.dark_mode else accent.name())))
+                p.drawEllipse(QPointF(rx, cy), 3.0, 3.0)
 
             elif is_thinking:
                 p.setPen(accent)
@@ -505,8 +609,12 @@ class AppleDynamicIsland(QWidget):
 
             elif is_listening:
                 # Siri-style continuous fluid sine waveform
+                font_listen = QFont("Segoe UI", 9)
+                font_listen.setWeight(QFont.Weight.DemiBold)
+                p.setFont(font_listen)
                 p.setPen(text_primary)
-                p.drawText(int(tx), int(cy + 4), "Listening…")
+                listen_label = "Processing speech…" if getattr(self, "is_transcribing", False) else "Listening…"
+                p.drawText(int(tx), int(cy + 4), listen_label)
 
                 # Multi-harmonic smooth waveform
                 wave_w = 60.0
@@ -2395,18 +2503,41 @@ class Overlay:
                     self.island.precision_active = d.get("precision", False)
                     self.tray.update_status(d["active"])
                     self.cursor_overlay.update_state(d)
+                elif kind == "prompt":
+                    prompt_txt = str(d.get("text", "")).strip()
+                    if prompt_txt:
+                        self.island.user_prompt = prompt_txt
+                        self.island.prompt_until = now + max(4.0, len(prompt_txt) * 0.09)
+                        self.island.listening = False
+                        self.island.listening_until = 0.0
+                        self.island.is_transcribing = False
                 elif kind == "say":
                     text = d.get("text", "")
                     self.island.say_text = text
                     self.island.say_until = now + max(3.5, len(text) * 0.08)
+                    self.island.thinking = False
+                    self.island.thinking_until = 0.0
+                    if self.island.user_prompt:
+                        self.island.prompt_until = max(self.island.prompt_until, self.island.say_until)
                     if d.get("speak", True) and text and self.ctx and hasattr(self.ctx, "speaker"):
                         self.ctx.speaker.say(text)
                 elif kind == "listening":
                     self.island.listening = True
                     self.island.listening_until = d.get("until", now + 5.0)
+                    self.island.is_transcribing = d.get("transcribing", False)
                 elif kind == "thinking":
-                    self.island.thinking = d.get("active", True)
+                    active = bool(d.get("active", True))
+                    self.island.thinking = active
+                    if active:
+                        timeout_sec = float(d.get("timeout", 8.0))
+                        self.island.thinking_until = now + timeout_sec
+                        if self.island.user_prompt:
+                            self.island.prompt_until = max(self.island.prompt_until, self.island.thinking_until)
+                    else:
+                        self.island.thinking_until = 0.0
                 elif kind == "ai_error":
+                    self.island.thinking = False
+                    self.island.thinking_until = 0.0
                     err_text = d.get("text", "AI Error")
                     self.island.error_text = err_text
                     self.island.error_until = now + 4.5
@@ -2414,6 +2545,8 @@ class Overlay:
                     if d.get("speak", True) and err_text and self.ctx and hasattr(self.ctx, "speaker"):
                         self.ctx.speaker.say(f"Notice: {err_text}")
                 elif kind == "error":
+                    self.island.thinking = False
+                    self.island.thinking_until = 0.0
                     err_text = d.get("text", "Error")
                     self.island.error_text = err_text
                     self.island.error_until = now + 5.0
@@ -2458,6 +2591,10 @@ class Overlay:
                 kind, d = self.q.get_nowait()
                 if kind == "state":
                     self.label_tk.config(text=f"Jarvis: {d['label']}")
+                elif kind == "prompt":
+                    self.label_tk.config(text=f"Heard: {d.get('text', '')}")
+                elif kind == "say":
+                    self.label_tk.config(text=f"Jarvis: {d.get('text', '')}")
         except queue.Empty:
             pass
         self.root.after(20, self._tick_tk)

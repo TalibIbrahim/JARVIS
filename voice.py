@@ -618,6 +618,13 @@ class Voice(threading.Thread):
             if rms < 30.0:
                 continue  # Discard silent acoustic flutter to protect quota
 
+            # Visual feedback: audio received, transcribing speech
+            if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+                try:
+                    self.ctx.overlay.post("listening", until=time.time() + 4.0, transcribing=True)
+                except Exception:
+                    pass
+
             text = None
             key = get_api_key()
             ai_enabled = getattr(self.cfg, "ai_enabled", False)
@@ -693,10 +700,28 @@ class Voice(threading.Thread):
                     self.ctx.overlay.post("listening", until=self.listening_until)
                 except Exception:
                     pass
+                if hasattr(self.ctx, "chirp"):
+                    try:
+                        self.ctx.chirp("wake")
+                    except Exception:
+                        pass
                 self.ctx.say("Yes, sir?")
                 return
 
         self.listening_until = 0.0
+        # Post recognized prompt to the screen immediately so the user sees what Jarvis received
+        try:
+            if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+                self.ctx.overlay.post("prompt", text=command, raw=text)
+        except Exception:
+            pass
+
+        if hasattr(self.ctx, "chirp"):
+            try:
+                self.ctx.chirp("confirm")
+            except Exception:
+                pass
+
         reply = run_command(command, self.ctx)
         if reply:
             self.ctx.say(reply)

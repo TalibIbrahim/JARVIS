@@ -138,7 +138,6 @@ Hover the cursor stationary inside a target area to click completely hands-free:
 ## Voice Commands
 
 Speak naturally after the wake word *"Jarvis"*:
-
 ```
 "Jarvis, open Chrome"        "open YouTube"          "open VS Code"
 "open File Explorer"         "open Notepad"          "open Calculator"
@@ -146,9 +145,18 @@ Speak naturally after the wake word *"Jarvis"*:
 "play / pause"               "next track"            "previous track"
 "screenshot"                 "show desktop"          "minimize / maximize"
 "switch window"              "close window"          "lock"
+"run diagnostics"            "suit status"           "power levels"
+"house party protocol"       "stealth mode"          "clean slate protocol"
+"target practice"            "thank you jarvis"      "who are you"
 "what time is it"            "what day is it"        "status"
 "wake up"                    "go to sleep"           "shut down Jarvis"
 ```
+
+### Siri-Style Prompt Display & Iron Man HUD
+- **Real-Time Prompt Telemetry**: Just like Siri on macOS and iOS, the Dynamic Island capsule displays the exact spoken prompt Jarvis received (`“<prompt>”`) with an Arc Reactor core badge, so you immediately know what directive was captured.
+- **Hardware Telemetry Diagnostics**: Run `"diagnostics"` or `"suit status"` to receive real-time Windows hardware reports on physical RAM availability, AC/battery power levels, and 120 Hz repulsor tracking.
+- **Stark Defense Protocols**: Direct voice actuation for `"House Party Protocol"`, `"Stealth Mode"`, `"Clean Slate Protocol"`, and `"Target Practice"`.
+- **Iron Man Acoustic Cues**: Futuristic HUD frequency chimes for wake acknowledgment (880/1320 Hz) and directive confirmation (1046/1318 Hz).
 
 ---
 

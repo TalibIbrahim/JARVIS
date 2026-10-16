@@ -224,9 +224,10 @@ All user interface components in J.A.R.V.I.S. adhere strictly to Apple's Human I
   - *Wake Progress*: Golden sweeping progress ring tracking 0.8 s palm hold.
   - *Active Tracking*: Expanded pill with neon cyan glow, miniature real-time hand skeleton wireframe, and active status.
   - *Gesture Badges*: Discrete pill badges for Click, Double Click, Drag, Drop, Scroll, and Zoom.
-  - *Voice Listening*: Soft pulsing Siri-style cyan/blue waveform.
+  - *Voice Listening*: Soft pulsing Siri-style cyan/blue waveform with active transcribing indicator.
+  - *Prompt Display*: Real-time on-screen Siri-style prompt display (`“<prompt>”`) with Tony Stark Arc Reactor core glyph and directive confirmation.
   - *Thinking*: Subtle pulsing accent glow with rhythmic 3-dot cadence indicators while awaiting LLM reasoning.
-  - *Speaking*: Dancing 5-bar audio waveform displaying assistant response cadence.
+  - *Speaking*: Stacks user prompt on top line with assistant response and dancing 4-bar audio waveform below.
   - *Error*: Amber warning badge (`#ff9f0a`) for Groq API key/rate-limit/offline errors and disconnected camera/microphone.
 
 ### 2. Cursor Dwell Overlay
@@ -268,9 +269,9 @@ Many Windows PCs have Virtual Audio Cables installed (e.g. from OBS, VoiceMeeter
   - *Automatic Fallback (Google Speech API)*: If no key is set, the network is offline, or the API returns HTTP 401/429, the system automatically routes to Google SpeechRecognition and presents an amber Island error badge. Once connectivity or rate limit cooldown clears, Groq transcription automatically resumes.
 - **Local Dispatch First**: [`commands.py`](file:///c:/Programming/Jarvis/commands.py) always evaluates exact regex word boundary patterns (`\b...\b`) locally first for instant, zero-latency execution.
 - **Groq LLM Intelligence Fallback**: If no local regex matches and AI is enabled, the utterance is submitted to Groq LLM (`llama-3.1-8b-instant`). The system prompt injects dynamic contextual state (time, active/standby status, tracking mode, dwell mode) and enforces JSON action responses (`action`, `args`, `reply`).
-- **Strict Action Whitelisting**: Actions returned by the LLM are validated against a strict whitelist (volume, media controls, whitelist-only app launching, whitelist-only sites, search, screenshot, workstation lock, window controls, mode switches, status). Arbitrary shell execution is impossible. If JSON parsing fails, the assistant speaks the reply text safely.
+- **Strict Action Whitelisting**: Actions returned by the LLM are validated against a strict whitelist (diagnostics, stealth mode, clean slate, house party, target practice, volume, media controls, whitelist-only app launching, whitelist-only sites, search, screenshot, workstation lock, window controls, mode switches, status). Arbitrary shell execution is impossible. If JSON parsing fails, the assistant speaks the reply text safely.
 - **In-Memory History**: Keeps up to 6 turns of conversation history in volatile RAM only. Resets automatically whenever Jarvis enters standby.
-- **Feedback**: Spoken responses delivered via an isolated background `pyttsx3` text-to-speech worker thread.
+- **Feedback**: Spoken responses delivered via an isolated background `pyttsx3` text-to-speech worker thread or Paul Bettany Piper neural voice.
 
 ### Voice Command Catalog
 - **Power & Mode**: `"wake up"`, `"go to sleep"`, `"shut down jarvis"`
@@ -280,7 +281,9 @@ Many Windows PCs have Virtual Audio Cables installed (e.g. from OBS, VoiceMeeter
 - **Media Controls**: `"volume up"`, `"volume down"`, `"mute"`, `"unmute"`, `"play"`, `"pause"`, `"next track"`, `"previous track"`
 - **App Launchers**: `"open Chrome"`, `"open Edge"`, `"open VS Code"`, `"open File Explorer"`, `"open Terminal"`, `"open Notepad"`, `"open Calculator"`, `"open Task Manager"`, `"open Spotify"`
 - **Web Navigation**: `"open YouTube"`, `"open GitHub"`, `"search for [query]"`
-- **Status & Info**: `"what time is it"`, `"what day is it"`, `"status report"`
+- **Stark Telemetry & Diagnostics**: `"run diagnostics"`, `"suit status"`, `"power levels"`, `"status report"`
+- **Stark Protocols**: `"house party protocol"`, `"stealth mode"`, `"clean slate protocol"`, `"target practice"`
+- **Stark Conversational Wits**: `"thank you jarvis"`, `"who are you"`, `"are you there"`
 - **Updates**: `"check for updates"`, `"install update"`
 
 ---

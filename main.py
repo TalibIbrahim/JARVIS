@@ -57,15 +57,25 @@ class Context:
     def quit(self):
         self.stop.set()
 
-    def chirp(self, up):
+    def chirp(self, kind=True):
         if sys.platform != "win32":
             return
         import winsound
-        notes = [(740, 70), (1100, 90)] if up else [(900, 70), (500, 110)]
+        if kind == "wake":
+            notes = [(880, 50), (1320, 70)]
+        elif kind == "confirm" or kind is True:
+            notes = [(1046, 45), (1318, 65)]
+        elif kind == "down" or kind is False:
+            notes = [(900, 60), (550, 90)]
+        else:
+            notes = [(880, 50), (1100, 70)]
 
         def play():
-            for freq, ms in notes:
-                winsound.Beep(freq, ms)
+            try:
+                for freq, ms in notes:
+                    winsound.Beep(freq, ms)
+            except Exception:
+                pass
 
         threading.Thread(target=play, daemon=True).start()
 

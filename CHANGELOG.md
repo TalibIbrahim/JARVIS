@@ -314,6 +314,19 @@
   - Transitioned default conversational LLM to `openai/gpt-oss-120b` and `openai/gpt-oss-20b` following Groq's model lifecycle update.
   - Added full test coverage for visual query recognition and image description (`TestVisionAnalysis`).
 
+---
 
-
-
+### 27. Release v1.2.7: Siri-Style Live Speech Display, Stark Protocols & Watchdog Timeout
+- **Siri-Style Prompt Display in Dynamic Island (`overlay.py`, `voice.py`)**:
+  - Live transcription and captured prompt display on screen (`"You: <prompt>"`) in the Apple Dynamic Island HUD so the user immediately knows what speech was heard.
+  - Dynamic pill expansion to accommodate two-line text (user prompt + assistant reply).
+  - Iron Man Arc Reactor glyph with luminous cyan outer ring and pulsing core.
+- **Iron Man Telemetry & Protocols (`ai.py`, `commands.py`, `main.py`)**:
+  - Persona aligned to Paul Bettany's J.A.R.V.I.S., strictly addressing the user respectfully as "sir" (and never "Mr. Stark").
+  - Native Win32 hardware telemetry (`get_system_telemetry` querying real RAM, AC power / battery percentage, and 120Hz repulsor tracking).
+  - Stark voice protocols: `"house party protocol"`, `"stealth mode"`, `"clean slate protocol"`, `"target practice"`, `"diagnostics"`, `"suit status"`, `"power levels"`.
+  - Repulsor-themed sound cues: distinct acoustic chirps for wake, confirmation, and power-down states.
+- **Visual Query "Thinking..." Fix & Watchdog Timeout (`commands.py`, `overlay.py`)**:
+  - Unified `try ... finally` block ensuring `post("thinking", active=False)` always runs across all visual query branches.
+  - Strict 8-second ceiling on Groq vision queries to avoid stalling.
+  - Watchdog expiration timer in `AppleDynamicIsland`: automatically clears thinking state after timeout even if any background process or network call hangs.
