@@ -98,11 +98,14 @@ class Pose:
             return True
 
         # 2. Natural open palm facing camera (robust on real webcams with perspective distortion)
-        fingers_open = (self.openness >= 0.50) and (self.idx > 1.35 and self.mid > 1.35)
-        not_pinching = self.pinch_ti > 0.38
+        fingers_open = (self.openness >= 0.38) and (self.idx > 1.25 and self.mid > 1.25)
+        extended_count = sum([self.idx > 1.28, self.mid > 1.28, self.ring > 1.22, self.pinky > 1.20])
+        has_extended_fingers = fingers_open or (extended_count >= 3 and self.openness >= 0.35)
+
+        not_pinching = self.pinch_ti > 0.28
         not_peace = not (self.idx > 1.35 and self.mid > 1.35 and self.ring < 1.25 and self.pinky < 1.25)
-        thumb_natural = self.thumb_out > 0.45
-        return fingers_open and not_pinching and not_peace and thumb_natural
+        thumb_natural = self.thumb_out > 0.28
+        return has_extended_fingers and not_pinching and not_peace and thumb_natural
 
     @property
     def peace(self):

@@ -368,3 +368,20 @@
   - Eliminated truncated binary replacement that triggered *"Could not load PyInstaller's embedded PKG archive"* on Windows.
 - **Update Voice Debouncing (`updater.py`)**:
   - Eliminated duplicate spoken announcements; J.A.R.V.I.S. announces update availability strictly once with session-level tag tracking.
+
+---
+
+### 30. Release v1.3.2: Natural Palm Gestures, Siri Dynamic Island Wake, & Intelligent Spotify Playback
+- **Robust Open Palm Detection & Camera Auto-Recovery (`gestures.py`, `tracker.py`)**:
+  - Retuned `Pose.palm` geometric constraints for typical webcam lenses and focal distortion (`thumb_out > 0.28`, `pinch_ti > 0.28`, $\ge 3$ extended fingers). Open palms are now instantly recognized without awkward hand positioning.
+  - Added automatic camera index failover in `tracker.py`: if secondary camera device index 1 is unavailable or unplugged, tracker seamlessly falls back to device index 0.
+- **Siri-Style Dynamic Island Wake Expansion (`overlay.py`, `voice.py`)**:
+  - Immediately upon hearing *"JARVIS"*, J.A.R.V.I.S. fires a `wake_detected` event and expands the Dynamic Island from compact pill ($110\times30\text{ px}$) to Siri listening dimensions ($380\times52\text{ px}$) with spring physics and an iridescent neon border.
+  - Added real-time 3-harmonic liquid soundwave animated directly by live microphone RMS audio amplitude (`Voice._latest_rms`), letting the user visually confirm J.A.R.V.I.S. is listening before completing their sentence.
+  - Extended active listening window to 7.0 seconds post-wake.
+- **Intelligent Spotify & YouTube Playback Engine (`commands.py`, `decision_engine.py`, `ai.py`)**:
+  - Added dedicated `play_media()` execution path supporting natural queries such as *"play Drake on spotify"*, *"play Queen on youtube"*, and automatic platform resolution.
+  - Disambiguated generic media actions from media search queries, avoiding command collisions.
+  - Integrated with on-device System 1 Decision Engine and Groq System 2 LLM with structured media playback extraction.
+- **Test Suite Expansion (`tests/test_user_features.py`)**:
+  - Added 8 dedicated unit tests verifying palm gesture thresholds, camera auto-fallback, media playback command routing, Dynamic Island Siri expansion state, and audio waveform reactivity. Full suite passes at 147/147 tests.

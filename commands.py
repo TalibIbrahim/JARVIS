@@ -4,8 +4,9 @@ import os
 import re
 import subprocess
 import time
+import urllib.parse
 import webbrowser
-from typing import Any
+from typing import Any, Tuple
 
 from ai import (
     get_api_key,
@@ -117,6 +118,46 @@ def get_system_telemetry(ctx=None) -> str:
         telemetry_summary = ". ".join(parts) + "."
         return f"All Mark systems operating nominally, sir. {telemetry_summary}"
     return "All Mark systems operating nominally, sir. Hand tracking telemetry is calibrated."
+
+
+def is_spotify_available() -> bool:
+    """Checks whether Spotify desktop application is installed or running on this PC."""
+    appdata = os.environ.get("APPDATA", "")
+    spotify_exe = os.path.join(appdata, "Spotify", "Spotify.exe")
+    if os.path.exists(spotify_exe):
+        return True
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    spotify_winapps = os.path.join(local_appdata, "Microsoft", "WindowsApps", "Spotify.exe")
+    if os.path.exists(spotify_winapps):
+        return True
+    try:
+        res = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Spotify.exe"], capture_output=True, text=True, timeout=2)
+        if "Spotify.exe" in res.stdout:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def play_media(query: str, platform: str = "auto") -> Tuple[bool, str]:
+    """Plays artist or track on Spotify or YouTube."""
+    clean_q = query.strip()
+    if not clean_q:
+        return False, "I didn't catch what you would like to play, sir."
+
+    encoded = urllib.parse.quote(clean_q)
+    plat = platform.lower()
+
+    if plat == "spotify" or (plat == "auto" and is_spotify_available()):
+        try:
+            subprocess.Popen(f'start "" "spotify:search:{encoded}"', shell=True)
+            return True, f"Playing {clean_q.title()} on Spotify, sir."
+        except Exception:
+            webbrowser.open(f"https://open.spotify.com/search/{encoded}")
+            return True, f"Playing {clean_q.title()} on Spotify, sir."
+    else:
+        webbrowser.open(f"https://www.youtube.com/results?search_query={encoded}")
+        return True, f"Playing {clean_q.title()} on YouTube, sir."
 
 
 def run_command(text, ctx):
@@ -251,7 +292,37 @@ def run_command(text, ctx):
     if re.search(r"\b(mute|unmute)\b", clean_t):
         pyautogui.press("volumemute", _pause=False)
         return "Muted."
-    if _any(clean_t, "play", "pause", "resume"):
+    # 1. Dedicated Music Search & Playback (Spotify / YouTube)
+    m_spot = re.match(r"(?:play|put on|listen to|search for)\s+(.+?)\s+(?:on|in)\s+spotify\b", clean_t)
+    if not m_spot:
+        m_spot = re.match(r"(?:play|put on|listen to)\s+spotify\s+(.+)", clean_t)
+    if not m_spot:
+        m_spot = re.match(r"^spotify\s+(?:play\s+)?(.+)", clean_t)
+    if m_spot:
+        query = m_spot.group(1).strip()
+        ok, reply = play_media(query, platform="spotify")
+        return reply
+
+    m_yt = re.match(r"(?:play|put on|listen to|search for)\s+(.+?)\s+(?:on|in)\s+youtube\b", clean_t)
+    if not m_yt:
+        m_yt = re.match(r"(?:play|put on|listen to)\s+youtube\s+(.+)", clean_t)
+    if not m_yt:
+        m_yt = re.match(r"^youtube\s+(?:play\s+)?(.+)", clean_t)
+    if m_yt:
+        query = m_yt.group(1).strip()
+        ok, reply = play_media(query, platform="youtube")
+        return reply
+
+    # 2. General "play <query>" (e.g. "play Drake", "play some Drake", "play Bohemian Rhapsody")
+    m_play = re.match(r"(?:play|put on|listen to)\s+(?:some\s+)?(.+)", clean_t)
+    if m_play:
+        target = m_play.group(1).strip()
+        if target not in ("music", "the music", "track", "song", "audio", "video", "media", "pause", "resume", "playback"):
+            ok, reply = play_media(target, platform="auto")
+            return reply
+
+    # 3. Simple Play / Pause toggle
+    if clean_t in ("play", "pause", "resume", "unpause", "play music", "pause music", "stop music", "resume music", "toggle playback", "toggle play", "toggle music", "stop playback"):
         pyautogui.press("playpause", _pause=False)
         return "Done."
     if _any(clean_t, "next track", "next song", "skip"):

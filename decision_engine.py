@@ -48,6 +48,13 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "pause the music", "resume playback", "play music", "stop playback",
         "pause the video", "resume track", "toggle play pause", "pause media", "unpause"
     ],
+    "play_music": [
+        "play drake on spotify", "play drake", "play taylor swift on spotify",
+        "play music on spotify", "play the weeknd on spotify", "play blinding lights",
+        "play songs by drake", "listen to drake on spotify", "put on some drake",
+        "play bohemian rhapsody on spotify", "play rock on spotify", "play jazz on spotify",
+        "search drake on spotify", "play spotify drake", "play songs by the weeknd"
+    ],
     "next_track": [
         "skip this song", "next track", "next song", "skip track", "play next song", "go to next track"
     ],
@@ -304,6 +311,14 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
         reply = "Audio muted, sir."
     elif action == "play_pause":
         reply = "Playback toggled, sir."
+    elif action == "play_music":
+        platform = "spotify" if "spotify" in clean else ("youtube" if "youtube" in clean else "auto")
+        query = clean
+        m = re.search(r"(?:play|put on|listen to|search for)\s+(.+?)(?:\s+(?:on|in)\s+(?:spotify|youtube))?$", clean)
+        if m:
+            query = m.group(1).strip()
+        args = {"query": query, "platform": platform}
+        reply = f"Playing {query.title()} on {platform.title()}, sir." if platform != "auto" else f"Playing {query.title()} for you now, sir."
     elif action == "next_track":
         reply = "Skipping to the next track, sir."
     elif action == "previous_track":

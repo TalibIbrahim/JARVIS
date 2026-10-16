@@ -53,7 +53,7 @@ class Config:
     clutch_enabled: bool = True         # pause pose / leaving margin box stops cursor
 
     # --- gesture timing / thresholds (distances are relative to hand size) ---
-    activate_hold: float = 0.7          # seconds of open palm to wake up
+    activate_hold: float = 0.5          # seconds of open palm to wake up
     deactivate_hold: float = 1.5        # seconds of open palm to go to standby
     palm_grace: float = 0.35            # grace period to absorb multi-frame landmark flicker during palm hold
     pinch_down: float = 0.28            # thumb-index distance that counts as a pinch
@@ -92,7 +92,7 @@ class Config:
         "jarves", "jarv", "travis", "service", "harvest", "charvis", "darvis", "jar is",
         "jar business"
     ])
-    command_window: float = 6.0         # seconds Jarvis keeps listening after "Jarvis?"
+    command_window: float = 7.0         # seconds Jarvis keeps listening after "Jarvis?"
     mic_device_index: int = None        # specific microphone device index, or None for auto-detect
     mic_energy_threshold: int = 300     # minimum audio energy threshold for speech trigger (lower = more sensitive)
     mic_dynamic_energy: bool = False    # adapt threshold dynamically (False prevents runaway threshold on laptop mics)

@@ -44,7 +44,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.3.1"
+    APP_VERSION = "1.3.2"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -361,13 +361,13 @@ class AppleDynamicIsland(QWidget):
         elif is_prompt:
             tw = min(500.0, max(300.0, 130.0 + len(self.user_prompt) * 7.2))
             th = 48.0
+        elif is_listening:
+            tw, th = 380.0, 52.0
         elif is_thinking:
             tw, th = 280.0, 42.0
         elif is_speaking:
             tw = min(520.0, max(340.0, 120.0 + len(self.say_text) * 6.5))
             th = 50.0
-        elif is_listening:
-            tw, th = 280.0, 42.0
         elif is_gesture:
             tw, th = 270.0, 40.0
         elif self.active:
@@ -440,6 +440,10 @@ class AppleDynamicIsland(QWidget):
             else:
                 border_grad.setColorAt(0.0, QColor("#ff453a"))
                 border_grad.setColorAt(1.0, QColor("#d70015"))
+        elif is_listening:
+            border_grad.setColorAt(0.0, QColor(0, 240, 255, 230))
+            border_grad.setColorAt(0.5, QColor(175, 82, 222, 230))
+            border_grad.setColorAt(1.0, QColor(255, 45, 85, 230))
         elif is_thinking or is_prompt:
             arc_pulse = int(140 + 75 * math.sin(t * 6.0))
             border_grad.setColorAt(0.0, QColor(0, 229, 255, arc_pulse))
@@ -621,6 +625,76 @@ class AppleDynamicIsland(QWidget):
                     p.setBrush(QBrush(QColor(accent.red(), accent.green(), accent.blue(), alpha)))
                     p.drawEllipse(QPointF(rx + i * 8, cy), 2.5, 2.5)
 
+            elif is_listening:
+                # Siri-style continuous fluid waveform & glowing multi-color orb
+                # 1. Siri-style iridescent glowing orb on left
+                orb_cx = 28.0
+                orb_cy = cy
+                orb_r = 10.0
+
+                g_orb = QRadialGradient(orb_cx, orb_cy, orb_r)
+                g_orb.setColorAt(0.0, QColor(255, 255, 255, 255))
+                g_orb.setColorAt(0.35, QColor(0, 240, 255, 230))
+                g_orb.setColorAt(0.70, QColor(175, 82, 222, 210))
+                g_orb.setColorAt(1.0, QColor(255, 45, 85, 0))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(g_orb))
+                p.drawEllipse(QPointF(orb_cx, orb_cy), orb_r, orb_r)
+
+                # 2. Text display
+                text_x = 46.0
+                p.setPen(text_primary)
+                font_title = QFont("Segoe UI", 9)
+                font_title.setWeight(QFont.Weight.DemiBold)
+                p.setFont(font_title)
+
+                if is_speaking and self.say_text:
+                    listen_title = self.say_text if len(self.say_text) <= 24 else self.say_text[:22] + "…"
+                elif getattr(self, "is_transcribing", False):
+                    listen_title = "Processing speech…"
+                else:
+                    listen_title = "Listening…"
+                p.drawText(int(text_x), int(cy - 1), listen_title)
+
+                font_hint = QFont("Segoe UI", 8)
+                font_hint.setWeight(QFont.Weight.Medium)
+                p.setFont(font_hint)
+                p.setPen(accent)
+                p.drawText(int(text_x), int(cy + 12), "Jarvis is ready")
+
+                # 3. Siri-style multi-harmonic liquid waveform responding to live microphone level
+                live_vol = 0.0
+                try:
+                    from voice import Voice
+                    if time.time() - getattr(Voice, "_latest_time", 0.0) < 0.8:
+                        raw_rms = float(getattr(Voice, "_latest_rms", 0.0))
+                        live_vol = min(max((raw_rms - 25.0) / 350.0, 0.0), 1.0)
+                except Exception:
+                    pass
+
+                wave_w = min(110.0, max(60.0, w - text_x - 120.0))
+                wave_x0 = w - wave_w - 20.0
+                base_amp = 3.5 + live_vol * 12.0
+
+                wave_configs = [
+                    (QColor(175, 82, 222, 160), 2.0, 7.0, 3.5, base_amp * 0.85),
+                    (QColor(0, 240, 255, 210), 2.2, 9.2, 4.2, base_amp * 1.0),
+                    (QColor(255, 255, 255, 230), 1.6, 8.4, 3.8, base_amp * 0.65),
+                ]
+
+                for w_color, w_thick, w_speed, w_freq, w_amp in wave_configs:
+                    p.setPen(QPen(w_color, w_thick, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                    wave_path = QPainterPath()
+                    for step in range(int(wave_w)):
+                        frac = step / wave_w
+                        envelope = math.sin(frac * math.pi)
+                        wy = cy + w_amp * envelope * math.sin(t * w_speed + frac * w_freq * math.pi)
+                        if step == 0:
+                            wave_path.moveTo(wave_x0 + step, wy)
+                        else:
+                            wave_path.lineTo(wave_x0 + step, wy)
+                    p.drawPath(wave_path)
+
             elif is_speaking:
                 p.setPen(accent)
                 p.drawText(int(tx), int(cy - 2), "Jarvis")
@@ -635,30 +709,6 @@ class AppleDynamicIsland(QWidget):
                 for i in range(4):
                     bar_h = 3.0 + 10.0 * abs(math.sin(t * 7.0 + i * 0.8))
                     p.fillRect(QRectF(wx + i * 6, cy - bar_h / 2.0, 3.0, bar_h), accent)
-
-            elif is_listening:
-                # Siri-style continuous fluid sine waveform
-                font_listen = QFont("Segoe UI", 9)
-                font_listen.setWeight(QFont.Weight.DemiBold)
-                p.setFont(font_listen)
-                p.setPen(text_primary)
-                listen_label = "Processing speech…" if getattr(self, "is_transcribing", False) else "Listening…"
-                p.drawText(int(tx), int(cy + 4), listen_label)
-
-                # Multi-harmonic smooth waveform
-                wave_w = 60.0
-                wave_x0 = w - 75.0
-                p.setPen(QPen(accent, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                wave_path = QPainterPath()
-                for step in range(int(wave_w)):
-                    frac = step / wave_w
-                    envelope = math.sin(frac * math.pi)
-                    wy = cy + 6.0 * envelope * math.sin(t * 8.0 + frac * 4.0 * math.pi)
-                    if step == 0:
-                        wave_path.moveTo(wave_x0 + step, wy)
-                    else:
-                        wave_path.lineTo(wave_x0 + step, wy)
-                p.drawPath(wave_path)
 
             else:
                 # Tracking / Gesture feedback
@@ -2569,10 +2619,17 @@ class Overlay:
                         self.island.prompt_until = max(self.island.prompt_until, self.island.say_until)
                     if d.get("speak", True) and text and self.ctx and hasattr(self.ctx, "speaker"):
                         self.ctx.speaker.say(text)
+                elif kind == "wake_detected":
+                    self.island.listening = True
+                    self.island.listening_until = now + getattr(self.cfg, "command_window", 7.0)
+                    self.island.is_transcribing = False
+                    self.island.spring_w.vel = 140.0
                 elif kind == "listening":
                     self.island.listening = True
                     self.island.listening_until = d.get("until", now + 5.0)
                     self.island.is_transcribing = d.get("transcribing", False)
+                    if d.get("wake", False):
+                        self.island.spring_w.vel = 140.0
                 elif kind == "thinking":
                     active = bool(d.get("active", True))
                     self.island.thinking = active

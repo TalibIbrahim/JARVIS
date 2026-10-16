@@ -65,6 +65,7 @@ WHITELIST_ACTIONS = {
     "tracking_mode",
     "power_mode",
     "status",
+    "play_music",
 }
 
 
@@ -685,6 +686,7 @@ def build_system_prompt(ctx: Any = None) -> str:
         "   - 'tracking_mode' (args: {'mode': 'relative' | 'absolute'})\n"
         "   - 'power_mode' (args: {'mode': 'standby' | 'wake' | 'quit'})\n"
         "   - 'status' (args: {})\n"
+        "   - 'play_music' (args: {'query': '<artist or track>', 'platform': 'spotify' | 'youtube'})\n"
         "7. Never output markdown fences (do not output ```json). Output raw JSON only."
     )
     return prompt
@@ -799,6 +801,15 @@ def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> T
                 webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(query))
                 return True, f"Searched for {query}"
             return False, "Empty search query"
+
+        elif action == "play_music":
+            from commands import play_media
+            query = str(args.get("query", "")).strip()
+            platform = str(args.get("platform", "spotify")).strip().lower()
+            if not platform or platform not in ("spotify", "youtube"):
+                platform = "auto"
+            ok, msg = play_media(query, platform=platform)
+            return ok, msg
 
         elif action == "screenshot":
             folder = os.path.join(os.path.expanduser("~"), "Pictures", "Jarvis")

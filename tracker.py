@@ -25,23 +25,39 @@ class FrameGrabber(threading.Thread):
 
     def open_camera(self):
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
-        cap = cv2.VideoCapture(self.cfg.camera_index, backend)
-        if getattr(self.cfg, "camera_mjpg", True):
+        preferred = getattr(self.cfg, "camera_index", 0)
+        candidates = [preferred] + [i for i in (0, 1, 2) if i != preferred]
+
+        for idx in candidates:
+            cap = cv2.VideoCapture(idx, backend)
+            if getattr(self.cfg, "camera_mjpg", True):
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                except Exception:
+                    pass
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.frame_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.frame_height)
+            cap.set(cv2.CAP_PROP_FPS, getattr(self.cfg, "camera_fps", 30))
             try:
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
                 pass
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.frame_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.frame_height)
-        cap.set(cv2.CAP_PROP_FPS, getattr(self.cfg, "camera_fps", 30))
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
 
-        self.cap = cap
-        self.opened = cap.isOpened()
-        return self.opened
+            if cap.isOpened():
+                if idx != preferred:
+                    print(f"[tracker] Camera [{preferred}] unavailable. Auto-recovered to working camera [{idx}].")
+                    self.cfg.camera_index = idx
+                self.cap = cap
+                self.opened = True
+                return True
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+        self.cap = None
+        self.opened = False
+        return False
 
     def run(self):
         if not self.cap or not self.opened:
@@ -117,18 +133,32 @@ class Tracker(threading.Thread):
                 self.overlay.post("error", text="CAMERA NOT FOUND")
                 return
             self._grabber.start()
-        else:
             backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
-            cap = cv2.VideoCapture(cfg.camera_index, backend)
-            if getattr(cfg, "camera_mjpg", True):
+            preferred = getattr(cfg, "camera_index", 0)
+            candidates = [preferred] + [i for i in (0, 1, 2) if i != preferred]
+            cap = None
+            for idx in candidates:
+                cand_cap = cv2.VideoCapture(idx, backend)
+                if getattr(cfg, "camera_mjpg", True):
+                    try:
+                        cand_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                    except Exception:
+                        pass
+                cand_cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
+                cand_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
+                cand_cap.set(cv2.CAP_PROP_FPS, getattr(cfg, "camera_fps", 30))
+                if cand_cap.isOpened():
+                    cap = cand_cap
+                    if idx != preferred:
+                        print(f"[tracker] Camera [{preferred}] unavailable. Auto-recovered to working camera [{idx}].")
+                        cfg.camera_index = idx
+                    break
                 try:
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                    cand_cap.release()
                 except Exception:
                     pass
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
-            cap.set(cv2.CAP_PROP_FPS, getattr(cfg, "camera_fps", 30))
-            if not cap.isOpened():
+
+            if not cap or not cap.isOpened():
                 self.ctx.say("I can't open the camera, sir.")
                 self.overlay.post("error", text="CAMERA NOT FOUND")
                 return

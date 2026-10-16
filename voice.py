@@ -116,10 +116,10 @@ def find_best_microphone(cfg=None):
     if not mics:
         return None, "Default System Microphone"
 
-    # 1. Explicitly requested device in config
+    # 1. Explicitly requested device in config (if physical and working)
     if cfg_idx is not None:
         for m in mics:
-            if m["index"] == cfg_idx and m["working"]:
+            if m["index"] == cfg_idx and m["working"] and not m["is_virtual"]:
                 return m["index"], m["name"]
 
     # 2. Filter working non-virtual devices
@@ -725,8 +725,9 @@ class Voice(threading.Thread):
                 return
 
             if not command:
-                self.listening_until = now + self.cfg.command_window
+                self.listening_until = now + getattr(self.cfg, "command_window", 7.0)
                 try:
+                    self.ctx.overlay.post("wake_detected")
                     self.ctx.overlay.post("listening", until=self.listening_until)
                 except Exception:
                     pass
