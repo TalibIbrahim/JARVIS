@@ -385,3 +385,18 @@
   - Integrated with on-device System 1 Decision Engine and Groq System 2 LLM with structured media playback extraction.
 - **Test Suite Expansion (`tests/test_user_features.py`)**:
   - Added 8 dedicated unit tests verifying palm gesture thresholds, camera auto-fallback, media playback command routing, Dynamic Island Siri expansion state, and audio waveform reactivity. Full suite passes at 147/147 tests.
+
+---
+
+### 31. Release v1.3.3: Dynamic Hardware Camera Enumeration & Ghost Device Filtering
+- **Dynamic Camera Hardware Discovery (`tracker.py`, `overlay.py`)**:
+  - Replaced static placeholder `range(4)` loop in Settings $\rightarrow$ General with dynamic physical device enumeration via `list_cameras()`.
+  - Automatically displays friendly hardware names (e.g. `HP HD Camera (Camera 0)`) and saves real hardware index bindings.
+  - Actively filters out non-color sensors such as Windows Hello Infrared (`HP IR Camera`) and unresponsive ghost indices.
+  - Implemented 30-second thread-safe caching to ensure instantaneous settings dialog opening.
+  - Added a **Refresh** button in Settings $\rightarrow$ General to detect external USB webcams immediately without restarting J.A.R.V.I.S.
+- **Redundant Camera Capture Initialization Fix (`tracker.py`)**:
+  - Encapsulated non-threaded camera open logic strictly inside `else:`, preventing duplicate camera access conflicts while `FrameGrabber` is active.
+- **Test Suite Expansion (`tests/test_settings.py`)**:
+  - Added unit tests for device enumeration and IR sensor exclusion (`test_list_cameras_returns_valid_devices`, `test_list_cameras_filters_ir_devices`). Full suite stands at **149 tests** passing cleanly.
+

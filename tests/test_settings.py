@@ -155,6 +155,36 @@ class TestSettingsWindowInteractions(unittest.TestCase):
         self.assertEqual(item[0], "open_settings")
         self.assertEqual(item[1].get("initial_tab"), "AI")
 
+    def test_list_cameras_returns_valid_devices(self):
+        from tracker import list_cameras
+        cams = list_cameras(force_refresh=True)
+        self.assertIsInstance(cams, list)
+        self.assertGreater(len(cams), 0)
+        self.assertIn("index", cams[0])
+        self.assertIn("name", cams[0])
+        self.assertIn("working", cams[0])
+
+    def test_list_cameras_filters_ir_devices(self):
+        from tracker import list_cameras
+        class FakeQtDevice:
+            def __init__(self, desc):
+                self._desc = desc
+            def description(self):
+                return self._desc
+            def isDefault(self):
+                return False
+
+        with patch("tracker.cv2.VideoCapture") as mock_cap, \
+             patch("PySide6.QtMultimedia.QMediaDevices.videoInputs", return_value=[FakeQtDevice("HP HD Camera"), FakeQtDevice("HP IR Camera")]):
+            instance = mock_cap.return_value
+            instance.isOpened.return_value = True
+            instance.read.return_value = (True, MagicMock(size=100))
+
+            cams = list_cameras(force_refresh=True)
+            names = [c["name"] for c in cams]
+            self.assertIn("HP HD Camera", names)
+            self.assertNotIn("HP IR Camera", names)
+
 
 if __name__ == "__main__":
     unittest.main()

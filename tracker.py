@@ -8,6 +8,71 @@ import mediapipe as mp
 
 from gestures import Hand
 
+_CAMERA_LOCK = threading.Lock()
+_CAMERA_CACHE = None
+_CAMERA_CACHE_TIME = 0.0
+_CAMERA_CACHE_TTL = 30.0
+
+
+def list_cameras(force_refresh=False):
+    """
+    Enumerates available physical and virtual camera capture devices.
+    Filters out non-functioning devices, Windows Hello IR sensors, and ghost indices.
+    Returns list of dicts:
+        [{'index': int, 'name': str, 'working': bool}]
+    """
+    global _CAMERA_CACHE, _CAMERA_CACHE_TIME
+    with _CAMERA_LOCK:
+        now = time.time()
+        if not force_refresh and _CAMERA_CACHE is not None and (now - _CAMERA_CACHE_TIME) < _CAMERA_CACHE_TTL:
+            return list(_CAMERA_CACHE)
+
+        qt_cams = []
+        try:
+            from PySide6.QtMultimedia import QMediaDevices
+            for c in QMediaDevices.videoInputs():
+                qt_cams.append({"name": c.description(), "default": c.isDefault()})
+        except Exception:
+            pass
+
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
+        cams = []
+        limit = max(2, len(qt_cams))
+
+        for idx in range(limit):
+            name = qt_cams[idx]["name"] if idx < len(qt_cams) else f"Camera {idx}"
+            # Skip pure IR / Windows Hello sensors
+            if any(w in name.lower() for w in (" ir ", "ir camera", "infrared", "windows hello")):
+                continue
+
+            cap = cv2.VideoCapture(idx, backend)
+            opened = cap.isOpened()
+            working = False
+            if opened:
+                ret, frame = cap.read()
+                working = bool(ret and frame is not None and frame.size > 0)
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            else:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+            if working:
+                cams.append({"index": idx, "name": name, "working": True})
+
+        if not cams:
+            # Fallback if probing was blocked or in headless environment
+            default_name = qt_cams[0]["name"] if qt_cams else "Default Camera (Camera 0)"
+            cams.append({"index": 0, "name": default_name, "working": True})
+
+        _CAMERA_CACHE = cams
+        _CAMERA_CACHE_TIME = now
+        return list(cams)
+
 
 class FrameGrabber(threading.Thread):
     """Dedicated background thread for non-blocking camera frame capture at 30+ FPS."""
@@ -133,6 +198,7 @@ class Tracker(threading.Thread):
                 self.overlay.post("error", text="CAMERA NOT FOUND")
                 return
             self._grabber.start()
+        else:
             backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
             preferred = getattr(cfg, "camera_index", 0)
             candidates = [preferred] + [i for i in (0, 1, 2) if i != preferred]

@@ -44,7 +44,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.3.2"
+    APP_VERSION = "1.3.3"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -53,6 +53,11 @@ except ImportError:
     find_best_microphone = lambda cfg=None: (None, "Default Microphone")
     probe_mic_level = lambda dev=None: (0.0, 0.0)
     test_microphone_recognition = lambda dev=None: {"success": False, "error": "Voice module unavailable"}
+
+try:
+    from tracker import list_cameras
+except ImportError:
+    list_cameras = lambda force_refresh=False: [{"index": 0, "name": "Default Camera (Camera 0)", "working": True}]
 
 try:
     from ai import (
@@ -1633,11 +1638,48 @@ class SettingsWindow(QDialog):
 
         # Camera Index
         cam_combo = QComboBox()
-        for i in range(4):
-            cam_combo.addItem(f"Camera {i}", i)
-        cam_combo.setCurrentIndex(self.cfg.camera_index)
-        cam_combo.currentIndexChanged.connect(lambda idx: self._save("camera_index", idx))
-        card.add_row("Camera Input", "Select video capture device", cam_combo)
+        cam_combo.setMinimumWidth(240)
+
+        def populate_cameras(force=False):
+            cams = list_cameras(force_refresh=force)
+            cam_combo.blockSignals(True)
+            cam_combo.clear()
+            selected_idx = 0
+            for idx, c in enumerate(cams):
+                display_label = f"{c['name']} (Camera {c['index']})"
+                cam_combo.addItem(display_label, c["index"])
+                if self.cfg.camera_index == c["index"]:
+                    selected_idx = idx
+
+            if not cams:
+                cam_combo.addItem("Default Camera (Camera 0)", 0)
+
+            cam_combo.setCurrentIndex(selected_idx)
+            cam_combo.blockSignals(False)
+
+        populate_cameras(force=False)
+
+        def on_cam_selected(c_idx):
+            dev_val = cam_combo.itemData(c_idx)
+            if dev_val is not None:
+                self._save("camera_index", dev_val)
+                self.cfg.camera_index = dev_val
+
+        cam_combo.currentIndexChanged.connect(on_cam_selected)
+
+        btn_refresh_cam = QPushButton("Refresh")
+        btn_refresh_cam.setFixedHeight(30)
+        btn_refresh_cam.setFixedWidth(80)
+        btn_refresh_cam.clicked.connect(lambda: populate_cameras(force=True))
+
+        cam_widget = QWidget()
+        cam_layout = QHBoxLayout(cam_widget)
+        cam_layout.setContentsMargins(0, 0, 0, 0)
+        cam_layout.setSpacing(8)
+        cam_layout.addWidget(cam_combo, stretch=1)
+        cam_layout.addWidget(btn_refresh_cam, stretch=0)
+
+        card.add_row("Camera Input", "Select video capture device", cam_widget)
 
         # Camera Resolution
         res_ctrl = SegmentedControl([
