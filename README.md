@@ -38,7 +38,9 @@
 | | |
 |---|---|
 | **Local & Real-Time** | 100% of computer vision and gesture state estimation executes on your machine. Zero video frames or landmarks leave your PC, delivering instantaneous sub-millisecond gesture latency. |
-| **Dynamic-Island Notch** | A polished, frameless, 32-bit translucent, click-through pill hugs the top-centre of your screen with an animated Tony Stark Arc-Reactor motif, circular wake ring, and audio waveforms. |
+| **System 1 Reflex Engine** | Non-autoregressive on-device decision engine (Laya-style) executing natural desktop voice commands (*"crank up the audio"*, *"hide all my windows"*, *"go dark"*) in **< 1.0 ms** with zero cloud latency and zero API cost. |
+| **Dynamic-Island Notch** | A polished, frameless, 32-bit translucent, click-through pill hugs the top-centre of your screen with an animated Tony Stark Arc-Reactor motif, circular wake ring, and live progressive speech typewriter. |
+| **Speaker Voice Recognition** | Real-time acoustic speaker verification ($F_0$ pitch, 8-band formant spectral envelope) calibrated to your voice so Jarvis only responds to you and ignores background room chatter. |
 | **Zero Click Drift** | With custom **Click Freeze** technology, the cursor automatically freezes the instant fingers start closing for a pinch (`pinch_ti < 0.55`), guaranteeing single and double clicks land exactly where aimed. |
 | **Effortless Reach** | Screen reach mapping uses a configurable `box_margin` (default 18%), so your hand only covers the center 64% of the camera frame to reach every corner of your multi-monitor desktop. |
 | **Failsafe Hardware Protection** | The mouse button and `Ctrl` key can never get stuck down. Involuntary tracking drops, app sleep, and shutdown trigger unconditional hardware button/key releases. |
@@ -82,11 +84,14 @@
 - **Distinct State Engine**: Seamlessly transitions between Standby, Wake Ring, Tracking, Gesture Flash badges, Voice Listening, Speaking, and Error indicators.
 - **Embedded Mini Skeleton**: Displays a live miniature wireframe of your tracked hand inside the island.
 
-### Local Voice Commands
+### Local Voice & Intelligence
 - **Wake Word Recognition**: Say *"Jarvis"* to trigger listening, or speak your command all at once (*"Jarvis, open Chrome"*).
-- **Decoupled Audio Recording**: Background audio worker queue decouples microphone recording from network speech recognition, ensuring no speech is lost while waiting for results.
-- **Regex Boundary Matching**: Precise word-boundary detection (`\b...\b`) prevents false command triggers (e.g., "clock" locking the PC, "commute" muting).
-- **Spoken Text-to-Speech**: Integrated pyttsx3 speech engine running on an isolated thread with local Windows voice profiles.
+- **Laya-Style System 1 Reflex Engine**: Non-autoregressive on-device semantic intent vectorizer (`decision_engine.py`) that classifies and executes un-regexed commands (*"crank up the audio"*, *"hide all my windows"*, *"go dark"*) in **< 1.0 ms** with zero cloud latency.
+- **Acoustic Voice Profile & Speaker Verification**: Calibrate Jarvis to your vocal signature (*"train my voice"*). Uses fundamental pitch ($F_0$), 8-band formant spectral envelope, and centroid matching to filter out background room voices.
+- **Siri-Style Live Typewriter Streaming**: Speech streams letter-by-letter across the Dynamic Island with a smooth blinking cyan cursor (`▍`) in real time.
+- **Groq Multimodal Intelligence (System 2)**: Seamless cloud fallback for general reasoning, coding, and camera vision analysis (*"what is this"* / *"look at this"*).
+- **Decoupled Audio Pipeline**: Threaded audio worker queue decouples microphone capture from recognition, ensuring zero audio dropouts.
+- **Spoken Text-to-Speech**: Integrated neural voice engine running on an isolated thread with Paul Bettany's J.A.R.V.I.S. personality.
 
 ### Settings & Live Calibration
 - **System Tray Icon**: Right-click the Arc Reactor tray icon in your Windows taskbar to toggle Wake/Standby, show the Vision HUD, open Settings, or Quit.
@@ -240,6 +245,9 @@ JARVIS/
 ├── overlay.py           # PySide6 Apple HIG Dynamic Island, Mica/Acrylic glass, settings window
 ├── dwell.py             # Kinect-style hover-to-click engine and radial action menu
 ├── voice.py             # Speech recognition worker, hardware mic auto-probing, pyttsx3 speaker
+├── voice_profile.py     # Acoustic speaker verification, F0 pitch autocorrelation, voice enrollment
+├── decision_engine.py   # Laya-style System 1 reflex decision engine, sub-1ms intent vectorizer
+├── ai.py                # Groq LLM & Multimodal Vision client, prompt builder, action executor
 ├── commands.py          # Local command directory with regex word boundary matching
 ├── config.py            # Configuration dataclass and JSON file loader (jarvis_config.json)
 ├── filters.py           # One Euro adaptive low-pass filter and deadzone hysteresis
@@ -252,6 +260,9 @@ JARVIS/
 │   ├── test_dwell.py           # 5 dwell hover and radial menu unit tests
 │   ├── test_single_instance.py # 2 Win32 mutex single-instance unit tests
 │   ├── test_updater.py         # 5 semver and release asset unit tests
+│   ├── test_ai.py              # 41 Groq LLM, Whisper STT, vision, whitelist unit tests
+│   ├── test_ironman_voice.py   # 46 prompt display, Stark telemetry & HUD unit tests
+│   ├── test_decision_engine.py # 13 sub-millisecond decision engine & voice profile tests
 │   ├── target_practice.py      # Automated and GUI 24x24 px precision targeting tool
 │   ├── target_practice.html    # Web-based interactive precision target practice
 │   └── PRECISION_TEST.md       # Precision test procedures and empirical benchmark results
@@ -268,10 +279,10 @@ JARVIS/
 Run the complete unit test suite anytime:
 
 ```powershell
-python -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-All 38 tests run in under 0.03 seconds, verifying wake/standby, clicks, double click, drag, right click, scroll, zoom, jitter tolerance, fist suppression, dwell timing, mutex locks, and handedness symmetry.
+All **138 tests** pass in ~2.6 seconds across the gesture state machine, dwell hover, single-instance mutex locks, auto-updater, Groq intelligence, vision analysis, Siri-style live display, Stark protocols, and the Laya-style System 1 decision engine.
 
 ---
 
