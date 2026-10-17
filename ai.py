@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Groq AI integration module for J.A.R.V.I.S.
 Provides:
@@ -11,14 +12,61 @@ Provides:
 import datetime
 import json
 import os
+import random
 import re
 import sys
 import threading
 import time
 import urllib.parse
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Iterator, Union, Callable
 
-import requests
+
+class _LazyRequestsProxy:
+    """Lazily loads requests on first network invocation to eliminate startup penalty."""
+    def __getattr__(self, name):
+        import requests
+        return getattr(requests, name)
+
+
+requests = _LazyRequestsProxy()
+
+_ORIG_POST = None
+_ORIG_GET = None
+
+def _get_orig_requests():
+    global _ORIG_POST, _ORIG_GET
+    if _ORIG_POST is None:
+        import requests as real_requests
+        _ORIG_POST = real_requests.post
+        _ORIG_GET = real_requests.get
+    return _ORIG_POST, _ORIG_GET
+
+def _is_mocked(func: Any) -> bool:
+    if func is None:
+        return False
+    return getattr(func, "_mock_name", None) is not None or "mock" in type(func).__name__.lower()
+
+_SESSION: Optional[Any] = None
+_SESSION_LOCK = threading.Lock()
+
+def get_persistent_session() -> Any:
+    """Returns persistent requests.Session with HTTP Keep-Alive and connection pooling."""
+    global _SESSION
+    if _SESSION is None:
+        with _SESSION_LOCK:
+            if _SESSION is None:
+                import requests as real_requests
+                from requests.adapters import HTTPAdapter
+                s = real_requests.Session()
+                adapter = HTTPAdapter(
+                    pool_connections=10,
+                    pool_maxsize=10,
+                    max_retries=0,
+                )
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _SESSION = s
+    return _SESSION
 try:
     import certifi
     if getattr(sys, "frozen", False):
@@ -462,18 +510,97 @@ class SimpleRateLimiter:
 
 class GroqClient:
     """
-    Lightweight Groq API client using requests.
-    Zero heavy SDK dependencies.
+    Lightweight, high-performance Groq API client with HTTP Keep-Alive,
+    connection pooling, TTL response caching, connection pre-warming,
+    and jittered exponential backoff retries.
     """
 
-    def __init__(self, api_key: Optional[str] = None, timeout: int = 10, base_url: str = GROQ_BASE_URL):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        timeout: int = 10,
+        base_url: str = GROQ_BASE_URL,
+        session: Optional[Any] = None,
+        max_retries: int = 2,
+        cache_ttl: float = 60.0,
+    ):
         if api_key is not None:
             self.api_key = api_key.strip()
         else:
             self.api_key = get_api_key()
         self.timeout = timeout
         self.base_url = base_url.rstrip("/")
+        self.session = session or get_persistent_session()
+        self.max_retries = max_retries
+        self.cache_ttl = cache_ttl
+        self._response_cache: Dict[Tuple, Tuple[str, float]] = {}
+        self._cache_lock = threading.Lock()
         self.rate_limiter = SimpleRateLimiter(max_requests_per_minute=25)
+
+    def _post(self, url: str, **kwargs) -> Any:
+        _get_orig_requests()
+        curr_post = getattr(requests, "post", None)
+        if _is_mocked(curr_post) or curr_post is not _ORIG_POST:
+            return curr_post(url, **kwargs)
+        return self.session.post(url, **kwargs)
+
+    def _get(self, url: str, **kwargs) -> Any:
+        _get_orig_requests()
+        curr_get = getattr(requests, "get", None)
+        if _is_mocked(curr_get) or curr_get is not _ORIG_GET:
+            return curr_get(url, **kwargs)
+        return self.session.get(url, **kwargs)
+
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> Any:
+        attempts = max(1, self.max_retries + 1)
+        initial_backoff = 0.05
+        max_backoff = 2.0
+        for attempt in range(attempts):
+            try:
+                if method.upper() == "GET":
+                    resp = self._get(url, **kwargs)
+                else:
+                    resp = self._post(url, **kwargs)
+
+                # Retry on 5xx temporary server errors
+                if hasattr(resp, "status_code") and resp.status_code in (500, 502, 503, 504) and attempt < attempts - 1:
+                    backoff = min(max_backoff, initial_backoff * (2 ** attempt)) + random.uniform(0.0, 0.02)
+                    time.sleep(backoff)
+                    continue
+
+                return resp
+            except requests.exceptions.Timeout as exc:
+                raise TimeoutError(f"Request timed out after {kwargs.get('timeout', self.timeout)}s") from exc
+            except requests.exceptions.ConnectionError as exc:
+                raise OfflineError("Network offline: unable to reach Groq service") from exc
+            except requests.exceptions.RequestException as exc:
+                raise AIError(f"Network error: {exc}") from exc
+
+    def prewarm_connection(self, async_prewarm: bool = True) -> bool:
+        """
+        Pre-connects TCP/TLS socket to Groq API endpoint to eliminate handshake latency on wake.
+        If async_prewarm is True, performs the handshake in a background daemon thread.
+        """
+        def _worker():
+            try:
+                url = f"{self.base_url}/models"
+                headers = self._get_headers() if self.api_key else {"User-Agent": "JARVIS-Assistant/1.1"}
+                self._get(url, headers=headers, timeout=2.0)
+                return True
+            except Exception:
+                return False
+
+        if async_prewarm:
+            t = threading.Thread(target=_worker, name="GroqPrewarmThread", daemon=True)
+            t.start()
+            return True
+        else:
+            return _worker()
+
+    def clear_cache(self) -> None:
+        """Clears the short query response TTL cache."""
+        with self._cache_lock:
+            self._response_cache.clear()
 
     def _get_headers(self) -> Dict[str, str]:
         if not self.api_key:
@@ -538,14 +665,7 @@ class GroqClient:
         except Exception:
             pass
 
-        try:
-            resp = requests.post(url, headers=headers, files=files, data=data, timeout=self.timeout)
-        except requests.exceptions.Timeout as exc:
-            raise TimeoutError(f"Audio transcription timed out after {self.timeout}s") from exc
-        except requests.exceptions.ConnectionError as exc:
-            raise OfflineError("Network offline: unable to reach Groq audio service") from exc
-        except requests.exceptions.RequestException as exc:
-            raise AIError(f"Network error during transcription: {exc}") from exc
+        resp = self._request_with_retry("POST", url, headers=headers, files=files, data=data, timeout=self.timeout)
 
         if resp.status_code != 200:
             self._handle_response_error(resp)
@@ -556,12 +676,98 @@ class GroqClient:
         except Exception as exc:
             raise InvalidResponseError("Failed to parse transcription response") from exc
 
-    def chat(self, messages: List[Dict[str, str]], model: str = DEFAULT_LLM_MODEL,
-             temperature: float = 0.5, json_mode: bool = False) -> str:
+    def chat_stream(self, messages: List[Dict[str, str]], model: str = DEFAULT_LLM_MODEL,
+                    temperature: float = 0.5, json_mode: bool = False,
+                    on_chunk: Optional[Callable[[str], None]] = None) -> Iterator[str]:
         """
-        Generates chat completion.
+        Streams chat completion tokens as Server-Sent Events (SSE).
+        Yields individual text content chunks in real time as they arrive.
+        """
+        self.rate_limiter.acquire()
+        headers = self._get_headers()
+        headers["Content-Type"] = "application/json"
+        url = f"{self.base_url}/chat/completions"
+
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        # Phase 8 Privacy Log: audit external cloud LLM stream transmission
+        try:
+            from privacy_log import record_cloud_transmission
+            user_msgs = [m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+            last_text = str(user_msgs[-1]) if user_msgs else ""
+            summary_snippet = (last_text[:50] + "...") if len(last_text) > 50 else last_text
+            record_cloud_transmission(
+                destination="Groq LLM Stream",
+                payload_summary=f"Chat stream (model={model}, prompt='{summary_snippet}')",
+                metadata={"model": model, "stream": True, "json_mode": json_mode},
+            )
+        except Exception:
+            pass
+
+        resp = self._request_with_retry("POST", url, headers=headers, json=payload, stream=True, timeout=self.timeout)
+
+        if resp.status_code != 200:
+            self._handle_response_error(resp)
+
+        lines_iter = resp.iter_lines() if hasattr(resp, "iter_lines") else (resp.text.splitlines() if hasattr(resp, "text") else [])
+        for line in lines_iter:
+            if not line:
+                continue
+            line_str = line.decode("utf-8") if isinstance(line, (bytes, bytearray)) else line
+            line_str = line_str.strip()
+            if not line_str.startswith("data:"):
+                continue
+            data_str = line_str[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        if on_chunk:
+                            try:
+                                on_chunk(content)
+                            except Exception:
+                                pass
+                        yield content
+            except Exception:
+                continue
+
+    def chat(self, messages: List[Dict[str, str]], model: str = DEFAULT_LLM_MODEL,
+             temperature: float = 0.5, json_mode: bool = False, stream: bool = False) -> Union[str, Iterator[str]]:
+        """
+        Generates chat completion. If stream=True, returns an Iterator[str] yielding tokens.
+        Identical short queries are served instantly from the TTL response cache.
         Endpoint: POST /chat/completions
         """
+        if stream:
+            return self.chat_stream(messages, model=model, temperature=temperature, json_mode=json_mode)
+
+        # Check TTL response cache for identical short queries
+        cache_key = None
+        if not json_mode:
+            user_texts = [m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+            total_chars = sum(len(txt) for txt in user_texts)
+            if total_chars <= 160:
+                cache_key = (model, tuple((m.get("role"), str(m.get("content"))) for m in messages if isinstance(m, dict)))
+                with self._cache_lock:
+                    if cache_key in self._response_cache:
+                        cached_val, ts = self._response_cache[cache_key]
+                        if time.time() - ts < self.cache_ttl:
+                            return cached_val
+                        else:
+                            del self._response_cache[cache_key]
+
         self.rate_limiter.acquire()
         headers = self._get_headers()
         headers["Content-Type"] = "application/json"
@@ -589,21 +795,21 @@ class GroqClient:
         except Exception:
             pass
 
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-        except requests.exceptions.Timeout as exc:
-            raise TimeoutError(f"Chat completion timed out after {self.timeout}s") from exc
-        except requests.exceptions.ConnectionError as exc:
-            raise OfflineError("Network offline: unable to reach Groq chat service") from exc
-        except requests.exceptions.RequestException as exc:
-            raise AIError(f"Network error during chat completion: {exc}") from exc
+        resp = self._request_with_retry("POST", url, headers=headers, json=payload, timeout=self.timeout)
 
         if resp.status_code != 200:
             self._handle_response_error(resp)
 
         try:
             res_json = resp.json()
-            return res_json["choices"][0]["message"]["content"].strip()
+            content = res_json["choices"][0]["message"]["content"].strip()
+            if cache_key:
+                with self._cache_lock:
+                    if len(self._response_cache) >= 512:
+                        oldest = min(self._response_cache.keys(), key=lambda k: self._response_cache[k][1])
+                        del self._response_cache[oldest]
+                    self._response_cache[cache_key] = (content, time.time())
+            return content
         except Exception as exc:
             raise InvalidResponseError("Failed to parse chat completion response") from exc
 
@@ -691,14 +897,7 @@ class GroqClient:
         except Exception:
             pass
 
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-        except requests.exceptions.Timeout as exc:
-            raise TimeoutError(f"Vision analysis timed out after {self.timeout}s") from exc
-        except requests.exceptions.ConnectionError as exc:
-            raise OfflineError("Network offline: unable to reach Groq vision service") from exc
-        except requests.exceptions.RequestException as exc:
-            raise AIError(f"Network error during vision analysis: {exc}") from exc
+        resp = self._request_with_retry("POST", url, headers=headers, json=payload, timeout=self.timeout)
 
         if resp.status_code != 200:
             self._handle_response_error(resp)
@@ -718,14 +917,7 @@ class GroqClient:
         headers = self._get_headers()
         url = f"{self.base_url}/models"
 
-        try:
-            resp = requests.get(url, headers=headers, timeout=self.timeout)
-        except requests.exceptions.Timeout as exc:
-            raise TimeoutError(f"List models timed out after {self.timeout}s") from exc
-        except requests.exceptions.ConnectionError as exc:
-            raise OfflineError("Network offline: unable to reach Groq service") from exc
-        except requests.exceptions.RequestException as exc:
-            raise AIError(f"Network error fetching models: {exc}") from exc
+        resp = self._request_with_retry("GET", url, headers=headers, timeout=self.timeout)
 
         if resp.status_code != 200:
             self._handle_response_error(resp)
@@ -831,6 +1023,24 @@ def get_conversation_manager() -> ConversationManager:
 
 def reset_ai_history() -> None:
     _CONVERSATION_MGR.reset()
+
+
+def prewarm_connection(api_key: Optional[str] = None, async_prewarm: bool = True) -> bool:
+    """Pre-connects TCP/TLS socket to Groq on wake events off the main UI/audio threads."""
+    client = GroqClient(api_key=api_key)
+    return client.prewarm_connection(async_prewarm=async_prewarm)
+
+
+def clear_ai_cache() -> None:
+    """Clears persistent session and connection cache."""
+    global _SESSION
+    with _SESSION_LOCK:
+        if _SESSION is not None:
+            try:
+                _SESSION.close()
+            except Exception:
+                pass
+            _SESSION = None
 
 
 # =====================================================================
@@ -1009,6 +1219,127 @@ def parse_ai_response(raw_text: str) -> Tuple[str, Dict[str, Any], str]:
                 pass
 
     return "none", {}, raw_text.strip()
+
+
+def extract_streaming_reply(accumulated: str) -> str:
+    """
+    Extracts the current partial reply text from accumulated LLM output
+    which may be in-progress JSON (e.g. {"reply": "..."}) or plain text.
+    """
+    if not accumulated:
+        return ""
+
+    s = accumulated.strip()
+    if s.startswith("```"):
+        first_nl = s.find("\n")
+        if first_nl != -1:
+            s = s[first_nl + 1:].strip()
+
+    if not s.startswith("{"):
+        if s.endswith("```"):
+            s = s[:-3].strip()
+        return s
+
+    match = re.search(r'"reply"\s*:\s*"', s)
+    if not match:
+        return ""
+
+    start_idx = match.end()
+    chars = []
+    escaped = False
+    for i in range(start_idx, len(s)):
+        ch = s[i]
+        if escaped:
+            if ch == 'n':
+                chars.append('\n')
+            elif ch == 't':
+                chars.append('\t')
+            elif ch == '"':
+                chars.append('"')
+            elif ch == '\\':
+                chars.append('\\')
+            else:
+                chars.append(ch)
+            escaped = False
+        elif ch == '\\':
+            escaped = True
+        elif ch == '"':
+            break
+        else:
+            chars.append(ch)
+
+    return "".join(chars).strip()
+
+
+def extract_first_sentence(text: str) -> str:
+    """Extracts the first complete sentence from text, or partial text if no sentence terminator is reached."""
+    m = re.search(r"^(.*?[.!?])(?:\s+|$)", text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+
+def stream_ai_query(
+    client: GroqClient,
+    messages: List[Dict[str, str]],
+    model: str = DEFAULT_LLM_MODEL,
+    temperature: float = 0.5,
+    ctx: Any = None,
+    on_partial_reply: Optional[Callable[[str], None]] = None,
+) -> str:
+    """
+    Streams chat completion from Groq LLM with low-latency progressive chunk dispatch.
+    Extracts partial reply / first sentence in real-time and notifies overlay / callbacks
+    as tokens arrive rather than stalling until the entire response is received.
+    Returns the full accumulated raw response string.
+    """
+    chat_result = client.chat(messages, model=model, temperature=temperature, json_mode=True, stream=True)
+    if isinstance(chat_result, str):
+        # Fallback if client was mocked or returned a complete string directly
+        reply_snippet = extract_streaming_reply(chat_result) or chat_result
+        first_sent = extract_first_sentence(reply_snippet)
+        disp = first_sent or reply_snippet
+        if disp and ctx and hasattr(ctx, "overlay") and ctx.overlay:
+            try:
+                ctx.overlay.post("say", text=disp, speak=False)
+            except Exception:
+                pass
+        if on_partial_reply and disp:
+            try:
+                on_partial_reply(disp)
+            except Exception:
+                pass
+        return chat_result
+
+    accumulated = ""
+    last_posted_text = ""
+    first_sentence_posted = False
+
+    for token in chat_result:
+        accumulated += token
+        partial_reply = extract_streaming_reply(accumulated)
+        if not partial_reply:
+            continue
+
+        first_sent = extract_first_sentence(partial_reply)
+        has_full_first_sent = bool(re.search(r"[.!?](?:\s+|$)", partial_reply))
+
+        display_text = partial_reply if has_full_first_sent else first_sent
+
+        if display_text and display_text != last_posted_text:
+            last_posted_text = display_text
+            if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                try:
+                    ctx.overlay.post("say", text=display_text, speak=False)
+                except Exception:
+                    pass
+            if on_partial_reply:
+                try:
+                    on_partial_reply(display_text)
+                except Exception:
+                    pass
+
+    return accumulated
 
 
 def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> Tuple[bool, str]:

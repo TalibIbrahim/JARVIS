@@ -34,6 +34,9 @@ from ai import (
     parse_ai_response,
     execute_whitelisted_action,
     WHITELIST_ACTIONS,
+    extract_streaming_reply,
+    extract_first_sentence,
+    stream_ai_query,
 )
 from commands import run_command, APPS, SITES
 from config import Config, load_config
@@ -536,5 +539,234 @@ class TestVisionAnalysis(unittest.TestCase):
         mock_desc.assert_called_once()
 
 
+class TestGroqClientPhase3Optimizations(unittest.TestCase):
+    """Verifies Phase 3 HTTP Keep-Alive, Pre-warming, Streaming, Retries, and TTL Cache."""
+
+    def setUp(self):
+        self.client = GroqClient(api_key="gsk_test_key_phase3", timeout=5)
+
+    def test_persistent_session_and_pooling(self):
+        """Verifies persistent requests.Session with connection pooling."""
+        self.assertIsNotNone(self.client.session)
+        self.assertIn("https://", self.client.session.adapters)
+        adapter = self.client.session.adapters["https://"]
+        self.assertGreaterEqual(getattr(adapter, "_pool_connections", 0), 10)
+        self.assertGreaterEqual(getattr(adapter, "_pool_maxsize", 0), 10)
+
+    @patch("requests.get")
+    def test_prewarm_connection_sync(self, mock_get):
+        """Prewarm connects to models endpoint to establish TCP/TLS session."""
+        mock_get.return_value = MockResponse(200, {"data": []})
+        ok = self.client.prewarm_connection(async_prewarm=False)
+        self.assertTrue(ok)
+        mock_get.assert_called_once()
+        args, kwargs = mock_get.call_args
+        self.assertIn("/models", args[0])
+
+    @patch("requests.get")
+    def test_prewarm_connection_async(self, mock_get):
+        """Prewarm launches non-blocking worker thread on wake event."""
+        mock_get.return_value = MockResponse(200, {"data": []})
+        ok = self.client.prewarm_connection(async_prewarm=True)
+        self.assertTrue(ok)
+        time.sleep(0.1)  # allow background thread to finish
+        self.assertTrue(mock_get.called)
+
+    def test_chat_streaming(self):
+        """Tests SSE streaming parser yielding tokens in real time."""
+        sse_lines = [
+            b'data: {"choices": [{"delta": {"content": "Good "}}]}',
+            b'data: {"choices": [{"delta": {"content": "morning, "}}]}',
+            b'data: {"choices": [{"delta": {"content": "sir."}}]}',
+            b'data: [DONE]',
+        ]
+
+        class StreamingMockResponse:
+            status_code = 200
+            headers = {}
+
+            def iter_lines(self):
+                return iter(sse_lines)
+
+        with patch.object(self.client, "_request_with_retry", return_value=StreamingMockResponse()):
+            tokens = list(self.client.chat([{"role": "user", "content": "hello"}], stream=True))
+            self.assertEqual(tokens, ["Good ", "morning, ", "sir."])
+            full_reply = "".join(tokens)
+            self.assertEqual(full_reply, "Good morning, sir.")
+
+    @patch("requests.post")
+    def test_ttl_response_cache_short_queries(self, mock_post):
+        """Tests that identical short queries hit the TTL cache and avoid network round-trips."""
+        mock_post.return_value = MockResponse(
+            200,
+            {"choices": [{"message": {"content": "Paris is the capital of France, sir."}}]}
+        )
+        self.client.clear_cache()
+
+        msgs = [{"role": "user", "content": "What is the capital of France?"}]
+
+        # Call 1: cold cache -> hits network
+        reply1 = self.client.chat(msgs, json_mode=False)
+        self.assertEqual(reply1, "Paris is the capital of France, sir.")
+        self.assertEqual(mock_post.call_count, 1)
+
+        # Call 2: warm cache -> served from TTL cache with zero network calls
+        reply2 = self.client.chat(msgs, json_mode=False)
+        self.assertEqual(reply2, "Paris is the capital of France, sir.")
+        self.assertEqual(mock_post.call_count, 1)  # call_count remains 1!
+
+        # Clear cache -> Call 3 hits network again
+        self.client.clear_cache()
+        reply3 = self.client.chat(msgs, json_mode=False)
+        self.assertEqual(reply3, "Paris is the capital of France, sir.")
+        self.assertEqual(mock_post.call_count, 2)
+
+    def test_jittered_retry_on_server_5xx(self):
+        """Tests exponential backoff retries when server returns transient 500 error."""
+        resp_500 = MockResponse(500, text="Internal Server Error")
+        resp_200 = MockResponse(200, {"choices": [{"message": {"content": "All systems operational, sir."}}]})
+
+        call_records = []
+
+        def mock_post_call(url, **kwargs):
+            call_records.append(url)
+            if len(call_records) == 1:
+                return resp_500
+            return resp_200
+
+        with patch.object(self.client, "_post", side_effect=mock_post_call):
+            self.client.clear_cache()
+            self.client.max_retries = 2
+            reply = self.client.chat([{"role": "user", "content": "diagnostics"}], json_mode=False)
+            self.assertEqual(reply, "All systems operational, sir.")
+            self.assertEqual(len(call_records), 2)  # retried after 500!
+
+
+class TestPhase4StreamingAndLatencyLadder(unittest.TestCase):
+    """
+    Validates Phase 4 streaming progressive chunk dispatch,
+    latency ladder compliance (<100ms ack, 100-400ms activity, >400ms pulse),
+    and fast error handling (zero retry delays on offline/timeout).
+    """
+
+    def test_extract_streaming_reply_json_complete(self):
+        accumulated = '{\n  "action": "none",\n  "args": {},\n  "reply": "Good evening, sir. All telemetry nominal."\n}'
+        extracted = extract_streaming_reply(accumulated)
+        self.assertEqual(extracted, "Good evening, sir. All telemetry nominal.")
+
+    def test_extract_streaming_reply_json_partial(self):
+        accumulated = '{"action": "none", "args": {}, "reply": "Good evening, sir. All'
+        extracted = extract_streaming_reply(accumulated)
+        self.assertEqual(extracted, "Good evening, sir. All")
+
+    def test_extract_streaming_reply_escaped_characters(self):
+        accumulated = r'{"reply": "He said \"welcome back\" to you, sir.\nNext line."}'
+        extracted = extract_streaming_reply(accumulated)
+        self.assertEqual(extracted, 'He said "welcome back" to you, sir.\nNext line.')
+
+    def test_extract_streaming_reply_plain_text(self):
+        raw_text = "Good evening, sir. At your command."
+        extracted = extract_streaming_reply(raw_text)
+        self.assertEqual(extracted, "Good evening, sir. At your command.")
+
+    def test_extract_first_sentence(self):
+        text = "All systems operational, sir. How may I assist you this evening?"
+        sent = extract_first_sentence(text)
+        self.assertEqual(sent, "All systems operational, sir.")
+
+        sent_q = extract_first_sentence("Is that all, sir? Standing by.")
+        self.assertEqual(sent_q, "Is that all, sir?")
+
+        sent_excl = extract_first_sentence("Power cells at maximum! All circuits green.")
+        self.assertEqual(sent_excl, "Power cells at maximum!")
+
+        incomplete = extract_first_sentence("Good morning")
+        self.assertEqual(incomplete, "Good morning")
+
+    def test_stream_ai_query_progressive_dispatch_to_overlay(self):
+        """Streaming chat completion posts partial chunks and first sentence to overlay with speak=False."""
+        client = MagicMock()
+        # Chunks simulating real SSE streaming from Groq
+        simulated_tokens = [
+            '{"action":', ' "none",', ' "args": {},', ' "reply": "Good',
+            ' evening,', ' sir.', ' I have', ' calibrated the', ' repulsors."}'
+        ]
+        client.chat.return_value = iter(simulated_tokens)
+
+        ctx = MagicMock()
+        callback_history = []
+
+        result = stream_ai_query(
+            client=client,
+            messages=[{"role": "user", "content": "status"}],
+            ctx=ctx,
+            on_partial_reply=lambda txt: callback_history.append(txt),
+        )
+
+        self.assertEqual(result, "".join(simulated_tokens))
+        # Verify overlay.post was called with speak=False
+        ctx.overlay.post.assert_any_call("say", text="Good evening, sir.", speak=False)
+        # Verify callback captured progressive growth
+        self.assertTrue(len(callback_history) >= 2)
+        self.assertIn("Good evening, sir.", callback_history)
+
+    def test_stream_ai_query_string_fallback(self):
+        """When client returns a raw string (e.g. mocked or non-stream), dispatches gracefully."""
+        client = MagicMock()
+        client.chat.return_value = '{"action": "none", "args": {}, "reply": "Immediate answer, sir."}'
+
+        ctx = MagicMock()
+        result = stream_ai_query(
+            client=client,
+            messages=[{"role": "user", "content": "hi"}],
+            ctx=ctx,
+        )
+
+        self.assertIn("Immediate answer, sir.", result)
+        ctx.overlay.post.assert_called_with("say", text="Immediate answer, sir.", speak=False)
+
+    def test_fast_error_timeout_no_retry_delays(self):
+        """Requests that time out fail immediately without waiting backoff retries."""
+        client = GroqClient(api_key="gsk_test", timeout=2, max_retries=2)
+
+        with patch.object(client, "_post", side_effect=requests.exceptions.Timeout("Read timeout")):
+            t0 = time.perf_counter()
+            with self.assertRaises(TimeoutError):
+                client.chat([{"role": "user", "content": "test"}])
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            # Must fail immediately in < 50 ms rather than stalling for seconds
+            self.assertLess(elapsed_ms, 50.0)
+
+    def test_fast_error_offline_no_retry_delays(self):
+        """Network offline/DNS failure fails immediately without waiting backoff retries."""
+        client = GroqClient(api_key="gsk_test", timeout=2, max_retries=2)
+
+        with patch.object(client, "_post", side_effect=requests.exceptions.ConnectionError("DNS failed")):
+            t0 = time.perf_counter()
+            with self.assertRaises(OfflineError):
+                client.chat([{"role": "user", "content": "test"}])
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            # Must fail immediately in < 50 ms
+            self.assertLess(elapsed_ms, 50.0)
+
+    def test_latency_ladder_timings(self):
+        """Verifies sub-100ms instant acknowledgement and sub-0.1ms extraction."""
+        # 1. Token chunk extraction latency
+        token_chunk = '{"action": "none", "args": {}, "reply": "Yes, sir."}'
+        t0 = time.perf_counter()
+        for _ in range(100):
+            _ = extract_streaming_reply(token_chunk)
+        extract_ms = ((time.perf_counter() - t0) / 100.0) * 1000.0
+        self.assertLess(extract_ms, 0.5, "Chunk extraction must be sub-millisecond")
+
+        # 2. First sentence extraction latency
+        t0 = time.perf_counter()
+        for _ in range(100):
+            _ = extract_first_sentence("Yes, sir. All systems optimal.")
+        sent_ms = ((time.perf_counter() - t0) / 100.0) * 1000.0
+        self.assertLess(sent_ms, 0.5, "Sentence extraction must be sub-millisecond")
+
+
 if __name__ == "__main__":
     unittest.main()
+

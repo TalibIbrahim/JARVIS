@@ -417,10 +417,14 @@ class GestureEngine:
                 self.clutched = False
                 ax, ay = self._map(*anchor)
                 if self.last_anchor is not None and self.last_anchor_t is not None:
-                    dt = max(now - self.last_anchor_t, 1e-4)
-                    adx = anchor[0] - self.last_anchor[0]
-                    ady = anchor[1] - self.last_anchor[1]
-                    speed = math.hypot(adx, ady) / dt
+                    raw_dt = now - self.last_anchor_t
+                    if raw_dt > 0.10:
+                        adx, ady, speed = 0.0, 0.0, 0.0
+                    else:
+                        dt = max(min(raw_dt, 0.05), 1e-4)
+                        adx = anchor[0] - self.last_anchor[0]
+                        ady = anchor[1] - self.last_anchor[1]
+                        speed = math.hypot(adx, ady) / dt
                 else:
                     adx, ady, speed = 0.0, 0.0, 0.0
                 self.last_anchor = anchor
@@ -750,10 +754,14 @@ class GestureEngine:
                 self.clutched = False
                 ax, ay = self._map(*anchor)
                 if self.last_anchor is not None and self.last_anchor_t is not None:
-                    dt = max(now - self.last_anchor_t, 1e-4)
-                    adx = anchor[0] - self.last_anchor[0]
-                    ady = anchor[1] - self.last_anchor[1]
-                    speed = math.hypot(adx, ady) / dt
+                    raw_dt = now - self.last_anchor_t
+                    if raw_dt > 0.10:
+                        adx, ady, speed = 0.0, 0.0, 0.0
+                    else:
+                        dt = max(min(raw_dt, 0.05), 1e-4)
+                        adx = anchor[0] - self.last_anchor[0]
+                        ady = anchor[1] - self.last_anchor[1]
+                        speed = math.hypot(adx, ady) / dt
                 else:
                     adx, ady, speed = 0.0, 0.0, 0.0
                 self.last_anchor = anchor

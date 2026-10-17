@@ -7,6 +7,7 @@ Unit tests for the new features:
 import unittest
 from unittest.mock import MagicMock, patch
 import time
+import numpy as np
 
 from config import Config
 from gestures import GestureEngine, Hand, Pose
@@ -119,6 +120,124 @@ class TestWakeWordSiriExpansion(unittest.TestCase):
         # Target spring dimensions must be 380 x 52
         self.assertEqual(island.spring_w.target, 380.0)
         self.assertEqual(island.spring_h.target, 52.0)
+
+
+class TestPhase5ReliabilityAndRecovery(unittest.TestCase):
+    """Verifies camera hotplug backoff, mic stream recovery, and sleep dt clamping/failsafes."""
+
+    def test_camera_hotplug_reconnect_backoff_loop(self):
+        """FrameGrabber enters reconnect_loop on read failure and re-initializes on replug."""
+        from tracker import FrameGrabber
+        import threading
+        cfg = Config(camera_index=0)
+        stop = threading.Event()
+        grabber = FrameGrabber(cfg, stop)
+
+        mock_bad_cap = MagicMock()
+        mock_bad_cap.isOpened.return_value = False
+
+        mock_good_cap = MagicMock()
+        mock_good_cap.isOpened.return_value = True
+        fake_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        mock_good_cap.read.return_value = (True, fake_frame)
+        mock_good_cap.get.side_effect = lambda prop: 1280 if prop == 3 else 720
+
+        # Simulate 1 failure then success
+        caps = [mock_bad_cap, mock_good_cap]
+        def cap_factory(*args, **kwargs):
+            return caps.pop(0) if caps else mock_good_cap
+
+        with patch("tracker.cv2.VideoCapture", side_effect=cap_factory), \
+             patch("tracker.time.sleep", return_value=None), \
+             patch.object(stop, "wait", return_value=False):
+            recovered = grabber.reconnect_loop()
+            self.assertTrue(recovered)
+            self.assertTrue(grabber.opened)
+            self.assertEqual(grabber.failures, 0)
+            grabber.release()
+
+    def test_microphone_stream_error_recovery(self):
+        """WakeWordDetector cleans up broken stream, probes working mic, and recovers stream."""
+        import voice
+        from voice import WakeWordDetector
+        import threading
+
+        cfg = Config()
+        stop = threading.Event()
+        detector = WakeWordDetector(cfg=cfg, stop_event=stop)
+
+        mock_pyaudio = MagicMock()
+        mock_stream = MagicMock()
+        fake_audio = np.zeros(1280, dtype=np.int16).tobytes()
+        mock_stream.read.return_value = fake_audio
+        mock_pyaudio.open.return_value = mock_stream
+
+        with patch.object(voice, "get_shared_pyaudio", return_value=mock_pyaudio), \
+             patch.object(voice, "reset_shared_pyaudio"), \
+             patch.object(voice, "find_best_microphone", return_value=(2, "USB Audio Device")), \
+             patch.object(stop, "wait", return_value=False):
+            rec_stream = detector.reconnect_stream()
+            self.assertIsNotNone(rec_stream)
+            self.assertEqual(detector.device_index, 2)
+            self.assertEqual(voice.Voice.current_mic_index, 2)
+            self.assertEqual(voice.Voice.current_mic_name, "USB Audio Device")
+
+    def test_controller_sleep_dt_clamping_and_failsafe_release(self):
+        """Controller clamps dt, detects sleep gap (>0.10s), and unconditionally releases inputs."""
+        from controller import Controller
+        from gestures import Action
+        cfg = Config(tracking_mode="relative")
+        ctrl = Controller(cfg)
+
+        with patch("controller.pyautogui.mouseUp") as mock_mouse_up, \
+             patch("controller.pyautogui.keyUp") as mock_key_up:
+
+            # 1. Simulate active dragging
+            ctrl.button_down = True
+            ctrl.ctrl_down = True
+            ctrl.dragging = True
+
+            # 2. Trigger unconditional failsafe release
+            ctrl.failsafe_release()
+            mock_mouse_up.assert_called_with(_pause=False)
+            mock_key_up.assert_called_with("ctrl", _pause=False)
+            self.assertFalse(ctrl.button_down)
+            self.assertFalse(ctrl.ctrl_down)
+            self.assertFalse(ctrl.dragging)
+
+            # 3. Test sleep gap > 0.10s in relative mode
+            mock_mouse_up.reset_mock()
+            mock_key_up.reset_mock()
+            ctrl.cur_x, ctrl.cur_y = 500.0, 500.0
+            ctrl.target_x, ctrl.target_y = 500.0, 500.0
+            ctrl.last_landmark_x = 0.5
+            ctrl.last_landmark_y = 0.5
+            ctrl.last_move_t = 100.0  # long ago (e.g. sleep)
+
+            with patch("controller.time.perf_counter", return_value=105.0):  # 5s sleep gap
+                act = Action("move", x=0.6, y=0.6)
+                ctrl.handle(act)
+                # Must have triggered failsafe release and NOT jumped cursor
+                mock_mouse_up.assert_called_with(_pause=False)
+                mock_key_up.assert_called_with("ctrl", _pause=False)
+                self.assertEqual(ctrl.target_x, 500.0)
+                self.assertEqual(ctrl.target_y, 500.0)
+
+            # 4. Test lost / sleep action triggers failsafe release
+            mock_mouse_up.reset_mock()
+            mock_key_up.reset_mock()
+            ctrl.handle(Action("lost"))
+            mock_mouse_up.assert_called_with(_pause=False)
+            mock_key_up.assert_called_with("ctrl", _pause=False)
+
+            # 5. Test on_sleep and on_resume hooks
+            mock_mouse_up.reset_mock()
+            mock_key_up.reset_mock()
+            ctrl.on_sleep()
+            mock_mouse_up.assert_called_with(_pause=False)
+            mock_key_up.assert_called_with("ctrl", _pause=False)
+
+        ctrl.shutdown()
 
 
 if __name__ == "__main__":

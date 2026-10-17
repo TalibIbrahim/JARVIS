@@ -36,8 +36,11 @@ GA_ROOT = 2
 WM_CLOSE = 0x0010
 
 
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+if wintypes and hasattr(wintypes, "POINT"):
+    POINT = wintypes.POINT
+else:
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
 class Win32APIProtocol(Protocol):

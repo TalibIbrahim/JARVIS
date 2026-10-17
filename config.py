@@ -1,6 +1,7 @@
 """Tunable settings. Override any value by creating jarvis_config.json next to main.py."""
 import json
 import os
+import shutil
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
@@ -116,6 +117,10 @@ class Config:
     glass_blur: bool = True             # Windows 11 Acrylic / Windows 10 blur behind
     reduce_motion: bool = False         # reduce UI animations
     show_skeleton_mini: bool = True     # mini skeleton preview inside dynamic island
+    ui_status_line_enabled: bool = True  # Subtle status line below thinking glyph for extended operations
+    ui_cancel_hint_enabled: bool = True  # Cancellation hint after 3.0s continuous listening/thinking
+    ui_progressive_shimmer_enabled: bool = True  # Shimmer highlight across streaming tokens
+    show_health_panel: bool = True      # Diagnostic health card in Settings About tab
 
     # --- dynamic island & widgets ---
     idle_display: str = "time_weather"  # "off", "time", "time_weather"
@@ -206,24 +211,161 @@ def get_config_path(explicit_path=None):
     return local_path
 
 
-def load_config(path=None):
-    cfg = Config()
-    path = get_config_path(path)
-    if os.path.exists(path):
+def _atomic_write_json(file_path: str, data: dict) -> bool:
+    """
+    Atomically writes data to JSON file:
+    1. Writes to file_path.tmp
+    2. Calls flush() and os.fsync()
+    3. Keeps backup in file_path.bak
+    4. Atomically replaces file_path using os.replace()
+    """
+    try:
+        dir_name = os.path.dirname(os.path.abspath(file_path))
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        tmp_path = f"{file_path}.tmp"
+        bak_path = f"{file_path}.bak"
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            try:
+                shutil.copy2(file_path, bak_path)
+            except Exception:
+                pass
+
+        os.replace(tmp_path, file_path)
+        return True
+    except Exception as exc:
+        print(f"[config] atomic write error for {file_path}: {exc}")
+        return False
+
+
+def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
+    """Safely coerces or falls back to default if value is wrong type."""
+    if value is None:
+        return default_val if default_val is not None else None
+
+    if isinstance(default_val, bool):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            if value.lower() in ("true", "1", "yes", "on"):
+                return True
+            if value.lower() in ("false", "0", "no", "off"):
+                return False
+        return default_val
+
+    if isinstance(default_val, int) and not isinstance(default_val, bool):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            return int(float(value))
+        except (ValueError, TypeError):
+            return default_val
+
+    if isinstance(default_val, float):
+        if isinstance(value, (float, int)) and not isinstance(value, bool):
+            return float(value)
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default_val
+
+    if isinstance(default_val, str):
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    if isinstance(default_val, list):
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return default_val
+
+    if isinstance(default_val, dict):
+        if isinstance(value, dict):
+            return dict(value)
+        return default_val
+
+    return value
+
+
+def load_config(path=None):
+    """
+    Loads configuration from JSON file.
+    Validates JSON integrity, enforces strict type safety with safe defaults,
+    and automatically repairs file or recovers from .bak backup.
+    """
+    cfg = Config()
+    config_path = get_config_path(path)
+    bak_path = f"{config_path}.bak"
+    data = None
+    needs_repair = False
+
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            known = {f.name for f in fields(Config)}
-            for key, value in data.items():
-                if key in known:
-                    setattr(cfg, key, value)
-        except Exception as exc:  # bad JSON should never stop the app from starting
-            print(f"[config] ignoring {path}: {exc}")
+            if not isinstance(data, dict):
+                needs_repair = True
+                data = None
+        except Exception as exc:
+            needs_repair = True
+            print(f"[config] corrupted config at {config_path}: {exc}. Attempting recovery from backup...")
+            if os.path.exists(bak_path):
+                try:
+                    with open(bak_path, "r", encoding="utf-8") as f_bak:
+                        data = json.load(f_bak)
+                    if isinstance(data, dict):
+                        print(f"[config] successfully restored config from {bak_path}")
+                        _atomic_write_json(config_path, data)
+                        needs_repair = False
+                    else:
+                        data = None
+                except Exception as bak_exc:
+                    print(f"[config] backup at {bak_path} also corrupted: {bak_exc}")
+                    data = None
+            else:
+                print(f"[config] no backup found at {bak_path}, falling back to defaults")
+    elif os.path.exists(bak_path):
+        try:
+            with open(bak_path, "r", encoding="utf-8") as f_bak:
+                data = json.load(f_bak)
+            if isinstance(data, dict):
+                _atomic_write_json(config_path, data)
+            else:
+                data = None
+                needs_repair = True
+        except Exception:
+            needs_repair = True
+
+    type_repaired = False
+    if isinstance(data, dict):
+        field_map = {f.name: f for f in fields(Config)}
+        for key, value in data.items():
+            if key in field_map:
+                default_val = getattr(cfg, key)
+                coerced = _coerce_field_value(key, value, default_val)
+                if coerced != value:
+                    type_repaired = True
+                setattr(cfg, key, coerced)
+    else:
+        needs_repair = True
+
+    if needs_repair or type_repaired:
+        try:
+            save_config(cfg, path=config_path)
+        except Exception:
+            pass
+
     return cfg
 
 
 def save_config(cfg: Config, path=None) -> bool:
-    """Persists current Config fields to jarvis_config.json."""
+    """Persists current Config fields to jarvis_config.json atomically."""
     config_path = get_config_path(path)
     try:
         existing = {}
@@ -233,20 +375,20 @@ def save_config(cfg: Config, path=None) -> bool:
                     existing = json.load(f)
             except Exception:
                 existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
         for f in fields(Config):
             val = getattr(cfg, f.name)
             if isinstance(val, (str, int, float, bool, list, dict)) or val is None:
                 existing[f.name] = val
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=4)
-        return True
+        return _atomic_write_json(config_path, existing)
     except Exception as exc:
         print(f"[config] save error: {exc}")
         return False
 
 
 def remember_folder_alias(alias: str, folder_path: str, cfg: Optional[Config] = None, config_path: Optional[str] = None) -> bool:
-    """Persists a spoken alias -> folder path mapping in config."""
+    """Persists a spoken alias -> folder path mapping in config atomically."""
     clean_alias = str(alias).strip().lower()
     abs_path = os.path.abspath(folder_path)
     if cfg is not None:
@@ -266,9 +408,7 @@ def remember_folder_alias(alias: str, folder_path: str, cfg: Optional[Config] = 
         if "folders_whitelist" not in data or not isinstance(data["folders_whitelist"], dict):
             data["folders_whitelist"] = {}
         data["folders_whitelist"][clean_alias] = abs_path
-        with open(target_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-        return True
+        return _atomic_write_json(target_path, data)
     except Exception as exc:
         print(f"[config] remember_folder_alias error: {exc}")
         return False

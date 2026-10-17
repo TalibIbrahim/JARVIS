@@ -18,6 +18,7 @@ from ai import (
     build_system_prompt,
     parse_ai_response,
     execute_whitelisted_action,
+    stream_ai_query,
     AuthenticationError,
     RateLimitError,
     OfflineError,
@@ -1154,7 +1155,13 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
         system_prompt = build_system_prompt(ctx)
         messages = conv_mgr.get_messages(system_prompt, user_text)
 
-        raw_reply = client.chat(messages, model=model, temperature=0.5, json_mode=True)
+        raw_reply = stream_ai_query(
+            client=client,
+            messages=messages,
+            model=model,
+            temperature=0.5,
+            ctx=ctx,
+        )
         action, args, reply = parse_ai_response(raw_reply)
 
         if action and action != "none":
@@ -1179,10 +1186,11 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
             except Exception:
                 pass
         return "Groq rate limit reached, sir. Please stand by a moment."
-    except (OfflineError, TimeoutError):
+    except (OfflineError, TimeoutError) as exc:
+        err_msg = "Request Timed Out" if isinstance(exc, TimeoutError) else "Groq Offline"
         if ctx and hasattr(ctx, "overlay") and ctx.overlay:
             try:
-                ctx.overlay.post("ai_error", text="Groq Offline")
+                ctx.overlay.post("ai_error", text=err_msg)
             except Exception:
                 pass
         return "I am unable to reach the AI service right now, sir."

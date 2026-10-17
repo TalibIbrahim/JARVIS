@@ -122,7 +122,7 @@ def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstanc
 
 
 def main():
-    if "-h" in sys.argv or "--help" in sys.argv or "--island-demo" in sys.argv:
+    if any(arg in sys.argv for arg in ("-h", "--help", "--island-demo", "--perf-report", "--self-test")):
         pass
     elif not acquire_single_instance_lock():
         sys.exit(0)
@@ -135,7 +135,19 @@ def main():
     parser.add_argument("--diagnose", action="store_true", help="run diagnostic jitter, latency, and precision measurement")
     parser.add_argument("--test-mic", action="store_true", help="test microphone input levels and speech recognition")
     parser.add_argument("--island-demo", action="store_true", help="run Dynamic Island demo mode without requiring camera/gestures")
+    parser.add_argument("--perf-report", action="store_true", help="print latency budget performance report and exit")
+    parser.add_argument("--self-test", action="store_true", help="run hardware, models, and network self-test diagnostic")
     args = parser.parse_args()
+
+    if args.perf_report:
+        from perf import print_perf_report
+        code = 0 if print_perf_report() else 1
+        sys.exit(code)
+
+    if args.self_test:
+        from self_test import run_self_test
+        code = run_self_test()
+        sys.exit(code)
 
     if args.diagnose:
         from diagnose import run_diagnose
@@ -202,17 +214,57 @@ def main():
     ctx = Context(engine, overlay, speaker, stop)
     overlay.ctx = ctx
 
+    try:
+        import system_control
+        system_control.get_system_control().set_overlay(overlay)
+    except Exception:
+        pass
+
+    from thread_supervisor import ThreadSupervisor, explain_graceful_degradation
+    supervisor = ThreadSupervisor(stop_event=stop)
+    ctx.supervisor = supervisor
+
     from updater import AutoUpdater
     updater = AutoUpdater(ctx=ctx, overlay=overlay, auto_check=cfg.auto_update_check)
     ctx.updater = updater
     overlay.updater = updater
-    updater.start_periodic_check(interval_hours=4)
+    supervisor.register(
+        name="AutoUpdater",
+        factory=lambda: updater.start_periodic_check(interval_hours=4),
+        max_restarts=3,
+        backoff_base=2.0,
+    )
+    supervisor.start("AutoUpdater")
 
-    tracker = Tracker(cfg, engine, controller, overlay, ctx, stop)
-    ctx.tracker = tracker
-    tracker.start()
+    def _make_tracker():
+        t = Tracker(cfg, engine, controller, overlay, ctx, stop)
+        ctx.tracker = t
+        return t
+
+    def _on_tracker_error(name, exc):
+        explain_graceful_degradation("camera", overlay=overlay, speaker=speaker)
+
+    supervisor.register(
+        name="Tracker",
+        factory=_make_tracker,
+        max_restarts=5,
+        backoff_base=1.0,
+        on_error=_on_tracker_error,
+    )
+    supervisor.start("Tracker")
+
     if cfg.voice_enabled:
-        Voice(cfg, ctx, stop).start()
+        def _on_voice_error(name, exc):
+            explain_graceful_degradation("voice", overlay=overlay, speaker=speaker)
+
+        supervisor.register(
+            name="Voice",
+            factory=lambda: Voice(cfg, ctx, stop),
+            max_restarts=5,
+            backoff_base=1.0,
+            on_error=_on_voice_error,
+        )
+        supervisor.start("Voice")
 
     # Global hotkeys: Ctrl+Alt+J toggles wake/standby, Ctrl+Alt+Q quits.
     try:
@@ -236,9 +288,9 @@ def main():
         pass
     finally:
         stop.set()
+        supervisor.stop(timeout=2)
         controller.shutdown()
         speaker.q.put(None)
-        tracker.join(timeout=2)
         if _INSTANCE_MUTEX and sys.platform == "win32":
             try:
                 ctypes.windll.kernel32.CloseHandle(_INSTANCE_MUTEX)

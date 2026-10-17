@@ -145,6 +145,18 @@ def get_shared_pyaudio():
         return _SHARED_PYAUDIO
 
 
+def reset_shared_pyaudio():
+    """Terminates and resets the shared PyAudio instance to detect hotplugged devices."""
+    global _SHARED_PYAUDIO
+    with _PORTAUDIO_LOCK:
+        if _SHARED_PYAUDIO is not None:
+            try:
+                _SHARED_PYAUDIO.terminate()
+            except Exception:
+                pass
+            _SHARED_PYAUDIO = None
+
+
 def list_microphones(probe_rms=False):
     """
     Enumerates all system audio input devices safely using the shared PyAudio instance.
@@ -206,7 +218,7 @@ def list_microphones(probe_rms=False):
     return mics
 
 
-def find_best_microphone(cfg=None):
+def find_best_microphone(cfg=None, probe_working=False):
     """
     Finds the most suitable microphone device index and name.
     1. If cfg.mic_device_index is explicitly specified, verifies and uses it.
@@ -214,7 +226,7 @@ def find_best_microphone(cfg=None):
        and selecting the physical microphone with active audio signal.
     """
     cfg_idx = getattr(cfg, "mic_device_index", None) if cfg else None
-    mics = list_microphones(probe_rms=False)
+    mics = list_microphones(probe_rms=probe_working)
     if not mics:
         return None, "Default System Microphone"
 
@@ -290,6 +302,12 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
             input_device_index=dev_idx,
             frames_per_buffer=chunk_samples
         )
+    except Exception:
+        return 0.0, 0.0
+    finally:
+        _PORTAUDIO_LOCK.release()
+
+    try:
         data = stream.read(chunk_samples, exception_on_overflow=False)
         arr = np.frombuffer(data, dtype=np.int16)
         rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
@@ -300,11 +318,11 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
     finally:
         if stream is not None:
             try:
-                stream.stop_stream()
-                stream.close()
+                with _PORTAUDIO_LOCK:
+                    stream.stop_stream()
+                    stream.close()
             except Exception:
                 pass
-        _PORTAUDIO_LOCK.release()
 
 
 def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
@@ -398,6 +416,161 @@ def ensure_piper_model(model_path, config_path):
         return False
 
 
+_SHARED_PIPER_VOICE = None
+_SHARED_PIPER_LOCK = threading.RLock()
+_SHARED_PIPER_PATH = None
+_AUDIO_PHRASE_CACHE = {}
+_CACHED_OUTPUT_SR = None
+
+PRE_RENDERED_PHRASES = [
+    "Yes, sir.",
+    "At your service.",
+    "Online and ready.",
+    "Done.",
+    "Muted.",
+    "Unmuted.",
+    "Right away, sir.",
+    "Yes, sir?",
+]
+
+
+def _normalize_phrase_key(text: str) -> str:
+    """Normalizes text for phrase cache lookup (lowercase, stripped punctuation)."""
+    return re.sub(r"[^\w\s]", "", text).strip().lower()
+
+
+def _get_output_sample_rate(default: int = 44100) -> int:
+    """Safely queries hardware output sample rate holding _PORTAUDIO_LOCK during device query."""
+    global _CACHED_OUTPUT_SR
+    if _CACHED_OUTPUT_SR is not None:
+        return _CACHED_OUTPUT_SR
+    try:
+        import sounddevice as sd
+        with _PORTAUDIO_LOCK:
+            out_dev = sd.query_devices(kind="output")
+        dev_sr = int(out_dev.get("default_samplerate", default))
+        if dev_sr > 0:
+            _CACHED_OUTPUT_SR = dev_sr
+            return dev_sr
+    except Exception:
+        pass
+    _CACHED_OUTPUT_SR = default
+    return default
+
+
+def split_into_sentences(text: str) -> list[str]:
+    """
+    Splits text into sentences based on punctuation [.!?].
+    Preserves punctuation and filters out empty chunks.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    return parts if parts else [text]
+
+
+def _synthesize_sentence_audio(voice, text_sentence: str, target_sr: int = None) -> tuple:
+    """
+    Synthesizes a single sentence or phrase using PiperVoice, applying:
+    1. 5ms micro-fade to eliminate DC offsets and inter-chunk boundary clicks.
+    2. 60ms natural pause between sentences.
+    3. 0.88x headroom scaling (clipped [-0.95, 0.95]) to eliminate inter-sample clipping crackle.
+    4. Resampling to output device native sample rate (polyphase filter / linear fallback).
+    Returns (audio_float_array, target_sr).
+    """
+    if voice is None or not text_sentence.strip():
+        return np.array([], dtype=np.float32), (target_sr or 44100)
+
+    with _SHARED_PIPER_LOCK:
+        chunks = list(voice.synthesize(text_sentence))
+
+    if not chunks:
+        return np.array([], dtype=np.float32), (target_sr or 44100)
+
+    raw_sr = chunks[0].sample_rate
+
+    # 1. Clean DC offsets and prevent inter-chunk boundary clicks
+    fade_len = int(raw_sr * 0.005)  # 5ms micro-fade
+    silence = np.zeros(int(raw_sr * 0.06), dtype=np.float32)  # 60ms natural pause between sentences
+    processed_chunks = []
+    for c in chunks:
+        arr = c.audio_float_array.copy()
+        if len(arr) > fade_len * 2:
+            ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+            arr[:fade_len] *= ramp
+            arr[-fade_len:] *= ramp[::-1]
+        processed_chunks.append(arr)
+        processed_chunks.append(silence)
+
+    audio = np.concatenate(processed_chunks)
+
+    # 2. Headroom scaling: Prevent digital inter-sample clipping on DAC / Windows mixer
+    # 0.88x provides ~1.2 dB of headroom.
+    audio = np.clip(audio * 0.88, -0.95, 0.95).astype(np.float32)
+
+    # 3. Resample to hardware output device's native sample rate
+    if target_sr is None:
+        target_sr = _get_output_sample_rate(default=raw_sr)
+
+    if raw_sr != target_sr:
+        try:
+            import scipy.signal as signal
+            audio = signal.resample_poly(audio, up=target_sr, down=raw_sr).astype(np.float32)
+        except Exception:
+            old_indices = np.linspace(0, len(audio) - 1, len(audio))
+            new_len = int(len(audio) * target_sr / raw_sr)
+            new_indices = np.linspace(0, len(audio) - 1, new_len)
+            audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
+
+    return audio, target_sr
+
+
+def _warm_piper_cache(voice):
+    """Pre-renders frequent short phrases in memory so playback begins in < 1 ms."""
+    global _AUDIO_PHRASE_CACHE
+    if voice is None:
+        return
+    for phrase in PRE_RENDERED_PHRASES:
+        key = _normalize_phrase_key(phrase)
+        if key not in _AUDIO_PHRASE_CACHE:
+            try:
+                audio, sr = _synthesize_sentence_audio(voice, phrase)
+                if len(audio) > 0:
+                    _AUDIO_PHRASE_CACHE[key] = (audio, sr)
+                    _AUDIO_PHRASE_CACHE[phrase.strip().lower()] = (audio, sr)
+            except Exception as exc:
+                print(f"[voice] Failed to pre-render phrase '{phrase}': {exc}")
+
+
+def get_shared_piper(model_path: str, config_path: str):
+    """
+    Returns the warm, process-wide PiperVoice instance.
+    Loaded once and held in memory across all Speaker instances.
+    """
+    global _SHARED_PIPER_VOICE, _SHARED_PIPER_PATH
+    with _SHARED_PIPER_LOCK:
+        if _SHARED_PIPER_VOICE is not None and (_SHARED_PIPER_PATH == model_path or _SHARED_PIPER_PATH is None):
+            return _SHARED_PIPER_VOICE
+
+        if not (os.path.exists(model_path) and os.path.exists(config_path)):
+            ensure_piper_model(model_path, config_path)
+
+        if os.path.exists(model_path) and os.path.exists(config_path):
+            try:
+                from piper import PiperVoice
+                print(f"[voice] Loading Paul Bettany J.A.R.V.I.S. neural voice ({os.path.basename(model_path)})...")
+                voice = PiperVoice.load(model_path, config_path=config_path)
+                _SHARED_PIPER_VOICE = voice
+                _SHARED_PIPER_PATH = model_path
+                print("[voice] Paul Bettany voice model loaded.")
+                _warm_piper_cache(voice)
+                return voice
+            except Exception as e:
+                print(f"[voice] PiperVoice initialization failed: {e}")
+        return None
+
+
 class Speaker(threading.Thread):
     """
     Synthesizes and plays spoken feedback for J.A.R.V.I.S.
@@ -472,23 +645,10 @@ class Speaker(threading.Thread):
 
     def _init_piper(self):
         model_path, config_path = self._get_piper_paths()
-        if self._piper_voice is not None and getattr(self, "_loaded_model_path", None) == model_path:
-            return self._piper_voice
-
-        if not (os.path.exists(model_path) and os.path.exists(config_path)):
-            ensure_piper_model(model_path, config_path)
-        if os.path.exists(model_path) and os.path.exists(config_path):
-            try:
-                from piper import PiperVoice
-                print(f"[voice] Loading Paul Bettany J.A.R.V.I.S. neural voice ({os.path.basename(model_path)})...")
-                voice = PiperVoice.load(model_path, config_path=config_path)
-                self._piper_voice = voice
-                self._loaded_model_path = model_path
-                print("[voice] Paul Bettany voice model loaded.")
-                return voice
-            except Exception as e:
-                print(f"[voice] PiperVoice initialization failed: {e}")
-        return None
+        voice = get_shared_piper(model_path, config_path)
+        self._piper_voice = voice
+        self._loaded_model_path = model_path
+        return voice
 
     def _say_piper(self, text):
         voice = self._init_piper()
@@ -498,64 +658,76 @@ class Speaker(threading.Thread):
 
         self.is_speaking = True
         Voice.is_speaking = True
+        stop_synth = threading.Event()
         try:
             import sounddevice as sd
-            chunks = list(voice.synthesize(text))
-            if not chunks:
+
+            sentences = split_into_sentences(text)
+            if not sentences:
                 return
-            raw_sr = chunks[0].sample_rate
 
-            # 1. Clean DC offsets and prevent inter-chunk boundary clicks
-            fade_len = int(raw_sr * 0.005)  # 5ms micro-fade
-            silence = np.zeros(int(raw_sr * 0.06), dtype=np.float32)  # 60ms natural pause between sentences
-            processed_chunks = []
-            for c in chunks:
-                arr = c.audio_float_array.copy()
-                if len(arr) > fade_len * 2:
-                    ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-                    arr[:fade_len] *= ramp
-                    arr[-fade_len:] *= ramp[::-1]
-                processed_chunks.append(arr)
-                processed_chunks.append(silence)
+            def get_sentence_audio(sentence: str):
+                key = _normalize_phrase_key(sentence)
+                cached = _AUDIO_PHRASE_CACHE.get(key)
+                if cached is not None:
+                    return cached
+                return _synthesize_sentence_audio(voice, sentence)
 
-            audio = np.concatenate(processed_chunks)
+            # Single sentence optimization
+            if len(sentences) == 1:
+                audio, target_sr = get_sentence_audio(sentences[0])
+                if len(audio) > 0:
+                    with _PORTAUDIO_LOCK:
+                        sd.play(audio, samplerate=target_sr, latency="high")
+                    sd.wait()
+                return
 
-            # 2. Headroom scaling: Prevent digital inter-sample clipping on DAC / Windows mixer
-            # Piper normalizes audio to 1.0 (0 dBFS), which causes clipping/crackling during playback & resampling.
-            # 0.88x provides ~1.2 dB of headroom.
-            audio = np.clip(audio * 0.88, -0.95, 0.95).astype(np.float32)
+            # Multi-sentence streaming:
+            # 1. Synthesize and start playing the first sentence immediately
+            audio0, sr0 = get_sentence_audio(sentences[0])
 
-            # 3. Resample to hardware output device's native sample rate (e.g. 44100 / 48000 Hz)
-            # Modern Windows drivers (Realtek) do not natively render 22050 Hz under MME/DirectSound.
-            # Real-time driver resampling causes buffer underruns, jitter, and crackling.
-            target_sr = raw_sr
-            try:
-                out_dev = sd.query_devices(kind="output")
-                dev_sr = int(out_dev.get("default_samplerate", 44100))
-                if dev_sr > 0:
-                    target_sr = dev_sr
-            except Exception:
-                target_sr = 44100
+            # 2. Pipeline remaining sentences in background
+            synth_queue = queue.Queue(maxsize=len(sentences))
 
-            if raw_sr != target_sr:
+            def _bg_synthesizer():
                 try:
-                    import scipy.signal as signal
-                    audio = signal.resample_poly(audio, up=target_sr, down=raw_sr).astype(np.float32)
-                except Exception:
-                    # Fallback linear interpolation
-                    old_indices = np.linspace(0, len(audio) - 1, len(audio))
-                    new_len = int(len(audio) * target_sr / raw_sr)
-                    new_indices = np.linspace(0, len(audio) - 1, new_len)
-                    audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
+                    for s in sentences[1:]:
+                        if stop_synth.is_set():
+                            break
+                        item = get_sentence_audio(s)
+                        synth_queue.put(item)
+                except Exception as exc:
+                    synth_queue.put(exc)
+                finally:
+                    synth_queue.put(None)
 
-            # 4. Play with high latency buffer to avoid starvation under CPU load
-            with _PORTAUDIO_LOCK:
-                sd.play(audio, samplerate=target_sr, latency="high")
-            sd.wait()
+            bg_thread = threading.Thread(target=_bg_synthesizer, daemon=True)
+            bg_thread.start()
+
+            # 3. Play first sentence immediately via sounddevice
+            if len(audio0) > 0:
+                with _PORTAUDIO_LOCK:
+                    sd.play(audio0, samplerate=sr0, latency="high")
+                sd.wait()
+
+            # 4. Stream remaining sentences as they complete synthesis
+            while True:
+                item = synth_queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                audio_next, sr_next = item
+                if len(audio_next) > 0:
+                    with _PORTAUDIO_LOCK:
+                        sd.play(audio_next, samplerate=sr_next, latency="high")
+                    sd.wait()
+
         except Exception as exc:
             print(f"[voice] Piper synthesis/playback error: {exc}, falling back to system TTS")
             self._say_system(text)
         finally:
+            stop_synth.set()
             self.is_speaking = False
             Voice.is_speaking = False
 
@@ -677,8 +849,7 @@ class WakeWordDetector(threading.Thread):
                 data = None
                 if stream is not None:
                     try:
-                        with _PORTAUDIO_LOCK:
-                            data = stream.read(chunk_samples, exception_on_overflow=False)
+                        data = stream.read(chunk_samples, exception_on_overflow=False)
                     except Exception:
                         break
                 if not data:
@@ -768,6 +939,59 @@ class WakeWordDetector(threading.Thread):
             return ""
         return self.transcribe(raw_bytes)
 
+    def reconnect_stream(self, sample_rate: int = 16000, chunk_samples: int = 1280):
+        """
+        Auto-recovery backoff loop (1s, 2s, 4s) when audio stream encounters error/unplug.
+        Cleans up broken stream, resets PortAudio topology, probes for working physical mic,
+        and re-establishes stream automatically without restarting the app.
+        """
+        import pyaudio
+        delays = [1.0, 2.0, 4.0]
+        delay_idx = 0
+        print("[voice] Audio stream disconnected. Entering backoff retry loop (1s, 2s, 4s)...")
+
+        while not self.stop.is_set():
+            delay = delays[delay_idx]
+            if delay_idx < len(delays) - 1:
+                delay_idx += 1
+            if self.stop.wait(delay):
+                return None
+
+            reset_shared_pyaudio()
+            p = get_shared_pyaudio()
+            best_idx, best_name = find_best_microphone(self.cfg, probe_working=True)
+            if best_idx is None:
+                continue
+
+            try:
+                with _PORTAUDIO_LOCK:
+                    test_stream = p.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=sample_rate,
+                        input=True,
+                        input_device_index=best_idx,
+                        frames_per_buffer=chunk_samples,
+                    )
+                # Verify reading at least one frame works without exception
+                test_data = test_stream.read(chunk_samples, exception_on_overflow=False)
+                if test_data and len(test_data) > 0:
+                    self.device_index = best_idx
+                    Voice.current_mic_index = best_idx
+                    Voice.current_mic_name = best_name
+                    print(f"[voice] Microphone auto-recovered successfully to [{best_idx}] {best_name}.")
+                    return test_stream
+                else:
+                    try:
+                        with _PORTAUDIO_LOCK:
+                            test_stream.stop_stream()
+                            test_stream.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return None
+
     def run(self):
         import pyaudio
         p = get_shared_pyaudio()
@@ -795,10 +1019,12 @@ class WakeWordDetector(threading.Thread):
                     )
             except Exception as exc:
                 print(f"[voice] WakeWordDetector failed to open mic [{active_idx}]: {exc}")
-                time.sleep(1.0)
-                continue
+                stream = self.reconnect_stream(sample_rate, chunk_samples)
+                if stream is None:
+                    continue
 
             pre_roll = collections.deque(maxlen=4)
+            stream_error = False
             try:
                 while not self.stop.is_set():
                     new_cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
@@ -806,9 +1032,10 @@ class WakeWordDetector(threading.Thread):
                         break
 
                     try:
-                        with _PORTAUDIO_LOCK:
-                            data = stream.read(chunk_samples, exception_on_overflow=False)
-                    except Exception:
+                        data = stream.read(chunk_samples, exception_on_overflow=False)
+                    except Exception as stream_exc:
+                        print(f"[voice] Microphone stream read error: {stream_exc}. Unplug / disconnect detected.")
+                        stream_error = True
                         break
 
                     if not data:
@@ -883,10 +1110,59 @@ class WakeWordDetector(threading.Thread):
                 if stream is not None:
                     try:
                         with _PORTAUDIO_LOCK:
-                            stream.stop_stream()
+                            if hasattr(stream, "is_stopped") and not stream.is_stopped():
+                                stream.stop_stream()
                             stream.close()
                     except Exception:
                         pass
+                    stream = None
+
+            if stream_error and not self.stop.is_set():
+                self.device_index = None
+                recovered_stream = self.reconnect_stream(sample_rate, chunk_samples)
+                if recovered_stream is not None:
+                    try:
+                        with _PORTAUDIO_LOCK:
+                            recovered_stream.stop_stream()
+                            recovered_stream.close()
+                    except Exception:
+                        pass
+
+    def listen(self, timeout_no_speech: float = 5.0) -> bytes:
+        """
+        Actively captures an utterance with VAD and returns raw audio bytes.
+        PortAudio lock is held only during stream open and close, never during blocking reads.
+        """
+        cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
+        active_idx = cfg_idx if cfg_idx is not None else self.device_index
+        if active_idx is None:
+            active_idx, _ = find_best_microphone(self.cfg)
+
+        import pyaudio
+        p = get_shared_pyaudio()
+        stream = None
+        try:
+            with _PORTAUDIO_LOCK:
+                stream = p.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=16000,
+                    input=True,
+                    input_device_index=active_idx,
+                    frames_per_buffer=1280,
+                )
+            return self.record_utterance_with_vad(stream=stream, timeout_no_speech=timeout_no_speech)
+        except Exception as exc:
+            print(f"[voice] listen failed: {exc}")
+            return None
+        finally:
+            if stream is not None:
+                try:
+                    with _PORTAUDIO_LOCK:
+                        stream.stop_stream()
+                        stream.close()
+                except Exception:
+                    pass
 
     def _dispatch_utterance(self, raw_bytes: bytes):
         if self.on_utterance:
@@ -916,6 +1192,15 @@ class Voice(threading.Thread):
         self.sensitivity = getattr(cfg, "wake_sensitivity", "balanced") if cfg else "balanced"
         self.followup_window = float(getattr(cfg, "wake_followup_window", getattr(cfg, "command_window", 6.0))) if cfg else 6.0
         self.wake_detector = None
+
+    def listen(self, timeout: float = None) -> str:
+        """
+        Actively listens for a speech utterance and returns the transcribed text.
+        Lock contention free: PortAudio lock is never held during blocking reads.
+        """
+        if self.wake_detector:
+            return self.wake_detector.record_and_transcribe(timeout_no_speech=timeout or 5.0)
+        return ""
 
     def set_sensitivity(self, sensitivity):
         self.sensitivity = sensitivity

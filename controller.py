@@ -8,6 +8,7 @@ Features:
 - Integrated Kinect-style dwell click and radial action menu.
 - Failsafe mouse button and modifier key release on all exit/error paths.
 """
+import atexit
 import collections
 import ctypes
 import math
@@ -23,6 +24,76 @@ from dwell import DwellClicker
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False      # hand control would otherwise trip the corner failsafe
 pyautogui.MINIMUM_DURATION = 0
+
+
+class LookbackBuffer:
+    """Preallocated circular buffer for zero-allocation cursor position lookback."""
+    __slots__ = ("_cap", "_t", "_x", "_y", "_head", "_count")
+
+    def __init__(self, capacity: int = 400):
+        self._cap = capacity
+        self._t = [0.0] * capacity
+        self._x = [0.0] * capacity
+        self._y = [0.0] * capacity
+        self._head = 0
+        self._count = 0
+
+    def append_fast(self, t: float, x: float, y: float) -> None:
+        idx = self._head
+        self._t[idx] = t
+        self._x[idx] = x
+        self._y[idx] = y
+        self._head = (idx + 1) % self._cap
+        if self._count < self._cap:
+            self._count += 1
+
+    def clear(self) -> None:
+        self._head = 0
+        self._count = 0
+
+    def append(self, item_or_t, x=None, y=None) -> None:
+        if x is None:
+            t, x, y = item_or_t
+        else:
+            t = item_or_t
+        self.append_fast(float(t), float(x), float(y))
+
+    def get_lookback(self, target_t: float, default_x: float, default_y: float):
+        count = self._count
+        if count == 0:
+            return default_x, default_y
+        head = self._head
+        cap = self._cap
+        best_x = default_x
+        best_y = default_y
+        for i in range(count):
+            idx = (head - 1 - i) % cap
+            t = self._t[idx]
+            if t <= target_t:
+                return self._x[idx], self._y[idx]
+            best_x = self._x[idx]
+            best_y = self._y[idx]
+        return best_x, best_y
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __iter__(self):
+        head = self._head
+        count = self._count
+        cap = self._cap
+        start = (head - count) % cap
+        for i in range(count):
+            idx = (start + i) % cap
+            yield (self._t[idx], self._x[idx], self._y[idx])
+
+    def __reversed__(self):
+        head = self._head
+        count = self._count
+        cap = self._cap
+        for i in range(count):
+            idx = (head - 1 - i) % cap
+            yield (self._t[idx], self._x[idx], self._y[idx])
 
 
 class Controller:
@@ -49,14 +120,18 @@ class Controller:
         self.deadzone = DeadzoneFilter(getattr(cfg, "deadzone_px", 1.5))
         self.landmark_filter = OneEuroPoint(cfg.smooth_min_cutoff, cfg.smooth_beta)
 
-        # Cursor positions & lookback buffer
-        cur_pos = pyautogui.position()
-        self.cur_x = float(cur_pos[0])
-        self.cur_y = float(cur_pos[1])
+        try:
+            cur_pos = pyautogui.position()
+            self.cur_x = float(cur_pos[0])
+            self.cur_y = float(cur_pos[1])
+        except Exception:
+            self.cur_x = 0.0
+            self.cur_y = 0.0
         self.target_x = self.cur_x
         self.target_y = self.cur_y
-        self.history = collections.deque(maxlen=400)  # (timestamp, x, y)
-        self.history.append((time.perf_counter(), self.cur_x, self.cur_y))
+        self.history = LookbackBuffer(400)  # Preallocated zero-allocation buffer
+        self.history.append_fast(time.perf_counter(), self.cur_x, self.cur_y)
+        self._last_dwell_active = False
 
         # Relative tracking state
         self.last_landmark_x = None
@@ -79,6 +154,10 @@ class Controller:
         self._stop_thread = threading.Event()
         self._thread = threading.Thread(target=self._cursor_loop, daemon=True)
         self._thread.start()
+        try:
+            atexit.register(self.failsafe_release)
+        except Exception:
+            pass
 
     def set_overlay(self, overlay):
         self.overlay = overlay
@@ -100,55 +179,130 @@ class Controller:
         self.dwell.reset()
 
     def _release_ctrl(self):
-        if self.ctrl_down:
-            try:
-                pyautogui.keyUp("ctrl", _pause=False)
-            except Exception:
-                pass
-            self.ctrl_down = False
+        try:
+            pyautogui.keyUp("ctrl", _pause=False)
+        except Exception:
+            pass
+        self.ctrl_down = False
+
+    def failsafe_release(self):
+        """Unconditional failsafe release of mouse buttons and modifier keys."""
+        try:
+            pyautogui.mouseUp(_pause=False)
+        except Exception:
+            pass
+        self.button_down = False
+        self.dragging = False
+        self.pinching = False
+        self.scroll_mode_active = False
+
+        try:
+            pyautogui.keyUp("ctrl", _pause=False)
+        except Exception:
+            pass
+        self.ctrl_down = False
+
+    def on_sleep(self):
+        """Unconditional failsafe release and filter reset on system sleep or screen lock."""
+        self.failsafe_release()
+        self._reset_filters()
+        self.target_x = self.cur_x
+        self.target_y = self.cur_y
+
+    def on_resume(self):
+        """Resets move baseline and releases any latched input on resume."""
+        self.failsafe_release()
+        self._reset_filters()
+        self.last_move_t = None
+
+    def __del__(self):
+        try:
+            self.failsafe_release()
+        except Exception:
+            pass
 
     def _cursor_loop(self):
         """Dedicated high-frequency loop (120+ Hz) for smooth, decoupled cursor interpolation."""
-        rate = max(getattr(self.cfg, "cursor_rate_hz", 120), 60)
-        dt_target = 1.0 / rate
+        rate = max(float(getattr(self.cfg, "cursor_rate_hz", 120)), 60.0)
+        dt_target = 1.0 / (rate + 1.0)
+        alpha = 1.0 - math.exp(-38.0 * dt_target)
 
-        while not self._stop_thread.is_set():
-            t0 = time.perf_counter()
+        if self._win:
+            try:
+                ctypes.windll.winmm.timeBeginPeriod(1)
+            except Exception:
+                pass
+            try:
+                k32 = ctypes.windll.kernel32
+                k32.GetCurrentThread.restype = ctypes.c_void_p
+                k32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                k32.SetThreadPriority.restype = ctypes.c_bool
+                # THREAD_PRIORITY_HIGHEST = 2
+                k32.SetThreadPriority(k32.GetCurrentThread(), 2)
+            except Exception:
+                pass
 
-            # Smoothly interpolate towards target position
-            # Critically damped exponential approach
-            alpha = 1.0 - math.exp(-38.0 * dt_target)
-            dx = (self.target_x - self.cur_x) * alpha
-            dy = (self.target_y - self.cur_y) * alpha
+        next_tick = time.perf_counter() + dt_target
+        try:
+            while not self._stop_thread.is_set():
+                # Smoothly interpolate towards target position
+                # Critically damped exponential approach
+                dx = (self.target_x - self.cur_x) * alpha
+                dy = (self.target_y - self.cur_y) * alpha
 
-            if abs(dx) > 0.02 or abs(dy) > 0.02:
-                self.cur_x += dx
-                self.cur_y += dy
-                self._move(round(self.cur_x), round(self.cur_y))
+                if abs(dx) > 0.02 or abs(dy) > 0.02:
+                    self.cur_x += dx
+                    self.cur_y += dy
+                    self._move(round(self.cur_x), round(self.cur_y))
 
-            now = time.perf_counter()
-            self.history.append((now, self.cur_x, self.cur_y))
+                now = time.perf_counter()
+                self.history.append_fast(now, self.cur_x, self.cur_y)
 
-            # Update dwell click state
-            dwell_state = self.dwell.update(
-                self.cur_x, self.cur_y, now,
-                active=self.active,
-                hand_present=self.hand_present,
-                pinching=self.pinching,
-                dragging=self.dragging
-            )
+                # Update dwell click state
+                dwell_state = self.dwell.update(
+                    self.cur_x, self.cur_y, now,
+                    active=self.active,
+                    hand_present=self.hand_present,
+                    pinching=self.pinching,
+                    dragging=self.dragging
+                )
 
-            # Handle dwell actions
-            if dwell_state.get("action"):
-                self._handle_dwell_action(dwell_state["action"])
+                # Handle dwell actions
+                if dwell_state.get("action"):
+                    self._handle_dwell_action(dwell_state["action"])
 
-            # Post dwell feedback to overlay if available
-            if self.overlay:
-                self.overlay.post("cursor_dwell", **dwell_state)
+                # Post dwell feedback to overlay only when active or transitioning
+                is_dwell_active = bool(dwell_state.get("progress", 0.0) > 0.0 or
+                                       dwell_state.get("radial_open") or
+                                       dwell_state.get("flashing") or
+                                       dwell_state.get("latched"))
+                if is_dwell_active or self._last_dwell_active:
+                    self._last_dwell_active = is_dwell_active
+                    if self.overlay:
+                        self.overlay.post("cursor_dwell", **dwell_state)
 
-            elapsed = time.perf_counter() - t0
-            sleep_time = max(dt_target - elapsed, 0.001)
-            time.sleep(sleep_time)
+                # Hybrid sleep/spin to lock cursor loop frequency at 120+ Hz with < 0.3 ms jitter
+                rem = next_tick - time.perf_counter()
+                if rem > 0.0015:
+                    time.sleep(rem - 0.001)
+                while time.perf_counter() < next_tick and not self._stop_thread.is_set():
+                    pass
+
+                next_tick += dt_target
+                now_after = time.perf_counter()
+                if now_after > next_tick:
+                    # If behind due to system sleep/resume or lock screen stall
+                    if (now_after - next_tick) > 0.20:
+                        self.target_x = self.cur_x
+                        self.target_y = self.cur_y
+                        self.failsafe_release()
+                    next_tick = now_after + dt_target
+        finally:
+            if self._win:
+                try:
+                    ctypes.windll.winmm.timeEndPeriod(1)
+                except Exception:
+                    pass
 
     def _handle_dwell_action(self, act):
         if act == "click":
@@ -170,12 +324,7 @@ class Controller:
     def _get_lookback_position(self, lookback_ms):
         """Returns the cursor position from lookback_ms before now."""
         target_t = time.perf_counter() - (lookback_ms / 1000.0)
-        best_pos = (self.cur_x, self.cur_y)
-        for t, x, y in reversed(self.history):
-            if t <= target_t:
-                return x, y
-            best_pos = (x, y)
-        return best_pos
+        return self.history.get_lookback(target_t, self.cur_x, self.cur_y)
 
     def handle(self, a):
         k = a.kind
@@ -208,7 +357,18 @@ class Controller:
                     self.last_move_t = now
                     return
 
-                dt = max(now - self.last_move_t, 1e-4)
+                raw_dt = now - self.last_move_t
+                dt = max(min(raw_dt, 0.05), 1e-4)
+
+                # Gap detected from sleep/resume, screen lock, or frame drop
+                if raw_dt > 0.10:
+                    self.failsafe_release()
+                    self._reset_filters()
+                    self.last_landmark_x = flm_x
+                    self.last_landmark_y = flm_y
+                    self.last_move_t = now
+                    return
+
                 # Normalized landmark displacement
                 d_x = flm_x - self.last_landmark_x
                 d_y = flm_y - self.last_landmark_y
@@ -315,28 +475,12 @@ class Controller:
             self.hand_present = True
             self._reset_filters()
 
-        elif k in ("deactivate", "lost"):
+        elif k in ("deactivate", "lost", "sleep"):
             self.active = (k != "deactivate" and self.active)
             self.hand_present = False
-            self.pinching = False
-            self.dragging = False
-            self.scroll_mode_active = False
-
-            if self.button_down:
-                try:
-                    pyautogui.mouseUp(_pause=False)
-                except Exception:
-                    pass
-                self.button_down = False
-
-            self._release_ctrl()
+            self.failsafe_release()
             self._reset_filters()
 
     def shutdown(self):
         self._stop_thread.set()
-        try:
-            pyautogui.mouseUp(_pause=False)
-        except Exception:
-            pass
-        self.button_down = False
-        self._release_ctrl()
+        self.failsafe_release()

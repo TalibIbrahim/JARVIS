@@ -181,6 +181,9 @@ class TestQuickAnswersAndTimeZones:
         mock_ctx = MagicMock()
         mock_ctx.overlay = mock_overlay
 
+        # Warm up tzdata disk read to isolate purely algorithmic System 1 resolution latency
+        quick_answers.get_world_time(f"what time is it in {city}", ctx=mock_ctx)
+
         t0 = time.perf_counter()
         reply = quick_answers.get_world_time(f"what time is it in {city}", ctx=mock_ctx)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0

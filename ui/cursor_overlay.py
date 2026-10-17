@@ -146,8 +146,12 @@ class CursorFeedbackOverlay(QWidget):
 
         if should_render and self.cur_x > -100:
             sz = 220 if self.radial_open else 160
-            self.resize(sz, sz)
-            self.move(int(self.cur_x - sz / 2.0), int(self.cur_y - sz / 2.0))
+            if self.width() != sz or self.height() != sz:
+                self.resize(sz, sz)
+            nx = int(self.cur_x - sz / 2.0)
+            ny = int(self.cur_y - sz / 2.0)
+            if self.x() != nx or self.y() != ny:
+                self.move(nx, ny)
             if not self.isVisible():
                 self.show()
             self.update()
@@ -188,8 +192,12 @@ class CursorFeedbackOverlay(QWidget):
         self._ring_scale.update(0.016, T.reduce_motion())
 
         sz = 220 if self.radial_open else 160
-        self.resize(sz, sz)
-        self.move(int(self.cur_x - sz / 2.0), int(self.cur_y - sz / 2.0))
+        if self.width() != sz or self.height() != sz:
+            self.resize(sz, sz)
+        nx = int(self.cur_x - sz / 2.0)
+        ny = int(self.cur_y - sz / 2.0)
+        if self.x() != nx or self.y() != ny:
+            self.move(nx, ny)
         if not self.isVisible():
             self.show()
         self.update()

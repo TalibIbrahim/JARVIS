@@ -4,14 +4,34 @@ import threading
 import time
 
 import cv2
-import mediapipe as mp
+import numpy as np
 
-from gestures import Hand
+from gestures import Hand, Action
+
+mp = None
+
+
+def _get_mp():
+    """Lazily imports and caches MediaPipe to avoid 1.5s+ startup penalty."""
+    global mp
+    if mp is None:
+        import mediapipe as _mp
+        mp = _mp
+    return mp
+
 
 _CAMERA_LOCK = threading.Lock()
 _CAMERA_CACHE = None
 _CAMERA_CACHE_TIME = 0.0
 _CAMERA_CACHE_TTL = 30.0
+
+
+def clear_camera_cache():
+    """Clears cached camera enumeration on exit."""
+    global _CAMERA_CACHE, _CAMERA_CACHE_TIME
+    with _CAMERA_LOCK:
+        _CAMERA_CACHE = None
+        _CAMERA_CACHE_TIME = 0.0
 
 
 def list_cameras(force_refresh=False):
@@ -82,16 +102,30 @@ class FrameGrabber(threading.Thread):
         self.stop = stop_event
         self.cap = None
         self.lock = threading.Lock()
-        self.latest_frame = None
         self.latest_t = 0.0
         self.fps = 0.0
         self.failures = 0
         self.opened = False
 
+        self.reconnecting = False
+
+        # Double-buffer preallocated frames to eliminate per-frame allocations
+        h = int(getattr(cfg, "frame_height", 720))
+        w = int(getattr(cfg, "frame_width", 1280))
+        self._buffers = [
+            np.zeros((h, w, 3), dtype=np.uint8),
+            np.zeros((h, w, 3), dtype=np.uint8),
+        ]
+        self._write_idx = 0
+        self._read_idx = 1
+        self._has_frame = False
+
     def open_camera(self):
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
         preferred = getattr(self.cfg, "camera_index", 0)
         candidates = [preferred] + [i for i in (0, 1, 2) if i != preferred]
+        w = int(getattr(self.cfg, "frame_width", 1280))
+        h = int(getattr(self.cfg, "frame_height", 720))
 
         for idx in candidates:
             cap = cv2.VideoCapture(idx, backend)
@@ -100,8 +134,8 @@ class FrameGrabber(threading.Thread):
                     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 except Exception:
                     pass
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.frame_width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.frame_height)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
             cap.set(cv2.CAP_PROP_FPS, getattr(self.cfg, "camera_fps", 30))
             try:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -109,49 +143,130 @@ class FrameGrabber(threading.Thread):
                 pass
 
             if cap.isOpened():
-                if idx != preferred:
-                    print(f"[tracker] Camera [{preferred}] unavailable. Auto-recovered to working camera [{idx}].")
-                    self.cfg.camera_index = idx
-                self.cap = cap
-                self.opened = True
-                return True
-            try:
-                cap.release()
-            except Exception:
-                pass
+                ret, test_frame = cap.read()
+                is_valid = False
+                if ret and test_frame is not None:
+                    size = getattr(test_frame, "size", 1)
+                    is_valid = bool(size > 0 if isinstance(size, (int, float)) else True)
+
+                if is_valid:
+                    if idx != preferred:
+                        print(f"[tracker] Camera [{preferred}] unavailable. Auto-recovered to working camera [{idx}].")
+                        self.cfg.camera_index = idx
+                    self.cap = cap
+                    self.opened = True
+                    # Re-sync double-buffer dimensions if camera resolution differs
+                    if hasattr(test_frame, "shape") and isinstance(test_frame.shape, tuple) and len(test_frame.shape) >= 2:
+                        actual_h, actual_w = int(test_frame.shape[0]), int(test_frame.shape[1])
+                    else:
+                        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or w
+                        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or h
+
+                    with self.lock:
+                        if self._buffers[0].shape != (actual_h, actual_w, 3):
+                            self._buffers = [
+                                np.zeros((actual_h, actual_w, 3), dtype=np.uint8),
+                                np.zeros((actual_h, actual_w, 3), dtype=np.uint8),
+                            ]
+                        if isinstance(test_frame, np.ndarray) and test_frame.shape == self._buffers[self._write_idx].shape:
+                            np.copyto(self._buffers[self._write_idx], test_frame)
+                        self._read_idx = self._write_idx
+                        self._write_idx = 1 - self._write_idx
+                        self.latest_t = time.perf_counter()
+                        self._has_frame = True
+                    return True
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            else:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
         self.cap = None
         self.opened = False
         return False
 
+    def reconnect_loop(self):
+        """Auto-reconnect backoff loop (1s, 2s, 4s) when camera is disconnected."""
+        self.reconnecting = True
+        self.opened = False
+        self.release()
+        delays = [1.0, 2.0, 4.0]
+        delay_idx = 0
+        print("[tracker] Camera disconnected. Entering auto-reconnect backoff loop (1s, 2s, 4s)...")
+        while not self.stop.is_set():
+            delay = delays[delay_idx]
+            if delay_idx < len(delays) - 1:
+                delay_idx += 1
+            if self.stop.wait(delay):
+                break
+
+            clear_camera_cache()
+            if self.open_camera():
+                self.failures = 0
+                self.reconnecting = False
+                print("[tracker] Camera reconnected: DirectShow device re-opened and buffers re-initialized.")
+                return True
+        self.reconnecting = False
+        return False
+
     def run(self):
         if not self.cap or not self.opened:
             if not self.open_camera():
-                return
+                if not self.reconnect_loop():
+                    return
 
         last_t = time.perf_counter()
         while not self.stop.is_set():
+            if not self.cap or not self.opened:
+                if not self.reconnect_loop():
+                    continue
+                last_t = time.perf_counter()
+
             ok, frame = self.cap.read()
             now = time.perf_counter()
-            if not ok:
+            if not ok or frame is None or getattr(frame, "size", 0) == 0:
                 self.failures += 1
+                if self.failures >= 30:
+                    print(f"[tracker] Camera read failure threshold reached ({self.failures}). Reconnecting...")
+                    self.release()
+                    self.reconnect_loop()
+                    last_t = time.perf_counter()
+                    continue
                 time.sleep(0.02)
                 continue
+
             self.failures = 0
-            dt = max(now - last_t, 1e-4)
+            dt = max(min(now - last_t, 0.05), 1e-4)
             last_t = now
             inst_fps = 1.0 / dt
             self.fps = 0.9 * self.fps + 0.1 * inst_fps if self.fps > 0 else inst_fps
 
+            # Double-buffer write into preallocated array (zero-allocation)
+            write_buf = self._buffers[self._write_idx]
+            if hasattr(frame, "shape") and write_buf.shape != frame.shape:
+                self._buffers = [
+                    np.zeros_like(frame),
+                    np.zeros_like(frame),
+                ]
+                write_buf = self._buffers[self._write_idx]
+            if isinstance(frame, np.ndarray):
+                np.copyto(write_buf, frame)
+
             with self.lock:
-                self.latest_frame = frame
+                self._read_idx = self._write_idx
+                self._write_idx = 1 - self._write_idx
                 self.latest_t = now
+                self._has_frame = True
 
     def get_latest(self):
         with self.lock:
-            if self.latest_frame is None:
+            if not self._has_frame:
                 return None, 0.0
-            return self.latest_frame, self.latest_t
+            return self._buffers[self._read_idx], self.latest_t
 
     def release(self):
         if self.cap:
@@ -159,6 +274,8 @@ class FrameGrabber(threading.Thread):
                 self.cap.release()
             except Exception:
                 pass
+        self.cap = None
+        self.opened = False
 
 
 class Tracker(threading.Thread):
@@ -175,6 +292,11 @@ class Tracker(threading.Thread):
         self._inference_ms = 0.0
         self._frame_lock = threading.Lock()
         self._latest_raw_frame = None
+        self._last_frame_t = 0.0
+        # Preallocated buffers for zero-allocation hot path
+        self._flip_buf = None
+        self._rgb_buf = None
+        self._preview_overlay_buf = None
 
     def get_latest_frame(self, unmirrored: bool = True):
         """Returns the latest captured camera frame (BGR) for vision inspection."""
@@ -196,7 +318,6 @@ class Tracker(threading.Thread):
             if not self._grabber.open_camera():
                 self.ctx.say("I can't open the camera, sir.")
                 self.overlay.post("error", text="CAMERA NOT FOUND")
-                return
             self._grabber.start()
         else:
             backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
@@ -233,35 +354,50 @@ class Tracker(threading.Thread):
         det_conf = getattr(cfg, "min_detection_confidence", 0.6)
         track_conf = getattr(cfg, "min_tracking_confidence", 0.6)
 
-        hands = mp.solutions.hands.Hands(
+        mp_mod = _get_mp()
+        hands = mp_mod.solutions.hands.Hands(
             max_num_hands=2,
             model_complexity=comp,
             min_detection_confidence=det_conf,
             min_tracking_confidence=track_conf
         )
-        connections = list(mp.solutions.hands.HAND_CONNECTIONS)
+        connections = list(mp_mod.solutions.hands.HAND_CONNECTIONS)
         failures = 0
         last_processed_t = 0.0
         win_name = "JARVIS // VISION  (q to quit)"
 
         hand_visible = False
+        last_hand_seen_t = 0.0
         while not self.stop.is_set():
-            # CPU throttling: drop to ~10 FPS only when on standby and no hand is in view
-            if not self.engine.active and not cfg.show_preview and not hand_visible:
+            now_loop = time.perf_counter()
+            # Adaptive rate: low-power scanning when no hand is in view;
+            # jump to full 30 FPS rate instantly the moment a hand is detected,
+            # with zero missed first gestures.
+            hand_recent = (now_loop - last_hand_seen_t) < 0.5
+            if not self.engine.active and not cfg.show_preview and not hand_recent:
                 time.sleep(0.06)
 
             if use_threaded:
                 raw_frame, frame_t = self._grabber.get_latest()
                 if raw_frame is None or frame_t <= last_processed_t:
-                    if self._grabber.failures >= 30 and failures < 30:
+                    if (self._grabber.failures >= 30 or not self._grabber.opened) and failures < 30:
                         failures = 30
                         self.ctx.say("Camera feed lost, sir.")
                         self.overlay.post("error", text="CAMERA FEED LOST")
-                    time.sleep(0.005)
+                        self.controller.handle(Action("lost"))
+                    time.sleep(0.002)
                     continue
+
+                if failures >= 30:
+                    failures = 0
+                    print("[tracker] Camera feed recovered. Resuming tracking.")
+                    self.controller._reset_filters()
+                    self._flip_buf = None
+                    self._rgb_buf = None
+                    self._preview_overlay_buf = None
+
                 failures = 0
                 last_processed_t = frame_t
-                frame = raw_frame.copy()
             else:
                 ok, frame = cap.read()
                 if not ok:
@@ -269,28 +405,66 @@ class Tracker(threading.Thread):
                     if failures == 30:
                         self.ctx.say("Camera feed lost, sir.")
                         self.overlay.post("error", text="CAMERA FEED LOST")
-                    time.sleep(0.03)
-                    continue
+                        self.controller.handle(Action("lost"))
+                    if failures >= 30:
+                        delays = [1.0, 2.0, 4.0]
+                        delay_idx = min((failures - 30) // 10, len(delays) - 1)
+                        if self.stop.wait(delays[delay_idx]):
+                            break
+                        clear_camera_cache()
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        for c_idx in candidates:
+                            cand_cap = cv2.VideoCapture(c_idx, backend)
+                            if cand_cap.isOpened():
+                                ret, tf = cand_cap.read()
+                                if ret and tf is not None and getattr(tf, "size", 0) > 0:
+                                    cap = cand_cap
+                                    failures = 0
+                                    self._flip_buf = None
+                                    self._rgb_buf = None
+                                    self._preview_overlay_buf = None
+                                    self.controller._reset_filters()
+                                    break
+                                try:
+                                    cand_cap.release()
+                                except Exception:
+                                    pass
+                        continue
                 failures = 0
+                raw_frame = frame
                 with self._frame_lock:
-                    self._latest_raw_frame = frame.copy()
+                    self._latest_raw_frame = raw_frame
 
-            frame = cv2.flip(frame, 1)                       # mirror, so moving right moves right
-            
-            # MediaPipe Inference with timing
+            h, w = raw_frame.shape[:2]
+            if self._flip_buf is None or self._flip_buf.shape != (h, w, 3):
+                self._flip_buf = np.empty((h, w, 3), dtype=np.uint8)
+                self._rgb_buf = np.empty((h, w, 3), dtype=np.uint8)
+
+            # In-place destination flip (mirror, so moving right moves right)
+            cv2.flip(raw_frame, 1, dst=self._flip_buf)
+
+            # MediaPipe Inference with in-place destination color conversion
             t_inf_0 = time.perf_counter()
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = hands.process(rgb)
+            cv2.cvtColor(self._flip_buf, cv2.COLOR_BGR2RGB, dst=self._rgb_buf)
+            result = hands.process(self._rgb_buf)
             self._inference_ms = (time.perf_counter() - t_inf_0) * 1000.0
 
             found = []
             if result.multi_hand_landmarks:
                 for lms in result.multi_hand_landmarks:
                     found.append(Hand([(p.x, p.y) for p in lms.landmark]))
-            hand_visible = bool(found)
 
             now = time.time()
-            dt = max(now - self._last_frame_t, 1e-4)
+            if found:
+                last_hand_seen_t = time.perf_counter()
+                hand_visible = True
+            else:
+                hand_visible = False
+
+            dt = max(min(now - self._last_frame_t, 0.05), 1e-4)
             self._last_frame_t = now
             inst_fps = 1.0 / dt
             self._fps = 0.9 * self._fps + 0.1 * inst_fps if self._fps > 0 else inst_fps
@@ -311,7 +485,7 @@ class Tracker(threading.Thread):
             self.overlay.post("state", **st)
 
             if cfg.show_preview:
-                self._preview(frame, found, connections, st, win_name)
+                self._preview(self._flip_buf, found, connections, st, win_name)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or key == 27:             # q or Esc
                     self.stop.set()
@@ -394,9 +568,11 @@ class Tracker(threading.Thread):
         
         panel_h = 160 if scheme == "palm_fist" else 145
         panel_w = 380 if scheme == "palm_fist" else 340
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (8, h - panel_h), (panel_w, h - 8), (15, 20, 25), -1)
-        cv2.addWeighted(overlay, 0.70, frame, 0.30, 0, frame)
+        if self._preview_overlay_buf is None or self._preview_overlay_buf.shape != frame.shape:
+            self._preview_overlay_buf = np.empty_like(frame)
+        np.copyto(self._preview_overlay_buf, frame)
+        cv2.rectangle(self._preview_overlay_buf, (8, h - panel_h), (panel_w, h - 8), (15, 20, 25), -1)
+        cv2.addWeighted(self._preview_overlay_buf, 0.70, frame, 0.30, 0, frame)
 
         if scheme == "palm_fist":
             pose = st.get("pose", "OPEN")

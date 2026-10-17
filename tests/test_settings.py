@@ -127,11 +127,18 @@ class TestSettingsWindowInteractions(unittest.TestCase):
     def test_probe_mic_level_uses_live_voice_rms(self):
         import time
         from voice import Voice, probe_mic_level
-        Voice._latest_rms = 450.0
-        Voice._latest_time = time.time()
-        norm, rms = probe_mic_level()
-        self.assertEqual(rms, 450.0)
-        self.assertGreater(norm, 0.0)
+        prev_rms = getattr(Voice, "_latest_rms", 0.0)
+        prev_time = getattr(Voice, "_latest_time", 0.0)
+        try:
+            Voice._latest_rms = 450.0
+            Voice._latest_time = time.time()
+            norm, rms = probe_mic_level()
+            self.assertEqual(rms, 450.0)
+            self.assertGreater(norm, 0.0)
+        finally:
+            Voice._latest_rms = prev_rms
+            Voice._latest_time = prev_time
+
 
     def test_groq_api_key_save_in_settings(self):
         self.overlay.open_settings()

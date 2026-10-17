@@ -133,10 +133,12 @@ class WeatherClient:
         http_fetcher: Optional[Callable[[str, float], Dict[str, Any]]] = None,
         cache_ttl: float = CACHE_TTL_SECONDS,
         clock_fn: Callable[[], float] = time.time,
+        max_cache_entries: int = 128,
     ):
         self._fetcher = http_fetcher or default_http_fetcher
         self._cache_ttl = cache_ttl
         self._clock = clock_fn
+        self._max_cache_entries = max_cache_entries
         # Forecast cache: (lat, lon, units) -> (timestamp, WeatherData)
         self._forecast_cache: Dict[str, Tuple[float, WeatherData]] = {}
         # Geocoding cache: city_lower -> (lat, lon, display_name)
@@ -191,6 +193,9 @@ class WeatherClient:
                 else:
                     display = name
                 res = (lat, lon, display)
+                if len(self._geo_cache) >= self._max_cache_entries:
+                    oldest_k = next(iter(self._geo_cache))
+                    self._geo_cache.pop(oldest_k, None)
                 self._geo_cache[key] = res
                 return res
         except Exception as exc:
@@ -312,7 +317,10 @@ class WeatherClient:
                 hourly=hourly_list,
             )
 
-            # Save in cache
+            # Save in cache (bounded)
+            if len(self._forecast_cache) >= self._max_cache_entries:
+                oldest_k = next(iter(self._forecast_cache))
+                self._forecast_cache.pop(oldest_k, None)
             self._forecast_cache[cache_key] = (now, weather_res)
             return weather_res
 
@@ -340,6 +348,11 @@ class WeatherClient:
         lat, lon, display_name = geo
         return self.get_weather(lat, lon, city=display_name, units=units, force_refresh=force_refresh)
 
+    def clear_cache(self) -> None:
+        """Clears all cached weather and geocoding responses."""
+        self._forecast_cache.clear()
+        self._geo_cache.clear()
+
 
 # Global singleton client
 _WEATHER_CLIENT: Optional[WeatherClient] = None
@@ -355,3 +368,10 @@ def get_weather_client() -> WeatherClient:
 def set_weather_client(client: Optional[WeatherClient]) -> None:
     global _WEATHER_CLIENT
     _WEATHER_CLIENT = client
+
+
+def clear_weather_cache() -> None:
+    """Frees weather client cached responses on exit."""
+    global _WEATHER_CLIENT
+    if _WEATHER_CLIENT is not None:
+        _WEATHER_CLIENT.clear_cache()

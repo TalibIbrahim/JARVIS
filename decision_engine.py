@@ -11,6 +11,9 @@ Inspired by non-autoregressive decision models (like Laya AI and Jev):
 """
 
 from dataclasses import dataclass, field
+from functools import lru_cache
+import hashlib
+import json
 import math
 import os
 import re
@@ -19,7 +22,25 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
+import perf
 from context_resolver import Candidate, get_context_resolver, get_disambiguation_engine
+
+# Precompiled regex patterns to guarantee zero runtime re.compile() overhead
+_RE_NON_WORD = re.compile(r"[^\w\s]")
+_RE_OPEN_FOLDER = re.compile(r"(?:open|show|bring\s+up)\s+(?:the\s+)?(?:folder\s+)?(.+?)(?:\s+folder|\s+directory)?$")
+_RE_STRIP_MY_THE = re.compile(r"^(?:my|the)\s+")
+_RE_FILE_EXT = re.compile(r"\b(pdf|txt|md|docx|xlsx|csv|png|jpg|mp4|py)\b")
+_RE_REMEMBER_FOLDER = re.compile(r"remember\s+(?:this\s+folder\s+)?(?:as\s+)?(.+)")
+_RE_PLAY_MUSIC = re.compile(r"(?:play|put on|listen to|search for)\s+(.+?)(?:\s+(?:on|in)\s+(?:spotify|youtube))?$")
+_RE_SET_VOLUME = re.compile(r"\b(?:set\s+)?volume\s+(?:to\s+)?(\d{1,3})\b")
+_RE_SET_BRIGHTNESS = re.compile(r"\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})\b")
+_RE_SWITCH_APP = re.compile(r"(?:switch\s+(?:to\s+)?)(.+)")
+_RE_QUICK_NOTE = re.compile(r"(?:note\s+that|take\s+(?:a\s+)?note|write\s+down|add\s+note)\s+(.+)")
+
+@lru_cache(maxsize=256)
+def _get_word_boundary_regex(word: str) -> re.Pattern:
+    """Precompiles and caches word boundary regexes for apps, sites, and entities."""
+    return re.compile(rf"\b{re.escape(word)}\b")
 
 
 @dataclass
@@ -289,26 +310,104 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "how do quantum computers work", "what is the capital of France"
     ]
 }
+ 
+_EXACT_PROTOTYPE_MAP: Dict[str, str] = {}
+for _act, _phrases in INTENT_PROTOTYPES.items():
+    for _p in _phrases:
+        _clean_p = _RE_NON_WORD.sub(" ", _p.lower()).strip()
+        _norm_p = " ".join(_clean_p.split())
+        if _norm_p:
+            _EXACT_PROTOTYPE_MAP[_norm_p] = _act
+
+
+def _compute_prototypes_hash() -> str:
+    """Computes deterministic SHA-256 hash of INTENT_PROTOTYPES candidates."""
+    serialized = json.dumps(INTENT_PROTOTYPES, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _get_default_cache_path() -> str:
+    """Returns absolute path to disk cache file in .cache/."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, ".cache", "system1_index.npz")
 
 
 class SemanticDecisionEngine:
     """
     Lightweight, high-speed on-device decision model for J.A.R.V.I.S.
-    Performs calibrated semantic similarity evaluation in ~1-5 ms with 0 external dependencies.
+    Performs calibrated semantic similarity evaluation in < 1 ms with NumPy vectorization.
     Uses non-autoregressive exemplar matching with margin thresholding.
+    Caches precomputed TF-IDF index to disk with SHA-256 validation.
     """
 
-    def __init__(self):
+    def __init__(self, cache_path: Optional[str] = None):
         self._vocab: Dict[str, int] = {}
-        self._idf: np.ndarray = np.array([])
+        self._idf: np.ndarray = np.array([], dtype=np.float32)
         self._action_names: List[str] = list(INTENT_PROTOTYPES.keys())
-        self._exemplar_matrix: np.ndarray = np.array([])
+        self._action_to_idx: Dict[str, int] = {act: i for i, act in enumerate(self._action_names)}
+        self._exemplar_matrix: np.ndarray = np.array([], dtype=np.float32)
         self._exemplar_actions: List[str] = []
-        self._build_vocab_and_prototypes()
+        self._exemplar_action_indices: np.ndarray = np.array([], dtype=np.int32)
+        self._cache_path: str = cache_path if cache_path is not None else _get_default_cache_path()
+        if not self._load_from_cache():
+            self._build_vocab_and_prototypes()
+            self._save_to_cache()
+
+    def _load_from_cache(self) -> bool:
+        """Loads precomputed index from disk if content hash matches."""
+        if not self._cache_path or not os.path.exists(self._cache_path):
+            return False
+        try:
+            expected_hash = _compute_prototypes_hash()
+            with np.load(self._cache_path, allow_pickle=False) as data:
+                cached_hash = str(data["hash"][0])
+                if cached_hash != expected_hash:
+                    return False
+                vk = data["vocab_keys"]
+                vv = data["vocab_vals"]
+                self._vocab = dict(zip(vk.tolist(), vv.tolist()))
+                self._idf = data["idf"].astype(np.float32)
+                self._exemplar_matrix = data["exemplar_matrix"].astype(np.float32)
+                self._exemplar_action_indices = data["exemplar_action_indices"].astype(np.int32)
+                self._action_names = data["action_names"].tolist()
+                self._action_to_idx = {act: i for i, act in enumerate(self._action_names)}
+                self._exemplar_actions = [self._action_names[idx] for idx in self._exemplar_action_indices]
+                return True
+        except Exception:
+            return False
+
+    def _save_to_cache(self) -> bool:
+        """Atomically saves precomputed index to disk with content hash."""
+        if not self._cache_path:
+            return False
+        try:
+            cache_dir = os.path.dirname(self._cache_path)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            current_hash = _compute_prototypes_hash()
+            vk = np.array(list(self._vocab.keys()))
+            vv = np.array(list(self._vocab.values()), dtype=np.int32)
+            action_names_arr = np.array(self._action_names)
+            hash_arr = np.array([current_hash])
+            tmp_path = f"{self._cache_path}.tmp.npz"
+            np.savez(
+                tmp_path,
+                vocab_keys=vk,
+                vocab_vals=vv,
+                idf=self._idf,
+                exemplar_matrix=self._exemplar_matrix,
+                exemplar_action_indices=self._exemplar_action_indices,
+                action_names=action_names_arr,
+                hash=hash_arr,
+            )
+            os.replace(tmp_path, self._cache_path)
+            return True
+        except Exception:
+            return False
 
     def _tokenize(self, text: str) -> List[str]:
         """Extracts word unigrams and character 3-grams for typo-resilient semantic matching."""
-        clean = re.sub(r"[^\w\s]", " ", text.lower()).strip()
+        clean = _RE_NON_WORD.sub(" ", text.lower()).strip()
         words = clean.split()
         tokens = list(words)
         # Add character tri-grams for subword matching
@@ -323,6 +422,9 @@ class SemanticDecisionEngine:
         all_phrases = []
         doc_counts: Dict[str, int] = {}
         phrase_tokens: List[Tuple[str, List[str]]] = []
+
+        self._action_names = list(INTENT_PROTOTYPES.keys())
+        self._action_to_idx = {act: i for i, act in enumerate(self._action_names)}
 
         for action, phrases in INTENT_PROTOTYPES.items():
             for p in phrases:
@@ -344,15 +446,18 @@ class SemanticDecisionEngine:
         # Build normalized exemplar vectors
         exemplars = []
         exemplar_actions = []
+        exemplar_action_indices = []
         for action, tokens in phrase_tokens:
             vec = self._vectorize_tokens(tokens)
             norm = np.linalg.norm(vec)
             if norm > 1e-6:
                 exemplars.append(vec / norm)
                 exemplar_actions.append(action)
+                exemplar_action_indices.append(self._action_to_idx[action])
 
-        self._exemplar_matrix = np.stack(exemplars, axis=0)  # Shape: (n_exemplars, vocab_size)
+        self._exemplar_matrix = np.stack(exemplars, axis=0).astype(np.float32)  # Shape: (n_exemplars, vocab_size)
         self._exemplar_actions = exemplar_actions
+        self._exemplar_action_indices = np.array(exemplar_action_indices, dtype=np.int32)
 
     def _vectorize_tokens(self, tokens: List[str]) -> np.ndarray:
         """Projects token list into normalized TF-IDF feature vector."""
@@ -371,17 +476,15 @@ class SemanticDecisionEngine:
         if np.linalg.norm(vec) < 1e-6 or len(self._exemplar_actions) == 0:
             return {act: 1.0 / len(self._action_names) for act in self._action_names}
 
-        # Dot product with exemplar matrix
+        # Vectorized dot product and max-reduction across action heads
         raw_sims = np.dot(self._exemplar_matrix, vec)
-        action_scores: Dict[str, float] = {act: 0.0 for act in self._action_names}
-        for sim, act in zip(raw_sims, self._exemplar_actions):
-            if sim > action_scores[act]:
-                action_scores[act] = float(sim)
+        action_max_sims = np.zeros(len(self._action_names), dtype=np.float32)
+        np.maximum.at(action_max_sims, self._exemplar_action_indices, raw_sims)
 
-        sim_array = np.array([action_scores[act] for act in self._action_names], dtype=np.float32)
         # Softmax with temperature scaling T=0.20 for crisp, calibrated probabilities
         temp = 0.20
-        exp_sims = np.exp((sim_array - np.max(sim_array)) / temp)
+        max_sim = np.max(action_max_sims)
+        exp_sims = np.exp((action_max_sims - max_sim) / temp)
         probs = exp_sims / np.sum(exp_sims)
         return {act: float(probs[i]) for i, act in enumerate(self._action_names)}
 
@@ -390,35 +493,93 @@ class SemanticDecisionEngine:
         Evaluates user speech. Returns (action_name, confidence).
         Uses margin-based thresholding inspired by non-autoregressive decision models.
         If best decision is 'conversation' or score is ambiguous, returns (None, confidence).
+        Vectorized with NumPy for < 1.0 ms System 1 latency.
         """
-        tokens = self._tokenize(user_text)
-        vec = self._vectorize_tokens(tokens)
-        if np.linalg.norm(vec) < 1e-6 or len(self._exemplar_actions) == 0:
+        if not user_text:
             return None, 0.0
+        if not isinstance(user_text, str):
+            try:
+                user_text = str(user_text, errors="ignore") if isinstance(user_text, (bytes, bytearray)) else str(user_text)
+            except Exception:
+                return None, 0.0
+        if len(user_text) > 4096:
+            user_text = user_text[:4096]
 
-        raw_sims = np.dot(self._exemplar_matrix, vec)
-        action_scores: Dict[str, float] = {act: 0.0 for act in self._action_names}
-        for sim, act in zip(raw_sims, self._exemplar_actions):
-            if sim > action_scores[act]:
-                action_scores[act] = float(sim)
+        cleaned = _RE_NON_WORD.sub(" ", user_text.lower()).strip()
+        norm_text = " ".join(cleaned.split())
+        if not norm_text:
+            return None, 0.0
+        return self._decide_memo(norm_text, min_score, min_margin)
 
-        ranked = sorted(action_scores.items(), key=lambda x: x[1], reverse=True)
-        top_act, top_score = ranked[0]
-        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-        margin = top_score - second_score
+    @lru_cache(maxsize=1024)
+    def _decide_memo(self, norm_text: str, min_score: float, min_margin: float) -> Tuple[Optional[str], float]:
+        with perf.span("intent_decision"):
+            # 1. Early exit on exact prototype string match (sub-microsecond response)
+            if norm_text in _EXACT_PROTOTYPE_MAP:
+                matched_act = _EXACT_PROTOTYPE_MAP[norm_text]
+                if matched_act == "conversation":
+                    return None, 1.0
+                return matched_act, 1.0
 
-        if top_act == "conversation":
+            # 2. Vectorized TF-IDF exemplar matching
+            tokens = self._tokenize(norm_text)
+            vec = self._vectorize_tokens(tokens)
+            if np.linalg.norm(vec) < 1e-6 or len(self._exemplar_actions) == 0:
+                return None, 0.0
+
+            raw_sims = np.dot(self._exemplar_matrix, vec)
+            n_actions = len(self._action_names)
+            action_max_sims = np.zeros(n_actions, dtype=np.float32)
+            np.maximum.at(action_max_sims, self._exemplar_action_indices, raw_sims)
+
+            top_idx = int(np.argmax(action_max_sims))
+            top_score = float(action_max_sims[top_idx])
+            top_act = self._action_names[top_idx]
+
+            # 3. Early exit on high-confidence match (S* >= 0.85)
+            if top_score >= 0.85:
+                if top_act == "conversation":
+                    return None, top_score
+                return top_act, top_score
+
+            # 4. Margin-based thresholding for moderate confidence
+            action_max_sims[top_idx] = -1.0
+            second_score = float(np.max(action_max_sims)) if n_actions > 1 else 0.0
+            margin = top_score - second_score
+
+            if top_act == "conversation":
+                return None, top_score
+
+            if top_score >= min_score and margin >= min_margin:
+                return top_act, top_score
+
             return None, top_score
 
-        if top_score >= min_score and margin >= min_margin:
-            return top_act, top_score
-
-        return None, top_score
+    def clear(self) -> None:
+        """Frees large exemplar matrices on shutdown and clears LRU caches."""
+        try:
+            self._decide_memo.cache_clear()
+        except Exception:
+            pass
+        self._exemplar_matrix = np.array([], dtype=np.float32)
+        self._exemplar_action_indices = np.array([], dtype=np.int32)
+        self._idf = np.array([], dtype=np.float32)
+        self._vocab.clear()
 
     def classify(self, user_text: str, min_score: float = 0.25, min_margin: float = 0.03) -> DecisionMatch:
         """
         Evaluates user text and returns DecisionMatch with confidence and extracted parameters.
         """
+        if not user_text:
+            return DecisionMatch(intent=None, confidence=0.0, args={})
+        if not isinstance(user_text, str):
+            try:
+                user_text = str(user_text, errors="ignore") if isinstance(user_text, (bytes, bytearray)) else str(user_text)
+            except Exception:
+                return DecisionMatch(intent=None, confidence=0.0, args={})
+        if len(user_text) > 4096:
+            user_text = user_text[:4096]
+
         action, conf = self.decide(user_text, min_score=min_score, min_margin=min_margin)
         args: Dict[str, Any] = {}
         clean = user_text.lower().strip(" ,.!?")
@@ -435,9 +596,9 @@ class SemanticDecisionEngine:
                     args["site"] = site
                     break
         elif action == "open_folder":
-            m = re.search(r"(?:open|show|bring\s+up)\s+(?:the\s+)?(?:folder\s+)?(.+?)(?:\s+folder|\s+directory)?$", clean)
+            m = _RE_OPEN_FOLDER.search(clean)
             f_name = m.group(1).strip() if m else clean
-            args["folder"] = re.sub(r"^(?:my|the)\s+", "", f_name).strip()
+            args["folder"] = _RE_STRIP_MY_THE.sub("", f_name).strip()
         elif action == "open_recent_file":
             folder = "downloads"
             if "documents" in clean:
@@ -445,13 +606,13 @@ class SemanticDecisionEngine:
             elif "desktop" in clean:
                 folder = "desktop"
             args["folder"] = folder
-            ext_m = re.search(r"\b(pdf|txt|md|docx|xlsx|csv|png|jpg|mp4|py)\b", clean)
+            ext_m = _RE_FILE_EXT.search(clean)
             if ext_m:
                 args["extension"] = ext_m.group(1)
         elif action == "show_last_download":
             args["folder"] = "downloads"
         elif action == "remember_folder":
-            m = re.search(r"remember\s+(?:this\s+folder\s+)?(?:as\s+)?(.+)", clean)
+            m = _RE_REMEMBER_FOLDER.search(clean)
             if m:
                 args["alias"] = m.group(1).strip()
         return DecisionMatch(intent=action, confidence=conf, args=args)
@@ -477,28 +638,28 @@ def _extract_args_for_action(action: str, clean: str) -> Dict[str, Any]:
     elif action == "open_app":
         from commands import APPS
         for app in sorted(APPS.keys(), key=len, reverse=True):
-            if re.search(rf"\b{re.escape(app)}\b", clean):
+            if _get_word_boundary_regex(app).search(clean):
                 args["app"] = app
                 break
     elif action == "open_site":
         from commands import SITES
         for site in sorted(SITES.keys(), key=len, reverse=True):
-            if re.search(rf"\b{re.escape(site)}\b", clean):
+            if _get_word_boundary_regex(site).search(clean):
                 args["site"] = site
                 break
     elif action == "play_music":
         platform = "spotify" if "spotify" in clean else ("youtube" if "youtube" in clean else "auto")
         query = clean
-        m = re.search(r"(?:play|put on|listen to|search for)\s+(.+?)(?:\s+(?:on|in)\s+(?:spotify|youtube))?$", clean)
+        m = _RE_PLAY_MUSIC.search(clean)
         if m:
             query = m.group(1).strip()
         args = {"query": query, "platform": platform}
     elif action == "show_widget":
         args["widget"] = "media" if ("media" in clean or "music" in clean) else "weather"
     elif action == "open_folder":
-        m = re.search(r"(?:open|show|bring\s+up)\s+(?:the\s+)?(?:folder\s+)?(.+?)(?:\s+folder|\s+directory)?$", clean)
+        m = _RE_OPEN_FOLDER.search(clean)
         f_name = m.group(1).strip() if m else clean
-        args["folder"] = re.sub(r"^(?:my|the)\s+", "", f_name).strip()
+        args["folder"] = _RE_STRIP_MY_THE.sub("", f_name).strip()
     elif action == "open_recent_file":
         folder = "downloads"
         if "documents" in clean:
@@ -506,22 +667,22 @@ def _extract_args_for_action(action: str, clean: str) -> Dict[str, Any]:
         elif "desktop" in clean:
             folder = "desktop"
         args["folder"] = folder
-        ext_m = re.search(r"\b(pdf|txt|md|docx|xlsx|csv|png|jpg|mp4|py)\b", clean)
+        ext_m = _RE_FILE_EXT.search(clean)
         if ext_m:
             args["extension"] = ext_m.group(1)
     elif action == "show_last_download":
         args["folder"] = "downloads"
     elif action == "remember_folder":
-        m = re.search(r"remember\s+(?:this\s+folder\s+)?(?:as\s+)?(.+)", clean)
+        m = _RE_REMEMBER_FOLDER.search(clean)
         if m:
             args["alias"] = m.group(1).strip()
     elif action == "set_volume":
-        m = re.search(r"\b(?:set\s+)?volume\s+(?:to\s+)?(\d{1,3})\b", clean)
+        m = _RE_SET_VOLUME.search(clean)
         args["level"] = int(m.group(1)) if m else 50
     elif action in ("brightness_up", "brightness_down"):
         args["steps"] = 10
     elif action == "set_brightness":
-        m = re.search(r"\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})\b", clean)
+        m = _RE_SET_BRIGHTNESS.search(clean)
         args["level"] = int(m.group(1)) if m else 50
     elif action == "snap_window":
         dir_val = "left"
@@ -537,11 +698,11 @@ def _extract_args_for_action(action: str, clean: str) -> Dict[str, Any]:
     elif action == "switch_to_app":
         from commands import APPS
         for app in sorted(APPS.keys(), key=len, reverse=True):
-            if re.search(rf"\b{re.escape(app)}\b", clean):
+            if _get_word_boundary_regex(app).search(clean):
                 args["app"] = app
                 break
         if "app" not in args:
-            m = re.search(r"(?:switch\s+(?:to\s+)?)(.+)", clean)
+            m = _RE_SWITCH_APP.search(clean)
             if m:
                 args["app"] = m.group(1).strip()
     elif action in ("shutdown_system", "restart_system"):
@@ -648,7 +809,7 @@ def check_ambiguity_candidates(user_text: str) -> List[Candidate]:
         found_apps = []
         seen_targets = set()
         for app in sorted(APPS.keys(), key=len, reverse=True):
-            if re.search(rf"\b{re.escape(app)}\b", clean):
+            if _get_word_boundary_regex(app).search(clean):
                 tgt = APPS[app]
                 if tgt not in seen_targets:
                     seen_targets.add(tgt)
@@ -669,7 +830,7 @@ def check_ambiguity_candidates(user_text: str) -> List[Candidate]:
         found_sites = []
         seen_sites = set()
         for site in sorted(SITES.keys(), key=len, reverse=True):
-            if re.search(rf"\b{re.escape(site)}\b", clean):
+            if _get_word_boundary_regex(site).search(clean):
                 tgt = SITES[site]
                 if tgt not in seen_sites:
                     seen_sites.add(tgt)
@@ -731,6 +892,16 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
     executes it locally and returns J.A.R.V.I.S.'s spoken reply in ~5-15 ms.
     Returns None if the utterance should be routed to Groq LLM (System 2).
     """
+    if not user_text:
+        return None
+    if not isinstance(user_text, str):
+        try:
+            user_text = str(user_text, errors="ignore") if isinstance(user_text, (bytes, bytearray)) else str(user_text)
+        except Exception:
+            return None
+    if len(user_text) > 4096:
+        user_text = user_text[:4096]
+
     from ai import execute_whitelisted_action
     from commands import APPS, SITES, get_system_telemetry
 
@@ -792,7 +963,7 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
     elif action == "play_music":
         platform = "spotify" if "spotify" in clean else ("youtube" if "youtube" in clean else "auto")
         query = clean
-        m = re.search(r"(?:play|put on|listen to|search for)\s+(.+?)(?:\s+(?:on|in)\s+(?:spotify|youtube))?$", clean)
+        m = _RE_PLAY_MUSIC.search(clean)
         if m:
             query = m.group(1).strip()
         args = {"query": query, "platform": platform}
@@ -895,6 +1066,11 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
         args = {"mode": "wake"}
         action = "mode"
         reply = "Online. At your service, sir."
+        try:
+            from ai import prewarm_connection
+            prewarm_connection(async_prewarm=True)
+        except Exception:
+            pass
     elif action == "train_voice":
         from voice_profile import get_voice_profile
         from voice import Voice
@@ -935,10 +1111,10 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
             return None
     elif action == "open_folder":
         folder_raw = clean
-        m = re.search(r"(?:open|show|bring\s+up)\s+(?:the\s+)?(?:folder\s+)?(.+?)(?:\s+folder|\s+directory)?$", clean)
+        m = _RE_OPEN_FOLDER.search(clean)
         if m:
             folder_raw = m.group(1).strip()
-        folder_raw = re.sub(r"^(?:my|the)\s+", "", folder_raw).strip()
+        folder_raw = _RE_STRIP_MY_THE.sub("", folder_raw).strip()
         args = {"folder": folder_raw}
         reply = f"Opening {folder_raw} folder, sir."
     elif action == "open_recent_file":
@@ -948,7 +1124,7 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
         elif "desktop" in clean:
             folder = "desktop"
         args = {"folder": folder}
-        ext_m = re.search(r"\b(pdf|txt|md|docx|xlsx|csv|png|jpg|mp4|py)\b", clean)
+        ext_m = _RE_FILE_EXT.search(clean)
         if ext_m:
             args["extension"] = ext_m.group(1)
         reply = f"Opening recent file from {folder}, sir."
@@ -956,13 +1132,13 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
         args = {}
         reply = "Showing your latest download in Explorer, sir."
     elif action == "remember_folder":
-        m = re.search(r"remember\s+(?:this\s+folder\s+)?(?:as\s+)?(.+)", clean)
+        m = _RE_REMEMBER_FOLDER.search(clean)
         alias = m.group(1).strip() if m else "workspace"
         path = os.getcwd()
         args = {"alias": alias, "path": path, "confirmed": True}
         reply = f"Remembering folder as '{alias}', sir."
     elif action == "set_volume":
-        m = re.search(r"\b(?:set\s+)?volume\s+(?:to\s+)?(\d{1,3})\b", clean)
+        m = _RE_SET_VOLUME.search(clean)
         lvl = int(m.group(1)) if m else 50
         args = {"level": lvl}
         reply = f"Volume set to {lvl} percent, sir."
@@ -973,7 +1149,7 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
         args = {"steps": 10}
         reply = "Screen brightness lowered, sir."
     elif action == "set_brightness":
-        m = re.search(r"\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})\b", clean)
+        m = _RE_SET_BRIGHTNESS.search(clean)
         lvl = int(m.group(1)) if m else 50
         args = {"level": lvl}
         reply = f"Display brightness calibrated to {lvl} percent, sir."
@@ -999,11 +1175,11 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
         from commands import APPS
         target_app = ""
         for app in sorted(APPS.keys(), key=len, reverse=True):
-            if re.search(rf"\b{re.escape(app)}\b", clean):
+            if _get_word_boundary_regex(app).search(clean):
                 target_app = app
                 break
         if not target_app:
-            m = re.search(r"(?:switch\s+(?:to\s+)?)(.+)", clean)
+            m = _RE_SWITCH_APP.search(clean)
             if m:
                 target_app = m.group(1).strip()
         args = {"app": target_app}
@@ -1085,7 +1261,7 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
             args = {"value": 1.0, "from_unit": "km", "to_unit": "miles"}
             reply = "Unit conversion completed, sir."
     elif action == "quick_note":
-        m_note = re.search(r"(?:note\s+that|take\s+(?:a\s+)?note|write\s+down|add\s+note)\s+(.+)", clean)
+        m_note = _RE_QUICK_NOTE.search(clean)
         note_txt = m_note.group(1).strip() if m_note else clean
         args = {"text": note_txt}
         reply = f"Note recorded: '{note_txt}', sir."

@@ -1509,14 +1509,16 @@ class SettingsWindow(QDialog):
             self.mic_timer.stop()
         if self.updater and hasattr(self, "_updater_cb"):
             self.updater.remove_listener(self._updater_cb)
-        super().closeEvent(event)
+        if event is not None:
+            event.ignore()
+        self.hide()
 
     def reject(self):
         if hasattr(self, "mic_timer") and self.mic_timer.isActive():
             self.mic_timer.stop()
         if self.updater and hasattr(self, "_updater_cb"):
             self.updater.remove_listener(self._updater_cb)
-        super().reject()
+        self.hide()
 
     def _on_test_conn_result(self, ok, message, models_data):
         if hasattr(self, "btn_test_conn"):
@@ -2636,8 +2638,26 @@ class Overlay:
             self.timer = QTimer()
             self.timer.timeout.connect(self._tick)
             self.timer.start(16)
+
+            # Pre-create SettingsWindow hidden when idle after startup (< 150 ms latency target)
+            QTimer.singleShot(1500, self._prewarm_settings)
         else:
             self._init_tk_fallback()
+
+    def _prewarm_settings(self):
+        """Pre-creates the SettingsWindow hidden when idle to eliminate opening latency."""
+        if not PYSIDE6_AVAILABLE or not self.cfg or not self.ctx:
+            return
+        if self.stop.is_set() or self.settings_dlg is not None:
+            return
+        try:
+            _SettingsClass = _NewSettingsWindow if _NEW_UI_AVAILABLE else SettingsWindow
+            self.settings_dlg = _SettingsClass(self.cfg, self.ctx, updater=self.updater)
+            if hasattr(self.settings_dlg, "winId"):
+                _ = self.settings_dlg.winId()
+            self.settings_dlg.hide()
+        except Exception as exc:
+            print(f"[overlay] prewarm settings failed: {exc}")
 
     def post(self, kind, **data):
         """Thread-safe state update."""
@@ -2660,17 +2680,13 @@ class Overlay:
 
         _SettingsClass = _NewSettingsWindow if _NEW_UI_AVAILABLE else SettingsWindow
 
-        if self.settings_dlg is None or not self.settings_dlg.isVisible():
+        if self.settings_dlg is None:
             self.settings_dlg = _SettingsClass(self.cfg, self.ctx, updater=self.updater)
-            self.settings_dlg.select_tab(initial_tab)
-            self.settings_dlg.show()
-            self.settings_dlg.raise_()
-            self.settings_dlg.activateWindow()
-        else:
-            self.settings_dlg.select_tab(initial_tab)
-            self.settings_dlg.show()
-            self.settings_dlg.raise_()
-            self.settings_dlg.activateWindow()
+
+        self.settings_dlg.select_tab(initial_tab)
+        self.settings_dlg.show()
+        self.settings_dlg.raise_()
+        self.settings_dlg.activateWindow()
 
     def quit_app(self):
         self.stop.set()

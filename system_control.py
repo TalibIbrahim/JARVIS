@@ -90,6 +90,9 @@ class WindowBackendProtocol(Protocol):
     def get_foreground_window_title(self) -> str:
         ...
 
+    def is_foreground_elevated(self) -> bool:
+        ...
+
     def resolve_window_under_cursor(self, point: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
         ...
 
@@ -516,11 +519,114 @@ class MockDisplayBackend:
 
 
 # ============================================================================
+# Windows UIPI / Elevated Window Detection
+# ============================================================================
+
+ELEVATED_WINDOW_EXPLANATION: str = "ELEVATED WINDOW - RUN AS ADMIN"
+
+
+def is_window_elevated(hwnd: Optional[int] = None) -> bool:
+    """
+    Returns True if target window (or current foreground window) belongs to an
+    elevated (Administrator / High Integrity Level) process.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+
+        target_hwnd = hwnd if hwnd is not None else user32.GetForegroundWindow()
+        if not target_hwnd:
+            return False
+
+        pid = ctypes.c_ulong(0)
+        user32.GetWindowThreadProcessId(target_hwnd, ctypes.byref(pid))
+        if pid.value == 0:
+            return False
+
+        # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h_proc = kernel32.OpenProcess(0x1000, False, pid.value)
+        if not h_proc:
+            err = kernel32.GetLastError()
+            if err == 5:  # ERROR_ACCESS_DENIED from medium integrity caller
+                return True
+            return False
+
+        h_token = ctypes.c_void_p()
+        # TOKEN_QUERY = 0x0008
+        if not advapi32.OpenProcessToken(h_proc, 0x0008, ctypes.byref(h_token)):
+            kernel32.CloseHandle(h_proc)
+            return False
+
+        class TOKEN_ELEVATION(ctypes.Structure):
+            _fields_ = [("TokenIsElevated", ctypes.c_ulong)]
+
+        elevation = TOKEN_ELEVATION()
+        ret_len = ctypes.c_ulong(0)
+        ok = advapi32.GetTokenInformation(
+            h_token,
+            20,  # TokenElevation
+            ctypes.byref(elevation),
+            ctypes.sizeof(elevation),
+            ctypes.byref(ret_len),
+        )
+        kernel32.CloseHandle(h_token)
+        kernel32.CloseHandle(h_proc)
+
+        if ok and elevation.TokenIsElevated != 0:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def is_current_process_elevated() -> bool:
+    """Returns True if the current Python/Jarvis process is running elevated as Administrator."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def is_foreground_window_elevated() -> bool:
+    """Convenience helper to check if current foreground window is elevated."""
+    return is_window_elevated(None)
+
+
+def check_uipi_elevation(hwnd: Optional[int] = None) -> Tuple[bool, str]:
+    """
+    Checks if a window action is blocked by Windows UIPI (target elevated, Jarvis standard).
+    Returns (is_blocked, explanation_message).
+    """
+    if sys.platform != "win32":
+        return False, ""
+    if is_current_process_elevated():
+        return False, ""
+    if is_window_elevated(hwnd):
+        return True, ELEVATED_WINDOW_EXPLANATION
+    return False, ""
+
+
+# ============================================================================
 # Window Management Implementations
 # ============================================================================
 
 class WindowsWindowBackend:
     """Window management backend using Win32 API and pyautogui hotkeys."""
+
+    def __init__(self, elevation_checker: Optional[Callable[[], bool]] = None):
+        self._elevation_checker = elevation_checker
+
+    def is_foreground_elevated(self) -> bool:
+        if self._elevation_checker is not None:
+            return bool(self._elevation_checker())
+        return is_foreground_window_elevated()
 
     def snap_window(self, direction: str) -> bool:
         dir_clean = str(direction).lower().strip()
@@ -658,14 +764,18 @@ class WindowsWindowBackend:
 class MockWindowBackend:
     """In-memory mock window backend for deterministic testing."""
 
-    def __init__(self, foreground_title: str = "Test Window"):
+    def __init__(self, foreground_title: str = "Test Window", is_elevated: bool = False):
         self.foreground_title = foreground_title
+        self.is_elevated = is_elevated
         self.last_snap: Optional[str] = None
         self.all_minimized = False
         self.moved_monitor = False
         self.closed = False
         self.switched_apps: List[str] = []
         self.calls: List[Tuple[str, Any]] = []
+
+    def is_foreground_elevated(self) -> bool:
+        return self.is_elevated
 
     def snap_window(self, direction: str) -> bool:
         self.calls.append(("snap_window", direction))
@@ -942,12 +1052,35 @@ class SystemControlAdapter:
         display_backend: Optional[DisplayBackendProtocol] = None,
         window_backend: Optional[WindowBackendProtocol] = None,
         power_backend: Optional[PowerSessionBackendProtocol] = None,
+        overlay: Optional[Any] = None,
     ):
         self.audio = audio_backend or PycawAudioBackend()
         self.display = display_backend or WindowsDisplayBackend()
         self.window = window_backend or WindowsWindowBackend()
         self.power = power_backend or WindowsPowerSessionBackend()
+        self.overlay = overlay
         self._pending_destructive_action: Optional[str] = None
+
+    def set_overlay(self, overlay: Any) -> None:
+        self.overlay = overlay
+
+    def _check_uipi_block(self, overlay: Optional[Any] = None) -> Tuple[bool, str]:
+        ov = overlay or self.overlay
+        is_elevated = False
+        if hasattr(self.window, "is_foreground_elevated"):
+            is_elevated = self.window.is_foreground_elevated()
+        else:
+            is_elevated = is_foreground_window_elevated()
+
+        if is_elevated and not is_current_process_elevated():
+            if ov:
+                try:
+                    ov.post("result", text=ELEVATED_WINDOW_EXPLANATION, icon="error")
+                    ov.post("say", text=ELEVATED_WINDOW_EXPLANATION, speak=False)
+                except Exception:
+                    pass
+            return True, ELEVATED_WINDOW_EXPLANATION
+        return False, ""
 
     # --- Audio API ---
 
@@ -998,13 +1131,19 @@ class SystemControlAdapter:
 
     # --- Window API ---
 
-    def snap_window(self, direction: str) -> Tuple[bool, str]:
+    def snap_window(self, direction: str, overlay: Optional[Any] = None) -> Tuple[bool, str]:
+        blocked, msg = self._check_uipi_block(overlay)
+        if blocked:
+            return False, f"Target window is elevated: {msg}"
         ok = self.window.snap_window(direction)
         if ok:
             return True, f"Window snapped {direction}, sir."
         return False, f"Invalid snap direction '{direction}', sir."
 
-    def minimize_all(self) -> Tuple[bool, str]:
+    def minimize_all(self, overlay: Optional[Any] = None) -> Tuple[bool, str]:
+        blocked, msg = self._check_uipi_block(overlay)
+        if blocked:
+            return False, f"Target window is elevated: {msg}"
         ok = self.window.minimize_all()
         if ok:
             return True, "All windows minimized, sir."
@@ -1016,13 +1155,19 @@ class SystemControlAdapter:
             return True, f"Switched focus to {app_name}, sir."
         return False, f"Could not find or launch application '{app_name}', sir."
 
-    def move_to_other_monitor(self) -> Tuple[bool, str]:
+    def move_to_other_monitor(self, overlay: Optional[Any] = None) -> Tuple[bool, str]:
+        blocked, msg = self._check_uipi_block(overlay)
+        if blocked:
+            return False, f"Target window is elevated: {msg}"
         ok = self.window.move_to_other_monitor()
         if ok:
             return True, "Active window moved to other monitor, sir."
         return False, "Failed to move window to other monitor, sir."
 
-    def close_window(self, confirm: bool = False) -> Tuple[bool, str]:
+    def close_window(self, confirm: bool = False, overlay: Optional[Any] = None) -> Tuple[bool, str]:
+        blocked, msg = self._check_uipi_block(overlay)
+        if blocked:
+            return False, f"Target window is elevated: {msg}"
         return self.window.close_window(confirm=confirm)
 
     def resolve_window_under_cursor(self, point: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
@@ -1135,20 +1280,20 @@ def get_brightness() -> Tuple[bool, str]:
 def toggle_night_light() -> Tuple[bool, str]:
     return get_system_control().toggle_night_light()
 
-def snap_window(direction: str) -> Tuple[bool, str]:
-    return get_system_control().snap_window(direction=direction)
+def snap_window(direction: str, overlay: Optional[Any] = None) -> Tuple[bool, str]:
+    return get_system_control().snap_window(direction=direction, overlay=overlay)
 
-def minimize_all() -> Tuple[bool, str]:
-    return get_system_control().minimize_all()
+def minimize_all(overlay: Optional[Any] = None) -> Tuple[bool, str]:
+    return get_system_control().minimize_all(overlay=overlay)
 
 def switch_to_app(app_name: str) -> Tuple[bool, str]:
     return get_system_control().switch_to_app(app_name=app_name)
 
-def move_to_other_monitor() -> Tuple[bool, str]:
-    return get_system_control().move_to_other_monitor()
+def move_to_other_monitor(overlay: Optional[Any] = None) -> Tuple[bool, str]:
+    return get_system_control().move_to_other_monitor(overlay=overlay)
 
-def close_window(confirm: bool = False) -> Tuple[bool, str]:
-    return get_system_control().close_window(confirm=confirm)
+def close_window(confirm: bool = False, overlay: Optional[Any] = None) -> Tuple[bool, str]:
+    return get_system_control().close_window(confirm=confirm, overlay=overlay)
 
 def get_foreground_window_title() -> str:
     return get_system_control().window.get_foreground_window_title()

@@ -181,6 +181,9 @@ class AppleDynamicIsland(QWidget):
         self.precision_active= False
         self.thinking        = False
         self.thinking_until  = 0.0
+        self.thinking_status: Optional[str] = None
+        self._thinking_start_t: float = 0.0
+        self._listening_start_t: float = 0.0
         self.is_ai_error     = False
         self.is_transcribing = False
 
@@ -295,6 +298,16 @@ class AppleDynamicIsland(QWidget):
         # Theme
         self.dark_mode, _ = self._read_theme()
 
+        # Repaint consolidation & dirty region tracking
+        self._is_hovering: bool = False
+        self._prev_is_hovering: bool = False
+        self._prev_springs_active: bool = False
+        self._last_rendered_state: Optional[IslandState] = None
+        self._last_rendered_dark: Optional[bool] = None
+        self._last_rendered_min: Optional[int] = None
+        self._last_rendered_temp: Optional[float] = None
+        self._dirty: bool = True
+
         self.resize(110, 30)
         self._center_top()
 
@@ -372,7 +385,9 @@ class AppleDynamicIsland(QWidget):
                 # Add horizontal nope offset during NO_SPEECH
                 nope_dx = int(round(self._nope_offset_x))
                 cx = geom.x() + (geom.width() - w) // 2 + nope_dx
-                self.setGeometry(cx, geom.y(), w, h)
+                cur = self.geometry()
+                if cur.x() != cx or cur.y() != geom.y() or cur.width() != w or cur.height() != h:
+                    self.setGeometry(cx, geom.y(), w, h)
         except Exception as exc:
             print(f"[island] center_top: {exc}")
 
@@ -849,11 +864,20 @@ class AppleDynamicIsland(QWidget):
         if self.no_speech_active and (now < self._nope_t0 + self._nope_duration):
             return IslandState.NO_SPEECH
         if self.listening or now < self.listening_until:
+            if self._listening_start_t == 0.0:
+                self._listening_start_t = now
             return IslandState.LISTENING
+        else:
+            self._listening_start_t = 0.0
+
         if self.thinking and now < self.thinking_until:
+            if self._thinking_start_t == 0.0:
+                self._thinking_start_t = now
             if self.user_prompt:
                 return IslandState.PROMPT
             return IslandState.THINKING
+        else:
+            self._thinking_start_t = 0.0
         if now < self.prompt_until and self.user_prompt:
             if now < self.say_until:
                 return IslandState.SPEAKING
@@ -952,6 +976,15 @@ class AppleDynamicIsland(QWidget):
             disp = max(len(self.user_prompt), 20)
             tw = min(500.0, max(300.0, 130.0 + disp * 7.0))
             return (tw * scale, 48.0 * scale)
+        elif state == IslandState.THINKING:
+            cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+            ui_status_line = getattr(cfg, "ui_status_line_enabled", True)
+            elapsed = now - self._thinking_start_t if self._thinking_start_t > 0.0 else 0.0
+            tw = 320.0
+            if ui_status_line and elapsed > 1.5:
+                status_txt = getattr(self, "thinking_status", None) or getattr(self, "status_text", None) or "Consulting Groq LLM..."
+                tw = min(480.0, max(320.0, 60.0 + len(status_txt) * 7.2 + 50.0))
+            return (tw * scale, 46.0 * scale)
         elif state == IslandState.IDLE:
             compact_mode = self._get_current_compact_mode()
             if compact_mode == "media":
@@ -1046,10 +1079,78 @@ class AppleDynamicIsland(QWidget):
         self._opacity_spring.update(dt, reduce)
 
         # Ease 7 waveform bars toward live RMS level
-        self._update_wave_bars(now)
+        if state == IslandState.LISTENING or self.listening or any(b > 0.01 for b in self._wave_bars):
+            self._update_wave_bars(now)
 
         self._center_top()
-        self.update()
+
+        # ── Redundant Repaint Suppression ────────────────────────────────
+        springs_active = not (
+            self.spring_w.settled and
+            self.spring_h.settled and
+            self.spring_prog.settled and
+            self.spring_glow.settled and
+            self.spring_hud_volume.settled and
+            self._opacity_spring.settled
+        )
+
+        state_changed = (state != getattr(self, "_last_rendered_state", None))
+        theme_changed = (self.dark_mode != getattr(self, "_last_rendered_dark", None))
+        springs_moving = springs_active or getattr(self, "_prev_springs_active", False)
+        hover_active = getattr(self, "_is_hovering", False) or getattr(self, "_prev_is_hovering", False) or (self._hover_enter_t > 0.0)
+        dwell_active = (self._hovered_btn is not None or self._hovered_chip_idx is not None or now < getattr(self, "_btn_flash_until", 0.0))
+
+        anim_active = (
+            state in (
+                IslandState.WAKE,
+                IslandState.LISTENING,
+                IslandState.THINKING,
+                IslandState.CARD_SENDING,
+                IslandState.SPEAKING,
+            )
+            or self.no_speech_active
+            or (self.target_prompt and self.user_prompt != self.target_prompt)
+            or self.media_playing
+            or (state == IslandState.CARD_MEDIA and any(abs(b - 0.15) > 0.01 for b in self._media_bars))
+            or (state in (IslandState.CARD_TIMER, IslandState.IDLE) and self.timer_active and not getattr(self, "timer_paused", False))
+            or (state == IslandState.TRACKING and self.active and self.landmarks)
+            or (self.disambiguate_active and bool(self.disambiguate_candidates))
+            or getattr(self, "_dirty", False)
+        )
+        if reduce and (now - self._crossfade_start < (REDUCE_MOTION_MS / 1000.0)):
+            anim_active = True
+
+        clock_tick = False
+        if state == IslandState.IDLE:
+            cm = self._get_current_compact_mode()
+            if cm in ("time", "time_weather"):
+                current_min = int(now) // 60
+                if current_min != getattr(self, "_last_rendered_min", None) or self.weather_temp != getattr(self, "_last_rendered_temp", None):
+                    clock_tick = True
+                    self._last_rendered_min = current_min
+                    self._last_rendered_temp = self.weather_temp
+            elif cm == "media":
+                if any(abs(b - 0.15) > 0.01 for b in self._media_bars):
+                    anim_active = True
+
+        needs_repaint = (
+            state_changed or
+            theme_changed or
+            springs_moving or
+            hover_active or
+            dwell_active or
+            anim_active or
+            clock_tick
+        )
+
+        if needs_repaint:
+            self.update()
+            self._last_rendered_state = state
+            self._last_rendered_dark = self.dark_mode
+            self._dirty = False
+
+        self._prev_springs_active = springs_active
+        self._prev_is_hovering = getattr(self, "_is_hovering", False)
 
     def _update_wave_bars(self, now: float) -> None:
         live_vol = 0.0
@@ -1077,6 +1178,7 @@ class AppleDynamicIsland(QWidget):
         cursor_pos = QCursor.pos()
         geom = self.geometry()
         is_hovering = geom.contains(cursor_pos)
+        self._is_hovering = is_hovering
 
         cfg = getattr(self.mgr, "cfg", None)
         expand_trig = getattr(cfg, "island_expand_trigger", "hover")
@@ -1632,6 +1734,9 @@ class AppleDynamicIsland(QWidget):
         p.setOpacity(opacity)
         self._draw_content(p, w, h, now, t, state, dark, reduce)
         p.setOpacity(1.0)
+        self._last_rendered_state = state
+        self._last_rendered_dark = dark
+        self._dirty = False
 
     def _draw_shimmer(self, p: QPainter, path: QPainterPath, w: float, h: float, t: float, dark: bool) -> None:
         p.save()
@@ -1727,7 +1832,7 @@ class AppleDynamicIsland(QWidget):
             self._draw_listening(p, w, h, cy, t, now, dark, primary, accent, reduce)
 
         elif state == IslandState.THINKING:
-            self._draw_thinking(p, w, h, cy, t, dark, primary, accent, CYAN)
+            self._draw_thinking(p, w, h, cy, t, dark, primary, accent, CYAN, now=now)
 
         elif state == IslandState.CARD_SENDING:
             self._draw_sending_indicator(p, w, h, cy, t, dark, primary, accent, CYAN)
@@ -2727,6 +2832,20 @@ class AppleDynamicIsland(QWidget):
         title = "Processing..." if self.is_transcribing else "Listening..."
         p.drawText(int(text_x), int(cy - 3), title)
 
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        ui_cancel_hint = getattr(cfg, "ui_cancel_hint_enabled", True)
+        elapsed = now - self._listening_start_t if self._listening_start_t > 0.0 else 0.0
+
+        if ui_cancel_hint and elapsed > 3.0:
+            hint_font = qfont(TYPE.caption_2)
+            p.setFont(hint_font)
+            hint_col = QColor(T.color.secondary_label.resolve(dark))
+            if not reduce:
+                hint_col.setAlphaF(min(1.0, (elapsed - 3.0) / 0.35))
+            p.setPen(hint_col)
+            hint_rect = QRectF(text_x, cy - 14.0, (w - 68.0) - text_x, 14.0)
+            p.drawText(hint_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "Say 'cancel' to dismiss")
+
         self._draw_partial_transcript(p, text_x, cy + 11, max_text_w, now, dark, primary, reduce)
 
     def _draw_siri_orb(self, p: QPainter, orb_cx: float, orb_cy: float, t: float, speed_mult: float) -> None:
@@ -2798,6 +2917,9 @@ class AppleDynamicIsland(QWidget):
         fm = p.fontMetrics()
         space_w = fm.horizontalAdvance(" ")
 
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        ui_progressive_shimmer = getattr(cfg, "ui_progressive_shimmer_enabled", True)
+
         cur_x = x
         for word, arrival_t in self._transcript_words:
             word_w = fm.horizontalAdvance(word)
@@ -2808,18 +2930,31 @@ class AppleDynamicIsland(QWidget):
 
             if reduce:
                 alpha = 1.0
+                col = QColor(primary)
             else:
-                age = now - arrival_t
+                age = max(0.0, now - arrival_t)
                 alpha = min(1.0, max(0.0, age / 0.140))
+                col = QColor(primary)
+                if ui_progressive_shimmer and age < 2.0:
+                    recency = 1.0 - (age / 2.0)
+                    shimmer_wave = 0.5 + 0.5 * math.sin(now * 7.5 - cur_x * 0.06)
+                    boost = int(55.0 * recency * shimmer_wave)
+                    r = min(255, col.red() + boost)
+                    g = min(255, col.green() + boost)
+                    b = min(255, col.blue() + boost)
+                    col = QColor(r, g, b)
 
-            col = QColor(primary)
             col.setAlphaF(alpha)
             p.setPen(col)
             p.drawText(int(cur_x), int(y), word)
             cur_x += word_w + space_w
 
     def _draw_thinking(self, p: QPainter, w: float, h: float, cy: float,
-                       t: float, dark: bool, primary: QColor, accent: QColor, CYAN: QColor) -> None:
+                       t: float, dark: bool, primary: QColor, accent: QColor, CYAN: QColor,
+                       now: float = 0.0) -> None:
+        if now == 0.0:
+            now = time.time()
+
         self._draw_siri_orb(p, orb_cx=28.0, orb_cy=cy, t=t, speed_mult=2.8)
 
         text_x = 48.0
@@ -2829,10 +2964,34 @@ class AppleDynamicIsland(QWidget):
         p.setPen(accent)
         p.drawText(int(text_x), int(cy - 2), "Jarvis")
 
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        ui_status_line = getattr(cfg, "ui_status_line_enabled", True)
+        ui_cancel_hint = getattr(cfg, "ui_cancel_hint_enabled", True)
+        reduce = T.reduce_motion()
+
+        elapsed = now - self._thinking_start_t if self._thinking_start_t > 0.0 else 0.0
+
+        # Thinking Status Line (> 1.5s): update secondary status line
+        if ui_status_line and elapsed > 1.5:
+            thinking_label = getattr(self, "thinking_status", None) or getattr(self, "status_text", None) or "Consulting Groq LLM..."
+        else:
+            thinking_label = "Thinking..."
+
         sub_font = qfont(TYPE.caption_1)
         p.setFont(sub_font)
         p.setPen(primary)
-        p.drawText(int(text_x), int(cy + 11), "Thinking...")
+        p.drawText(int(text_x), int(cy + 11), thinking_label)
+
+        # Cancellation Hint (> 3.0s): footnote/caption style
+        if ui_cancel_hint and elapsed > 3.0:
+            hint_font = qfont(TYPE.caption_2)
+            p.setFont(hint_font)
+            hint_col = QColor(T.color.secondary_label.resolve(dark))
+            if not reduce:
+                hint_col.setAlphaF(min(1.0, (elapsed - 3.0) / 0.35))
+            p.setPen(hint_col)
+            hint_rect = QRectF(text_x, cy - 14.0, (w - 46.0) - text_x, 14.0)
+            p.drawText(hint_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "Say 'cancel' to dismiss")
 
         rx = w - 42.0
         for i in range(3):

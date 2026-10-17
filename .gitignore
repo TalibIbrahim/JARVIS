@@ -32,6 +32,9 @@ venv.bak/
 jarvis_config.json
 *.log
 *.tmp
+*.bak
+tests/diffs/
+.cache/
 .env
 *.env
 .env.*

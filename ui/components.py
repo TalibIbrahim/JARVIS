@@ -125,26 +125,44 @@ class Spring:
 # 2. Geometry helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+_SQUIRCLE_CACHE: dict[tuple[float, float, float], QPainterPath] = {}
+_MAX_SQUIRCLE_CACHE = 512
+
 def create_squircle_path(rect: QRectF, radius: float) -> QPainterPath:
     """
     Continuous-curvature squircle path (Apple G² superellipse).
     Uses bézier control factor ≈ 0.552284 for smooth corner transitions.
+    Results are cached by (rect.width(), rect.height(), radius).
     """
-    path = QPainterPath()
-    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
-    r = min(radius, w / 2.0, h / 2.0)
-    c = squircle_bezier_factor(r)
+    w = rect.width()
+    h = rect.height()
+    key = (w, h, float(radius))
+    base_path = _SQUIRCLE_CACHE.get(key)
+    if base_path is None:
+        if len(_SQUIRCLE_CACHE) >= _MAX_SQUIRCLE_CACHE:
+            _SQUIRCLE_CACHE.clear()
+        base_path = QPainterPath()
+        r = min(radius, w / 2.0, h / 2.0)
+        c = squircle_bezier_factor(r)
 
-    path.moveTo(x + r, y)
-    path.lineTo(x + w - r, y)
-    path.cubicTo(x + w - r + c, y,       x + w,     y + r - c, x + w,     y + r)
-    path.lineTo(x + w, y + h - r)
-    path.cubicTo(x + w,     y + h - r + c, x + w - r + c, y + h, x + w - r, y + h)
-    path.lineTo(x + r, y + h)
-    path.cubicTo(x + r - c, y + h,    x,         y + h - r + c, x,         y + h - r)
-    path.lineTo(x, y + r)
-    path.cubicTo(x,         y + r - c, x + r - c, y,             x + r,     y)
-    path.closeSubpath()
+        base_path.moveTo(r, 0.0)
+        base_path.lineTo(w - r, 0.0)
+        base_path.cubicTo(w - r + c, 0.0, w, r - c, w, r)
+        base_path.lineTo(w, h - r)
+        base_path.cubicTo(w, h - r + c, w - r + c, h, w - r, h)
+        base_path.lineTo(r, h)
+        base_path.cubicTo(r - c, h, 0.0, h - r + c, 0.0, h - r)
+        base_path.lineTo(0.0, r)
+        base_path.cubicTo(0.0, r - c, r - c, 0.0, r, 0.0)
+        base_path.closeSubpath()
+        _SQUIRCLE_CACHE[key] = base_path
+
+    x = rect.x()
+    y = rect.y()
+    if x == 0.0 and y == 0.0:
+        return QPainterPath(base_path)
+    path = QPainterPath(base_path)
+    path.translate(x, y)
     return path
 
 
@@ -250,7 +268,6 @@ class AppleSwitch(FocusRingMixin, QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(16)
 
     # ── public interface ──────────────────────────────────────────────────
 
@@ -266,11 +283,15 @@ class AppleSwitch(FocusRingMixin, QWidget):
             return
         self._checked = checked
         self._spring.set_target(1.0 if checked else 0.0)
+        if not self._timer.isActive():
+            self._timer.start(16)
         if not silent:
             self.toggled.emit(checked)
         self.update()
 
     def setEnabled(self, enabled: bool) -> None:
+        if self._enabled == enabled:
+            return
         self._enabled = enabled
         self.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ForbiddenCursor)
         self.update()
@@ -296,13 +317,15 @@ class AppleSwitch(FocusRingMixin, QWidget):
             super().keyPressEvent(event)
 
     def enterEvent(self, event) -> None:
-        self._hovered = True
-        self.update()
+        if not self._hovered:
+            self._hovered = True
+            self.update()
 
     def leaveEvent(self, event) -> None:
-        self._hovered = False
-        self._pressed = False
-        self.update()
+        if self._hovered or self._pressed:
+            self._hovered = False
+            self._pressed = False
+            self.update()
 
     # ── animation ─────────────────────────────────────────────────────────
 
@@ -312,6 +335,9 @@ class AppleSwitch(FocusRingMixin, QWidget):
         if abs(new_t - self._thumb_t) > 0.003:
             self._thumb_t = new_t
             self.update()
+        if self._spring.settled:
+            self._thumb_t = 1.0 if self._checked else 0.0
+            self._timer.stop()
 
     # ── painting ──────────────────────────────────────────────────────────
 
@@ -425,7 +451,6 @@ class SegmentedControl(FocusRingMixin, QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(16)
 
     def _index_of(self, oid: str) -> int:
         for i, (o, _) in enumerate(self.options):
@@ -443,6 +468,8 @@ class SegmentedControl(FocusRingMixin, QWidget):
         idx = self._index_of(oid)
         self._idx = idx
         self._spring.set_target(float(idx))
+        if not self._timer.isActive():
+            self._timer.start(16)
         if not silent:
             self.valueChanged.emit(oid)
         self.update()
@@ -452,6 +479,9 @@ class SegmentedControl(FocusRingMixin, QWidget):
         if abs(new_x - self._thumb_x) > 0.002:
             self._thumb_x = new_x
             self.update()
+        if self._spring.settled:
+            self._thumb_x = float(self._idx)
+            self._timer.stop()
 
     def _seg_rect(self, idx: int) -> QRectF:
         n   = len(self.options)
@@ -470,12 +500,15 @@ class SegmentedControl(FocusRingMixin, QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         n   = len(self.options)
         seg = self.width() / n
-        self._hovered = int(event.position().x() // seg)
-        self.update()
+        new_hov = int(event.position().x() // seg)
+        if self._hovered != new_hov:
+            self._hovered = new_hov
+            self.update()
 
     def leaveEvent(self, event) -> None:
-        self._hovered = None
-        self.update()
+        if self._hovered is not None:
+            self._hovered = None
+            self.update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         n   = len(self.options)
@@ -951,10 +984,14 @@ class _BaseButton(FocusRingMixin, QWidget):
         return self._label
 
     def setText(self, label: str) -> None:
+        if self._label == label:
+            return
         self._label = label
         self.update()
 
     def setEnabled(self, v: bool) -> None:
+        if self._enabled == v:
+            return
         self._enabled = v
         self.setCursor(Qt.CursorShape.PointingHandCursor if v else Qt.CursorShape.ArrowCursor)
         self.update()
@@ -963,13 +1000,15 @@ class _BaseButton(FocusRingMixin, QWidget):
         return self._enabled
 
     def enterEvent(self, e) -> None:
-        self._hovered = True
-        self.update()
+        if not self._hovered:
+            self._hovered = True
+            self.update()
 
     def leaveEvent(self, e) -> None:
-        self._hovered = False
-        self._pressed = False
-        self.update()
+        if self._hovered or self._pressed:
+            self._hovered = False
+            self._pressed = False
+            self.update()
 
     def mousePressEvent(self, e: QMouseEvent) -> None:
         if self._enabled and e.button() == Qt.MouseButton.LeftButton:
@@ -1175,11 +1214,22 @@ class StatusPill(QWidget):
         self.setFixedSize(tw + SPACING.md * 2, 20)
 
     def setText(self, text: str) -> None:
+        if self._text == text:
+            return
         self._text = text
         fm = QFontMetrics(self._font)
         tw = fm.horizontalAdvance(text)
         self.setFixedSize(tw + SPACING.md * 2, 20)
         self.update()
+
+    def setVariant(self, variant: str) -> None:
+        if self._variant == variant:
+            return
+        self._variant = variant
+        self.update()
+
+    def set_variant(self, variant: str) -> None:
+        self.setVariant(variant)
 
     def paintEvent(self, event: QPaintEvent) -> None:
         p = QPainter(self)

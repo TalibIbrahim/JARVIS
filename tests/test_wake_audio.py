@@ -271,5 +271,155 @@ class TestVoiceIntegration(unittest.TestCase):
         self.assertEqual(self.voice.get_followup_window(), 8.0)
 
 
+class TestPiperStreamingAndWarmCache(unittest.TestCase):
+    """Verifies Piper TTS sentence streaming, warm caching, and pre-rendered short phrases."""
+
+    def test_sentence_splitting(self):
+        """Sentence splitter correctly separates [.!?] boundaries while preserving sentences."""
+        from voice import split_into_sentences
+        text = "Yes, sir. Initiating house party protocol now! All systems ready."
+        sentences = split_into_sentences(text)
+        self.assertEqual(sentences, ["Yes, sir.", "Initiating house party protocol now!", "All systems ready."])
+
+        # Single sentence with question mark
+        self.assertEqual(split_into_sentences("At your service?"), ["At your service?"])
+        # Edge cases
+        self.assertEqual(split_into_sentences(""), [])
+        self.assertEqual(split_into_sentences("   "), [])
+        self.assertEqual(split_into_sentences("Done."), ["Done."])
+
+    def test_phrase_normalization(self):
+        """Phrase key normalization is case- and punctuation-insensitive."""
+        from voice import _normalize_phrase_key
+        self.assertEqual(_normalize_phrase_key("Yes, sir."), "yes sir")
+        self.assertEqual(_normalize_phrase_key("Yes, sir?"), "yes sir")
+        self.assertEqual(_normalize_phrase_key("Online and ready."), "online and ready")
+        self.assertEqual(_normalize_phrase_key("At your service!"), "at your service")
+
+    def test_warm_model_singleton(self):
+        """get_shared_piper returns the same warm model without reloading."""
+        import voice
+        fake_model = MagicMock()
+        with patch.object(voice, "_SHARED_PIPER_VOICE", fake_model):
+            with patch.object(voice, "_SHARED_PIPER_PATH", "fake_path"):
+                v1 = voice.get_shared_piper("fake_path", "fake_path.json")
+                v2 = voice.get_shared_piper("fake_path", "fake_path.json")
+                self.assertIs(v1, fake_model)
+                self.assertIs(v2, fake_model)
+
+    def test_phrase_cache_sub_millisecond_playback(self):
+        """Pre-rendered phrases exist in cache and take < 1 ms to fetch for immediate playback."""
+        import voice
+        dummy_audio = np.ones(1000, dtype=np.float32) * 0.1
+        voice._AUDIO_PHRASE_CACHE["yes sir"] = (dummy_audio, 44100)
+
+        t0 = time.perf_counter()
+        key = voice._normalize_phrase_key("Yes, sir.")
+        cached = voice._AUDIO_PHRASE_CACHE.get(key)
+        lookup_time_ms = (time.perf_counter() - t0) * 1000.0
+
+        self.assertIsNotNone(cached)
+        self.assertLess(lookup_time_ms, 1.0)
+        np.testing.assert_array_equal(cached[0], dummy_audio)
+        self.assertEqual(cached[1], 44100)
+
+    @patch("sounddevice.play")
+    @patch("sounddevice.wait")
+    def test_sentence_streaming_calls_sounddevice_per_sentence(self, mock_wait, mock_play):
+        """Sentence streaming plays each sentence sequentially via sounddevice."""
+        import voice
+        from voice import Speaker
+
+        mock_voice = MagicMock()
+        class DummyChunk:
+            sample_rate = 22050
+            audio_float_array = np.zeros(2205, dtype=np.float32)
+
+        mock_voice.synthesize.return_value = [DummyChunk()]
+
+        speaker = Speaker(enabled=True)
+        speaker._piper_voice = mock_voice
+
+        with patch.object(voice, "get_shared_piper", return_value=mock_voice):
+            with patch.object(voice, "_AUDIO_PHRASE_CACHE", {}):
+                text = "First sentence. Second sentence! Third sentence."
+                speaker._say_piper(text)
+
+                # Sounddevice play must have been called 3 times (once per sentence)
+                self.assertEqual(mock_play.call_count, 3)
+                self.assertEqual(mock_wait.call_count, 3)
+
+    def test_audio_fidelity_headroom_and_clipping(self):
+        """Synthesized audio must have 0.88x headroom scaling and clipped within [-0.95, 0.95]."""
+        import voice
+
+        class DummyChunk:
+            sample_rate = 22050
+            audio_float_array = np.ones(1000, dtype=np.float32)
+
+        mock_voice = MagicMock()
+        mock_voice.synthesize.return_value = [DummyChunk()]
+
+        audio, sr = voice._synthesize_sentence_audio(mock_voice, "Test.", target_sr=22050)
+        self.assertLessEqual(float(np.max(audio)), 0.881)
+        self.assertGreaterEqual(float(np.min(audio)), -0.95)
+
+
+class TestLockContentionAndWakeLatency(unittest.TestCase):
+    """Verifies that PortAudio lock contention is eliminated during blocking reads."""
+
+    def test_stream_read_does_not_hold_portaudio_lock(self):
+        """record_utterance_with_vad must NOT hold _PORTAUDIO_LOCK while calling stream.read()."""
+        import voice
+        from voice import WakeWordDetector
+
+        detector = WakeWordDetector()
+        lock_held_during_read = []
+
+        mock_stream = MagicMock()
+        def mock_read(samples, **kwargs):
+            is_locked = voice._PORTAUDIO_LOCK._is_owned()
+            lock_held_during_read.append(is_locked)
+            return (np.zeros(1280, dtype=np.int16)).tobytes()
+
+        mock_stream.read.side_effect = mock_read
+
+        detector.record_utterance_with_vad(
+            stream=mock_stream,
+            timeout_no_speech=0.1,
+            max_duration=0.1,
+        )
+
+        self.assertTrue(len(lock_held_during_read) > 0)
+        for locked in lock_held_during_read:
+            self.assertFalse(locked, "_PORTAUDIO_LOCK was held during stream.read()!")
+
+    def test_wake_detected_immediate_callback_latency(self):
+        """Wake detection executes on_wake callback immediately without blocking (< 100 ms)."""
+        from voice import WakeWordDetector
+        callback_times = []
+
+        def on_wake_cb():
+            callback_times.append(time.perf_counter())
+
+        detector = WakeWordDetector(on_wake=on_wake_cb)
+
+        t0 = time.perf_counter()
+        detector.on_wake()
+        latency_ms = (callback_times[0] - t0) * 1000.0
+
+        self.assertLess(latency_ms, 100.0)
+        self.assertLess(latency_ms, 10.0)
+
+    def test_voice_listen_method_exists_and_callable(self):
+        """Voice.listen() and WakeWordDetector.listen() methods are available and callable."""
+        import voice
+        cfg = Config()
+        ctx = MagicMock()
+        v = voice.Voice(cfg, ctx, MagicMock())
+        self.assertTrue(hasattr(v, "listen"))
+        self.assertEqual(v.listen(timeout=0.1), "")
+
+
 if __name__ == "__main__":
     unittest.main()

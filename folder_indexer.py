@@ -157,9 +157,10 @@ class FolderIndexer:
     Thread-safe and runnable in a daemon background thread.
     """
 
-    def __init__(self, roots: Optional[List[str]] = None, max_depth: int = 3):
+    def __init__(self, roots: Optional[List[str]] = None, max_depth: int = 3, max_folders: int = 10000):
         self._roots: List[str] = list(roots) if roots else []
         self._max_depth = max_depth
+        self._max_folders = max_folders
         self._indexed: Dict[str, IndexedFolder] = {}  # normalized abspath -> IndexedFolder
         self._lock = threading.RLock()
         self._scan_thread: Optional[threading.Thread] = None
@@ -222,6 +223,8 @@ class FolderIndexer:
             trigrams=tri,
         )
         with self._lock:
+            if abs_path not in self._indexed and len(self._indexed) >= self._max_folders:
+                return False
             self._indexed[abs_path] = folder
         return True
 

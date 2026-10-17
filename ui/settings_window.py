@@ -17,6 +17,7 @@ import math
 import os
 import sys
 import threading
+import time
 from typing import Optional
 
 from PySide6.QtCore import (
@@ -50,7 +51,7 @@ from ui.components import (
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "2.0.0"
+    APP_VERSION = "2.1.0"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -89,6 +90,8 @@ class SettingsBridge(QObject):
     test_conn_result = Signal(bool, str, dict)
     test_mic_result  = Signal(dict)
     updater_event    = Signal(str, dict)
+    mic_level_updated = Signal(float)
+    diagnostics_result = Signal(list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -198,10 +201,6 @@ class _SidebarWidget(QWidget):
 
         self._scroll.setWidget(self._list_widget)
         outer.addWidget(self._scroll, stretch=1)
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick_pill)
-        self._timer.start(16)
 
     def _build_rows(self) -> None:
         """Populate the list widget with section headers and category rows."""
@@ -403,6 +402,8 @@ class _SidebarRow(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_selected(self, v: bool) -> None:
+        if self._selected == v:
+            return
         self._selected = v
         self.update()
 
@@ -410,12 +411,14 @@ class _SidebarRow(QWidget):
         self.update()
 
     def enterEvent(self, e) -> None:
-        self._hovered = True
-        self.update()
+        if not self._hovered:
+            self._hovered = True
+            self.update()
 
     def leaveEvent(self, e) -> None:
-        self._hovered = False
-        self.update()
+        if self._hovered:
+            self._hovered = False
+            self.update()
 
     def mousePressEvent(self, e) -> None:
         self.clicked.emit()
@@ -771,6 +774,8 @@ class SettingsWindow(QDialog):
         self.bridge.test_conn_result.connect(self._on_test_conn_result)
         self.bridge.test_mic_result.connect(self._on_test_mic_result)
         self.bridge.updater_event.connect(self._on_updater_event_gui)
+        self.bridge.mic_level_updated.connect(self._on_mic_level_updated)
+        self.bridge.diagnostics_result.connect(self._on_diagnostics_result)
 
         self._dark = T.is_dark()
         self._backdrop_type: Optional[str] = None
@@ -835,6 +840,16 @@ class SettingsWindow(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        if hasattr(self, "_theme_timer") and not self._theme_timer.isActive():
+            self._theme_timer.start(2000)
+        if self.updater and hasattr(self, "_updater_cb"):
+            try:
+                self.updater.add_listener(self._updater_cb)
+            except Exception:
+                pass
+        if hasattr(self, "_sidebar") and getattr(self._sidebar, "_selected", None) == "Voice":
+            if hasattr(self, "_mic_timer") and not self._mic_timer.isActive():
+                self._mic_timer.start(120)
         QTimer.singleShot(0, self._apply_backdrop)
 
     def _apply_backdrop(self) -> None:
@@ -970,6 +985,7 @@ class SettingsWindow(QDialog):
         if isinstance(tab, int):
             if 0 <= tab < len(_CATEGORIES):
                 self._sidebar.select(_CATEGORIES[tab])
+                return
         elif isinstance(tab, str):
             tl = tab.strip().lower()
             if tl in ("productivity", "routines", "routine", "notes", "quick notes", "assistant"):
@@ -982,6 +998,7 @@ class SettingsWindow(QDialog):
                 if cid.lower() == tl or _SIDEBAR_LABELS.get(cid, "").lower() == tl:
                     self._sidebar.select(cid)
                     return
+        self._sidebar.select(_CATEGORIES[0])
 
     # ── Page builders ─────────────────────────────────────────────────────
 
@@ -1999,6 +2016,34 @@ class SettingsWindow(QDialog):
             self._updater_cb = _updater_cb
             self.updater.add_listener(_updater_cb)
 
+        if getattr(self.cfg, "show_health_panel", True):
+            hdr_health = QLabel("SYSTEM PRE-FLIGHT HEALTH")
+            hdr_health.setFont(qfont(TYPE.caption_2))
+            hdr_health.setContentsMargins(SPACING.xs, SPACING.md, 0, 4)
+            hdr_health.setProperty("role", "section_header")
+            hdr_health.setStyleSheet(f"color: {T.color.tertiary_label.resolve(self._dark).name()}; font-size: 10px; font-weight: 600; padding-left: 4px;")
+            layout.addWidget(hdr_health)
+
+            health_card = GroupedCard()
+            self.pill_cam    = StatusPill("Ready", variant="default")
+            self.pill_mic    = StatusPill("Ready", variant="default")
+            self.pill_models = StatusPill("Ready", variant="default")
+            self.pill_cloud  = StatusPill("Ready", variant="default")
+            self.pill_dpi    = StatusPill("Ready", variant="default")
+
+            health_card.add_row("Camera FPS", "DirectShow hardware capture & frame rate", self.pill_cam)
+            health_card.add_row("Mic RMS", "Microphone stream & live audio level", self.pill_mic)
+            health_card.add_row("Local Models", "Piper TTS and OpenWakeWord model files", self.pill_models)
+            health_card.add_row("Cloud AI Reachability", "Groq API endpoint connectivity", self.pill_cloud)
+            health_card.add_row("Display & DPI", "Monitor geometry and DPI scale factor", self.pill_dpi)
+
+            self.btn_diag_health = PrimaryButton("Run Diagnostics")
+            self.btn_diag_health.setFixedWidth(148)
+            self.btn_diag_health.clicked.connect(self._run_preflight_diagnostics)
+            health_card.add_row("Diagnostics", "Run all hardware and network pre-flight tests", self.btn_diag_health)
+
+            layout.addWidget(health_card)
+
         layout.addStretch()
         self._stack.addWidget(page)
 
@@ -2010,14 +2055,41 @@ class SettingsWindow(QDialog):
         self._save("mic_device_index", val)
         self.cfg.mic_device_index = val
 
+    def _on_mic_level_updated(self, norm: float) -> None:
+        if hasattr(self, "_mic_meter"):
+            self._mic_meter.update_level(norm)
+
     def _update_mic_level(self) -> None:
         if not self.isVisible():
             return
+        now = time.time()
         try:
-            norm, rms = probe_mic_level(self.cfg.mic_device_index)
-            self._mic_meter.update_level(norm)
+            from voice import Voice
+            if now - getattr(Voice, "_latest_time", 0.0) < 1.0:
+                raw = float(getattr(Voice, "_latest_rms", 0.0))
+                norm = min(max((raw - 20.0) / 2500.0, 0.0), 1.0)
+                if hasattr(self, "_mic_meter"):
+                    self._mic_meter.update_level(norm)
+                return
         except Exception:
             pass
+
+        if getattr(self, "_mic_probing", False):
+            return
+
+        self._mic_probing = True
+        dev_idx = getattr(self.cfg, "mic_device_index", None)
+
+        def worker():
+            try:
+                norm, _ = probe_mic_level(dev_idx)
+                self.bridge.mic_level_updated.emit(norm)
+            except Exception:
+                pass
+            finally:
+                self._mic_probing = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _run_mic_test(self) -> None:
         self.btn_test_mic.setEnabled(False)
@@ -2147,6 +2219,65 @@ class SettingsWindow(QDialog):
         if os.path.exists(s):
             subprocess.Popen([sys.executable, s])
 
+    def _run_preflight_diagnostics(self) -> None:
+        if hasattr(self, "btn_diag_health"):
+            self.btn_diag_health.setEnabled(False)
+            self.btn_diag_health.setText("Running...")
+
+        for pill in (getattr(self, "pill_cam", None),
+                     getattr(self, "pill_mic", None),
+                     getattr(self, "pill_models", None),
+                     getattr(self, "pill_cloud", None),
+                     getattr(self, "pill_dpi", None)):
+            if pill:
+                pill.setVariant("accent")
+                pill.setText("Checking...")
+
+        def worker():
+            try:
+                from self_test import get_self_test_summary
+                summary = get_self_test_summary()
+            except Exception as exc:
+                summary = [{"name": "Diagnostics Error", "passed": False, "message": str(exc), "elapsed_ms": 0.0}]
+            self.bridge.diagnostics_result.emit(summary)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_diagnostics_result(self, summary: list) -> None:
+        if hasattr(self, "btn_diag_health"):
+            self.btn_diag_health.setEnabled(True)
+            self.btn_diag_health.setText("Run Diagnostics")
+
+        mapping = {
+            "camera": getattr(self, "pill_cam", None),
+            "microphone": getattr(self, "pill_mic", None),
+            "mic": getattr(self, "pill_mic", None),
+            "model": getattr(self, "pill_models", None),
+            "network": getattr(self, "pill_cloud", None),
+            "reachability": getattr(self, "pill_cloud", None),
+            "cloud": getattr(self, "pill_cloud", None),
+            "dpi": getattr(self, "pill_dpi", None),
+            "monitor": getattr(self, "pill_dpi", None),
+            "display": getattr(self, "pill_dpi", None),
+        }
+
+        for item in summary:
+            name_lower = str(item.get("name", "")).lower()
+            passed = bool(item.get("passed", False))
+            msg = str(item.get("message", ""))
+
+            pill = None
+            for key, p in mapping.items():
+                if key in name_lower and p is not None:
+                    pill = p
+                    break
+
+            if pill:
+                pill.setVariant("success" if passed else "error")
+                pill.setText("Passed" if passed else "Failed")
+                pill.setToolTip(msg)
+
+
     def _open_target_practice(self) -> None:
         import subprocess
         base = os.path.dirname(os.path.abspath(__file__))
@@ -2189,7 +2320,8 @@ class SettingsWindow(QDialog):
         if hasattr(self, "_theme_timer") and self._theme_timer.isActive():
             self._theme_timer.stop()
         if event is not None:
-            super().closeEvent(event)
+            event.ignore()
+        self.hide()
 
     def reject(self) -> None:
         if hasattr(self, "_mic_timer") and self._mic_timer.isActive():
@@ -2198,4 +2330,4 @@ class SettingsWindow(QDialog):
             self.updater.remove_listener(self._updater_cb)
         if hasattr(self, "_theme_timer") and self._theme_timer.isActive():
             self._theme_timer.stop()
-        super().reject()
+        self.hide()
