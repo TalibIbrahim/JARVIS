@@ -266,6 +266,101 @@ def main():
         )
         supervisor.start("Voice")
 
+    # Media Session Manager (Windows SMTC / Media Controls)
+    from media_adapter import get_media_adapter
+    media_adapter = get_media_adapter()
+
+    def _on_media_changed(meta):
+        if meta and meta.has_media:
+            dur = float(meta.duration) if meta.duration else 0.0
+            pos = float(meta.position) if meta.position else 0.0
+            prog = (pos / dur) if dur > 0 else 0.0
+            overlay.post(
+                "media_state",
+                title=meta.title,
+                artist=meta.artist,
+                playing=meta.is_playing,
+                active=meta.has_media,
+                position=pos,
+                duration=dur,
+                progress=prog,
+                source=meta.source_app_id,
+            )
+        else:
+            overlay.post(
+                "media_state",
+                title="",
+                artist="",
+                playing=False,
+                active=False,
+                position=0.0,
+                duration=0.0,
+                progress=0.0,
+                source="",
+            )
+
+    media_adapter.add_listener(_on_media_changed)
+    supervisor.register(
+        name="MediaAdapter",
+        factory=lambda: media_adapter.start(),
+        max_restarts=3,
+        backoff_base=2.0,
+    )
+    supervisor.start("MediaAdapter")
+
+    # Periodic Weather Poller (Auto-Geolocation & Live Conditions)
+    def _run_weather_poller():
+        from weather_client import get_weather_client
+        client = get_weather_client()
+
+        def _fetch_and_post():
+            city_cfg = getattr(cfg, "island_weather_city", None) or getattr(cfg, "weather_city", "auto")
+            w = client.get_weather_for_city(city_cfg, units=getattr(cfg, "weather_units", "auto"))
+            if w and overlay:
+                h_list = [
+                    {
+                        "time": h.time,
+                        "temp": h.temperature,
+                        "condition": h.condition,
+                    }
+                    for h in w.hourly
+                ]
+                overlay.post(
+                    "weather_state",
+                    temp=w.temperature,
+                    condition=w.condition,
+                    icon=w.condition,
+                    high=getattr(w, "high", w.temperature + 4.0),
+                    low=getattr(w, "low", w.temperature - 4.0),
+                    feels_like=w.apparent_temperature,
+                    city=w.city.split(",")[0],
+                    hourly=h_list,
+                )
+
+        def _poller_loop():
+            if not stop.wait(2.0):
+                try:
+                    _fetch_and_post()
+                except Exception as e:
+                    print(f"[weather] Initial fetch note: {e}")
+            while not stop.wait(900.0):
+                try:
+                    _fetch_and_post()
+                except Exception as e:
+                    print(f"[weather] Periodic fetch note: {e}")
+
+        t = threading.Thread(target=_poller_loop, name="WeatherPoller", daemon=True)
+        t.start()
+        return t
+
+    supervisor.register(
+        name="WeatherPoller",
+        factory=_run_weather_poller,
+        max_restarts=3,
+        backoff_base=5.0,
+    )
+    supervisor.start("WeatherPoller")
+
     # Global hotkeys: Ctrl+Alt+J toggles wake/standby, Ctrl+Alt+Q quits.
     try:
         from pynput import keyboard
@@ -289,6 +384,10 @@ def main():
     finally:
         stop.set()
         supervisor.stop(timeout=2)
+        try:
+            media_adapter.stop(timeout=1.0)
+        except Exception:
+            pass
         controller.shutdown()
         speaker.q.put(None)
         if _INSTANCE_MUTEX and sys.platform == "win32":

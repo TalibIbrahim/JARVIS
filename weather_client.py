@@ -107,6 +107,8 @@ class WeatherData:
     timestamp: float
     stale: bool = False
     hourly: List[HourlyForecast] = field(default_factory=list)
+    high: float = 0.0
+    low: float = 0.0
 
 
 def default_http_fetcher(url: str, timeout: float = 6.0) -> Dict[str, Any]:
@@ -153,14 +155,44 @@ class WeatherClient:
             return "celsius"
         return "fahrenheit" if is_fahrenheit_locale() else "celsius"
 
+    def auto_detect_location(self) -> Optional[Tuple[float, float, str]]:
+        """
+        Auto-detects approximate location via IP geolocation (privacy-friendly, no GPS hardware required).
+        Returns (lat, lon, display_name) or None if unavailable.
+        """
+        key = "__auto_detected_location__"
+        if key in self._geo_cache:
+            return self._geo_cache[key]
+
+        endpoints = [
+            ("http://ip-api.com/json/", lambda d: (float(d["lat"]), float(d["lon"]), f"{d.get('city', 'Local')}, {d.get('country', '')}".strip(", ")) if d.get("status") == "success" else None),
+            ("https://ipapi.co/json/", lambda d: (float(d["latitude"]), float(d["longitude"]), f"{d.get('city', 'Local')}, {d.get('country_name', '')}".strip(", ")) if "latitude" in d else None),
+        ]
+
+        for url, parser in endpoints:
+            try:
+                data = self._fetcher(url, 4.0)
+                res = parser(data)
+                if res and res[0] is not None and res[1] is not None:
+                    self._geo_cache[key] = res
+                    return res
+            except Exception as exc:
+                print(f"[weather_client] IP geolocation endpoint {url} note: {exc}")
+
+        return None
+
     def geocode(self, city_name: str) -> Optional[Tuple[float, float, str]]:
         """
         Resolves city name to (lat, lon, resolved_city_name).
         Results are cached in-memory.
         """
-        clean = city_name.strip()
-        if not clean:
-            return None
+        clean = (city_name or "").strip()
+        if not clean or clean.lower() in ("auto", "my location", "current location", "here", "local"):
+            detected = self.auto_detect_location()
+            if detected:
+                return detected
+            if not clean:
+                return None
         key = clean.lower()
         if key in self._geo_cache:
             return self._geo_cache[key]
@@ -298,6 +330,10 @@ class WeatherClient:
                     condition=c_cond,
                 ))
 
+            h_temps_f = [float(h.temperature) for h in hourly_list]
+            high_temp = max(h_temps_f + [temp]) if h_temps_f else temp
+            low_temp = min(h_temps_f + [temp]) if h_temps_f else temp
+
             weather_res = WeatherData(
                 temperature=temp,
                 apparent_temperature=apparent_temp,
@@ -315,6 +351,8 @@ class WeatherClient:
                 timestamp=now,
                 stale=False,
                 hourly=hourly_list,
+                high=high_temp,
+                low=low_temp,
             )
 
             # Save in cache (bounded)

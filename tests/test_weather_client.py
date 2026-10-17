@@ -180,6 +180,35 @@ class TestWeatherClient(unittest.TestCase):
         data = self.client.get_weather(12.34, 56.78, units="celsius")
         self.assertIsNone(data)
 
+    def test_08_auto_detect_location_and_auto_city(self):
+        """Auto geolocation resolves 'auto' or 'current location' to detected coordinates."""
+        # Mock fetcher responses for ip-api.com
+        orig_fetch = self.fetcher.__call__
+
+        def custom_fetch(url, timeout=6.0):
+            if "ip-api.com" in url or "ipapi.co" in url:
+                return {
+                    "status": "success",
+                    "city": "Lahore",
+                    "country": "Pakistan",
+                    "lat": 31.5826,
+                    "lon": 74.3276,
+                }
+            return orig_fetch(url, timeout)
+
+        self.client._fetcher = custom_fetch
+        geo = self.client.geocode("auto")
+        self.assertIsNotNone(geo)
+        lat, lon, display = geo
+        self.assertAlmostEqual(lat, 31.5826)
+        self.assertAlmostEqual(lon, 74.3276)
+        self.assertIn("Lahore", display)
+
+        # get_weather_for_city("auto") should fetch weather for Lahore
+        w = self.client.get_weather_for_city("auto")
+        self.assertIsNotNone(w)
+        self.assertIn("Lahore", w.city)
+
 
 if __name__ == "__main__":
     unittest.main()

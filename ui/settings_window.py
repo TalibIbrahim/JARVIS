@@ -51,7 +51,7 @@ from ui.components import (
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "2.1.0"
+    APP_VERSION = "2.2.0"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
