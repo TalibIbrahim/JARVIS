@@ -2,6 +2,7 @@
 import json
 import os
 from dataclasses import dataclass, field, fields
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -67,6 +68,11 @@ class Config:
     scroll_invert: bool = False
     lost_grace: float = 0.4             # tolerate this long without a hand before releasing everything
 
+    # --- gesture shortcuts (phase 8) ---
+    gesture_shortcuts_enabled: bool = True  # enable vertical slide & horizontal swipe shortcuts
+    gesture_slide_volume: bool = True      # vertical slide adjusts volume (+/- 5%)
+    gesture_swipe_switch: bool = True      # horizontal swipe switches windows (Alt+Tab)
+
     # --- cursor smoothing & decoupling ---
     smooth_min_cutoff: float = 0.6      # lower = smoother when slow, higher = more responsive
     smooth_beta: float = 0.02           # higher = less lag during fast moves
@@ -86,6 +92,10 @@ class Config:
     tts_engine: str = "piper"           # "piper" (Paul Bettany MCU) or "system" (pyttsx3 SAPI5)
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
+    wake_word_enabled: bool = True      # openWakeWord / wake word detection toggle
+    wake_sensitivity: str = "balanced"  # "low", "balanced", "high"
+    wake_followup_window: float = 6.0   # seconds Jarvis keeps listening after wake detection
+    chime_enabled: bool = True          # play soft ascending two-note chime on wake
     wake_aliases: list = field(default_factory=lambda: [
         "jarvis", "hey jarvis", "ok jarvis", "okay jarvis", "hi jarvis", "hello jarvis",
         "yo jarvis", "jarvis please", "jarvas", "jervis", "gervais", "javis", "jarviz",
@@ -107,6 +117,19 @@ class Config:
     reduce_motion: bool = False         # reduce UI animations
     show_skeleton_mini: bool = True     # mini skeleton preview inside dynamic island
 
+    # --- dynamic island & widgets ---
+    idle_display: str = "time_weather"  # "off", "time", "time_weather"
+    show_now_playing: bool = True       # display media now playing widget in island
+    show_weather: bool = True           # display weather information in island
+    weather_city: str = "New York"      # default location name
+    weather_lat: float = 40.7128        # default latitude
+    weather_lon: float = -74.0060       # default longitude
+    weather_units: str = "auto"         # "auto", "celsius", "fahrenheit"
+    time_format: str = "auto"           # "auto", "12h", "24h"
+    expand_trigger: str = "hover"       # "hover", "dwell", "click"
+    hide_fullscreen: bool = True        # hide island when fullscreen app or game active
+    island_size: str = "default"        # "compact", "default", "large"
+
     # --- updates ---
     auto_update_check: bool = True      # automatically check for GitHub releases on startup
 
@@ -121,6 +144,42 @@ class Config:
     ai_max_history: int = 6
     groq_api_key: str = ""              # optional saved Groq API key persisted in config file
     local_decision_engine: bool = True  # ultra-fast local semantic intent matcher (System 1 reflex)
+
+    # --- files & folders management (phase 4) ---
+    folders_whitelist: dict = field(default_factory=lambda: {
+        "programming": "C:\\Programming" if os.path.exists("C:\\Programming") else os.path.join(os.path.expanduser("~"), "Programming"),
+        "downloads": os.path.join(os.path.expanduser("~"), "Downloads"),
+        "documents": os.path.join(os.path.expanduser("~"), "Documents"),
+        "desktop": os.path.join(os.path.expanduser("~"), "Desktop"),
+        "pictures": os.path.join(os.path.expanduser("~"), "Pictures"),
+        "music": os.path.join(os.path.expanduser("~"), "Music"),
+        "videos": os.path.join(os.path.expanduser("~"), "Videos"),
+    })
+    indexed_roots: list = field(default_factory=lambda: [
+        "C:\\Programming" if os.path.exists("C:\\Programming") else os.path.join(os.path.expanduser("~"), "Programming"),
+        os.path.join(os.path.expanduser("~"), "Documents"),
+        os.path.join(os.path.expanduser("~"), "Downloads"),
+        os.path.join(os.path.expanduser("~"), "Desktop"),
+    ])
+    # --- productivity, notes & routines (phase 6) ---
+    notes_file_path: str = field(default_factory=lambda: os.path.join(os.path.expanduser("~"), "Documents", "Jarvis_Notes.md"))
+    scheduler_file_path: str = ""
+    routines: dict = field(default_factory=lambda: {
+        "work mode": [
+            {"action": "open_app", "args": {"app": "code"}},
+            {"action": "set_volume", "args": {"level": 30}},
+        ],
+        "focus mode": [
+            {"action": "toggle_do_not_disturb", "args": {}},
+            {"action": "set_volume", "args": {"level": 15}},
+        ],
+        "evening mode": [
+            {"action": "toggle_night_light", "args": {}},
+            {"action": "set_brightness", "args": {"level": 30}},
+            {"action": "set_volume", "args": {"level": 20}},
+        ],
+    })
+
 
 
 def get_config_path(explicit_path=None):
@@ -161,3 +220,56 @@ def load_config(path=None):
         except Exception as exc:  # bad JSON should never stop the app from starting
             print(f"[config] ignoring {path}: {exc}")
     return cfg
+
+
+def save_config(cfg: Config, path=None) -> bool:
+    """Persists current Config fields to jarvis_config.json."""
+    config_path = get_config_path(path)
+    try:
+        existing = {}
+        if os.path.exists(config_path) and os.path.getsize(config_path) > 0:
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = {}
+        for f in fields(Config):
+            val = getattr(cfg, f.name)
+            if isinstance(val, (str, int, float, bool, list, dict)) or val is None:
+                existing[f.name] = val
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=4)
+        return True
+    except Exception as exc:
+        print(f"[config] save error: {exc}")
+        return False
+
+
+def remember_folder_alias(alias: str, folder_path: str, cfg: Optional[Config] = None, config_path: Optional[str] = None) -> bool:
+    """Persists a spoken alias -> folder path mapping in config."""
+    clean_alias = str(alias).strip().lower()
+    abs_path = os.path.abspath(folder_path)
+    if cfg is not None:
+        if not hasattr(cfg, "folders_whitelist") or not isinstance(cfg.folders_whitelist, dict):
+            cfg.folders_whitelist = {}
+        cfg.folders_whitelist[clean_alias] = abs_path
+
+    target_path = get_config_path(config_path)
+    try:
+        data = {}
+        if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+            try:
+                with open(target_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        if "folders_whitelist" not in data or not isinstance(data["folders_whitelist"], dict):
+            data["folders_whitelist"] = {}
+        data["folders_whitelist"][clean_alias] = abs_path
+        with open(target_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        return True
+    except Exception as exc:
+        print(f"[config] remember_folder_alias error: {exc}")
+        return False
+

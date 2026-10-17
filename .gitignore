@@ -57,3 +57,42 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# AI Prompts, Context & Assistant Guides
+*CONTEXT*.md
+*context*.md
+PROJECT_CONTEXT.md
+APP_CONTEXT.md
+*PROMPT*.md
+*prompt*.md
+*AI_GUIDE*.md
+*ai_guide*.md
+*INSTRUCTIONS*.md
+*instructions*.md
+copilot-instructions.md
+.github/copilot-instructions.md
+
+# AI Tooling, Agents & Scratch Directories
+subagents/
+.subagents/
+agents/
+.agents/
+prompts/
+.prompts/
+context/
+.context/
+scratch/
+.scratch/
+.cursor/
+.cursorrules
+.claude/
+.gemini/
+.antigravity/
+.windsurf/
+.codeium/
+.aidev/
+
+# Screenshots, Social & Showcase Media
+assets/screenshots/
+
+

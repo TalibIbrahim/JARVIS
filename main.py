@@ -122,7 +122,7 @@ def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstanc
 
 
 def main():
-    if "-h" in sys.argv or "--help" in sys.argv:
+    if "-h" in sys.argv or "--help" in sys.argv or "--island-demo" in sys.argv:
         pass
     elif not acquire_single_instance_lock():
         sys.exit(0)
@@ -134,6 +134,7 @@ def main():
     parser.add_argument("--camera", type=int, default=None, help="camera index (default 0)")
     parser.add_argument("--diagnose", action="store_true", help="run diagnostic jitter, latency, and precision measurement")
     parser.add_argument("--test-mic", action="store_true", help="test microphone input levels and speech recognition")
+    parser.add_argument("--island-demo", action="store_true", help="run Dynamic Island demo mode without requiring camera/gestures")
     args = parser.parse_args()
 
     if args.diagnose:
@@ -144,6 +145,34 @@ def main():
     if args.test_mic:
         import subprocess
         subprocess.run([sys.executable, "voice.py"])
+        sys.exit(0)
+
+    if args.island_demo:
+        from config import load_config
+        from overlay import Overlay
+        cfg = load_config()
+        stop = threading.Event()
+        overlay = Overlay(stop, cfg=cfg)
+        if hasattr(overlay, "island") and not getattr(overlay, "_island_demo", None):
+            try:
+                from ui.island import IslandDemoController
+                demo = IslandDemoController(overlay.island)
+                demo.start()
+                overlay._island_demo = demo
+            except Exception as _demo_err:
+                print(f"[main] demo start error: {_demo_err}")
+        print("[JARVIS] Dynamic Island running in --island-demo mode at 60 FPS.")
+        try:
+            overlay.run()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop.set()
+            if _INSTANCE_MUTEX and sys.platform == "win32":
+                try:
+                    ctypes.windll.kernel32.CloseHandle(_INSTANCE_MUTEX)
+                except Exception:
+                    pass
         sys.exit(0)
 
     from config import load_config
@@ -169,6 +198,7 @@ def main():
 
     overlay = Overlay(stop, cfg=cfg)
     controller.set_overlay(overlay)
+    engine.set_overlay(overlay)
     ctx = Context(engine, overlay, speaker, stop)
     overlay.ctx = ctx
 

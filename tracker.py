@@ -353,14 +353,14 @@ class Tracker(threading.Thread):
             cv2.putText(frame, "TRACKING ZONE: FULL (100%)", (12, 46),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, green, 1, cv2.LINE_AA)
 
-        # Draw hand skeletons
+        # Draw hand skeletons (2 px strokes with round joints)
         for hand in hands:
             pts = [(int(x * w), int(y * h)) for x, y in hand.lm]
             for a, b in connections:
-                cv2.line(frame, pts[a], pts[b], cyan, 1, cv2.LINE_AA)
+                cv2.line(frame, pts[a], pts[b], cyan, 2, cv2.LINE_AA)
             for i, p in enumerate(pts):
                 color = gold if i in (4, 8, 12) else (255, 255, 255)
-                radius = 4 if i in (4, 8, 12) else 2
+                radius = 4 if i in (4, 8, 12) else 3
                 cv2.circle(frame, p, radius, color, -1, cv2.LINE_AA)
 
         # Top Bar: Status & Telemetry

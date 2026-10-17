@@ -7,6 +7,7 @@ Handles:
 - Standalone microphone diagnostic test tool.
 - Non-blocking text-to-speech feedback via pyttsx3.
 """
+import collections
 import math
 import os
 import queue
@@ -27,10 +28,111 @@ from ai import (
     TimeoutError,
     AIError,
 )
+from chime import (
+    play_chime,
+    play_wake_chime,
+    set_chime_muted,
+    is_chime_muted,
+    set_chime_volume,
+    get_chime_volume,
+    set_audio_lock,
+)
 
 
 _PORTAUDIO_LOCK = threading.RLock()
+set_audio_lock(_PORTAUDIO_LOCK)
 _SHARED_PYAUDIO = None
+
+# Sensitivity mapping for openWakeWord detector
+SENSITIVITY_THRESHOLDS = {
+    "low": 0.70,
+    "balanced": 0.50,
+    "high": 0.35,
+}
+
+
+def parse_sensitivity(value, default=0.50) -> float:
+    """Maps sensitivity setting ('low', 'balanced', 'high' or numeric float) to threshold."""
+    if isinstance(value, (int, float)):
+        return float(np.clip(value, 0.05, 0.99))
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in SENSITIVITY_THRESHOLDS:
+            return SENSITIVITY_THRESHOLDS[v]
+        try:
+            return float(np.clip(float(v), 0.05, 0.99))
+        except ValueError:
+            pass
+    return default
+
+
+class WakeWordGuard:
+    """
+    False-trigger guard for openWakeWord detector:
+    1. Requires score above sensitivity threshold (or 2 consecutive frames).
+    2. Single frame score >= high confidence (min(0.85, threshold + 0.15)) also triggers.
+    3. Suppresses wake detection while assistant is speaking (Voice.is_speaking / TTS playing).
+    4. Post-trigger debounce window to prevent tail re-triggering.
+    """
+    def __init__(self, threshold=0.50, debounce_seconds=1.2, require_consecutive=False):
+        self.threshold = float(threshold)
+        self.debounce_seconds = float(debounce_seconds)
+        self.require_consecutive = require_consecutive
+        self.consecutive = 0
+        self.last_trigger_time = 0.0
+
+    def evaluate(self, score: float, is_speaking: bool = False, now: float = None) -> bool:
+        if now is None:
+            now = time.time()
+
+        # Suppress wake word while assistant is speaking or within debounce window
+        if is_speaking or (now - self.last_trigger_time) < self.debounce_seconds:
+            self.consecutive = 0
+            return False
+
+        if score >= self.threshold:
+            self.consecutive += 1
+            high_thresh = min(0.85, self.threshold + 0.15)
+            if self.consecutive >= 2 or score >= high_thresh or not self.require_consecutive:
+                self.consecutive = 0
+                self.last_trigger_time = now
+                return True
+        else:
+            self.consecutive = 0
+        return False
+
+
+class VADDetector:
+    """
+    Voice Activity Detection combining Silero VAD (ONNX) and RMS energy fallback.
+    Takes 16 kHz 16-bit PCM chunks and evaluates speech presence.
+    """
+    def __init__(self, energy_threshold=42.0, vad_threshold=0.35):
+        self.energy_threshold = energy_threshold
+        self.vad_threshold = vad_threshold
+        self._vad = None
+        self._init_vad()
+
+    def _init_vad(self):
+        try:
+            from openwakeword.vad import VAD
+            self._vad = VAD()
+        except Exception:
+            self._vad = None
+
+    def is_speech(self, chunk: np.ndarray, rms: float) -> bool:
+        if rms < self.energy_threshold:
+            return False
+
+        if self._vad is not None:
+            try:
+                prob = float(self._vad.predict(chunk))
+                if prob >= self.vad_threshold:
+                    return True
+            except Exception:
+                pass
+        return rms >= self.energy_threshold
+
 
 
 def get_shared_pyaudio():
@@ -311,6 +413,7 @@ class Speaker(threading.Thread):
         self.q = queue.Queue()
         self._piper_voice = None
         self._sapi_engine = None
+        self.is_speaking = False
 
     def say(self, text):
         is_enabled = getattr(self.cfg, "speak", self.enabled) if self.cfg else self.enabled
@@ -337,11 +440,16 @@ class Speaker(threading.Thread):
     def _say_system(self, text):
         engine = self._init_system_engine()
         if engine:
+            self.is_speaking = True
+            Voice.is_speaking = True
             try:
                 engine.say(text)
                 engine.runAndWait()
             except Exception as e:
                 print(f"[voice] system speech error: {e}")
+            finally:
+                self.is_speaking = False
+                Voice.is_speaking = False
 
     def _get_piper_paths(self):
         rel_model = getattr(self.cfg, "tts_model_path", "models/voice/jarvis-medium.onnx") if self.cfg else "models/voice/jarvis-medium.onnx"
@@ -388,6 +496,8 @@ class Speaker(threading.Thread):
             self._say_system(text)
             return
 
+        self.is_speaking = True
+        Voice.is_speaking = True
         try:
             import sounddevice as sd
             chunks = list(voice.synthesize(text))
@@ -445,6 +555,9 @@ class Speaker(threading.Thread):
         except Exception as exc:
             print(f"[voice] Piper synthesis/playback error: {exc}, falling back to system TTS")
             self._say_system(text)
+        finally:
+            self.is_speaking = False
+            Voice.is_speaking = False
 
     def run(self):
         # Pre-warm Piper model in background so spoken responses are instantaneous
@@ -469,11 +582,326 @@ class Speaker(threading.Thread):
                 print(f"[voice] speech output error: {exc}")
 
 
+class WakeWordDetector(threading.Thread):
+    """
+    Dedicated 16 kHz wake-word detection and VAD recording thread.
+    - Captures from probed physical microphone using shared PyAudio protected by _PORTAUDIO_LOCK.
+    - CPU usage strictly under ~3% (openWakeWord inference takes ~2.5 ms per 80 ms chunk).
+    - Sensitivity mapping (Low=0.7, Balanced=0.5, High=0.35).
+    - Configurable follow-up window (default 6 s).
+    - False-trigger guard with 2 consecutive detections or score over threshold, suppressed while speaking.
+    - Flow:
+        Wake detected -> on_wake callback -> soft two-note chime immediately (<150 ms) ->
+        Record with VAD (updating Voice._latest_rms) -> end on ~700 ms silence or 8 s max ->
+        on_utterance callback (or if 5 s silence with no speech -> on_no_speech callback).
+    """
+
+    def __init__(
+        self,
+        cfg=None,
+        on_wake=None,
+        on_utterance=None,
+        on_no_speech=None,
+        stop_event=None,
+        sensitivity="balanced",
+        followup_window=6.0,
+        device_index=None,
+    ):
+        super().__init__(name="WakeWordDetector", daemon=True)
+        self.cfg = cfg
+        self.on_wake = on_wake
+        self.on_utterance = on_utterance
+        self.on_no_speech = on_no_speech
+        self.stop = stop_event or threading.Event()
+        self.sensitivity_str = sensitivity
+        self.threshold = parse_sensitivity(getattr(cfg, "wake_sensitivity", sensitivity))
+        self.followup_window = float(getattr(cfg, "wake_followup_window", getattr(cfg, "command_window", followup_window)))
+        self.device_index = device_index
+        self.guard = WakeWordGuard(threshold=self.threshold)
+        self.vad = VADDetector()
+        self.model = None
+        self.listening_until = 0.0
+        self.is_recording = False
+        self._init_model()
+
+    def _init_model(self):
+        try:
+            from openwakeword.model import Model
+            self.model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+        except Exception as e:
+            print(f"[voice] openWakeWord model initialization note: {e}")
+            self.model = None
+
+    def set_sensitivity(self, sensitivity):
+        self.sensitivity_str = sensitivity
+        self.threshold = parse_sensitivity(sensitivity)
+        self.guard.threshold = self.threshold
+
+    def get_sensitivity(self) -> float:
+        return self.threshold
+
+    def set_followup_window(self, seconds: float):
+        self.followup_window = max(1.0, float(seconds))
+
+    def get_followup_window(self) -> float:
+        return self.followup_window
+
+    def record_utterance_with_vad(
+        self,
+        stream=None,
+        timeout_no_speech: float = 5.0,
+        silence_endpoint: float = 0.70,
+        max_duration: float = 8.0,
+        pre_roll: list = None,
+        chunk_samples: int = 1280,
+        sample_rate: int = 16000,
+    ) -> bytes:
+        """
+        Record with VAD: streams chunks while continuously updating Voice._latest_rms.
+        End on ~700 ms silence or 8 s max -> return raw PCM bytes.
+        If 5 s silence with no speech -> trigger no-speech callback, return None.
+        """
+        self.is_recording = True
+        chunk_duration = chunk_samples / sample_rate
+        recorded_frames = list(pre_roll) if pre_roll else []
+
+        speech_detected = False
+        consecutive_silence = 0.0
+        start_time = time.time()
+
+        try:
+            while not self.stop.is_set():
+                if Voice.is_speaking:
+                    break
+
+                data = None
+                if stream is not None:
+                    try:
+                        with _PORTAUDIO_LOCK:
+                            data = stream.read(chunk_samples, exception_on_overflow=False)
+                    except Exception:
+                        break
+                if not data:
+                    break
+
+                arr = np.frombuffer(data, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
+                Voice._latest_rms = rms
+                Voice._latest_time = time.time()
+                recorded_frames.append(data)
+
+                now = time.time()
+                elapsed = now - start_time
+                chunk_has_speech = self.vad.is_speech(arr, rms)
+
+                if not speech_detected:
+                    if chunk_has_speech:
+                        speech_detected = True
+                        consecutive_silence = 0.0
+                    elif elapsed >= timeout_no_speech:
+                        # 5 s silence with no speech
+                        if self.on_no_speech:
+                            try:
+                                self.on_no_speech()
+                            except Exception as ns_err:
+                                print(f"[voice] on_no_speech error: {ns_err}")
+                        self.listening_until = 0.0
+                        return None
+                else:
+                    if chunk_has_speech:
+                        consecutive_silence = 0.0
+                    else:
+                        consecutive_silence += chunk_duration
+                        if consecutive_silence >= silence_endpoint:
+                            break
+                    if elapsed >= max_duration:
+                        break
+
+            if not speech_detected or len(recorded_frames) < 3:
+                return None
+
+            raw_bytes = b"".join(recorded_frames)
+            Voice._last_raw_audio = raw_bytes
+            return raw_bytes
+        finally:
+            self.is_recording = False
+
+    def transcribe(self, raw_bytes: bytes) -> str:
+        """Transcribes 16 kHz raw PCM bytes via Groq Whisper or Google fallback."""
+        if not raw_bytes:
+            return ""
+        try:
+            import speech_recognition as sr
+            audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
+            key = get_api_key()
+            ai_enabled = getattr(self.cfg, "ai_enabled", False) if self.cfg else False
+            if ai_enabled and key:
+                try:
+                    wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+                    stt_model = getattr(self.cfg, "ai_stt_model", "whisper-large-v3-turbo") if self.cfg else "whisper-large-v3-turbo"
+                    timeout = getattr(self.cfg, "ai_timeout", 10) if self.cfg else 10
+                    client = GroqClient(api_key=key, timeout=timeout)
+                    return client.transcribe(wav_bytes, model=stt_model, language="en")
+                except Exception as e:
+                    print(f"[voice] Groq transcribe fallback note: {e}")
+            r = sr.Recognizer()
+            return r.recognize_google(audio)
+        except Exception as exc:
+            print(f"[voice] transcription error: {exc}")
+            return ""
+
+    def record_and_transcribe(
+        self,
+        stream=None,
+        timeout_no_speech: float = 5.0,
+        silence_endpoint: float = 0.70,
+        max_duration: float = 8.0,
+    ) -> str:
+        """Records with VAD and transcribes into an utterance string."""
+        raw_bytes = self.record_utterance_with_vad(
+            stream=stream,
+            timeout_no_speech=timeout_no_speech,
+            silence_endpoint=silence_endpoint,
+            max_duration=max_duration,
+        )
+        if not raw_bytes:
+            return ""
+        return self.transcribe(raw_bytes)
+
+    def run(self):
+        import pyaudio
+        p = get_shared_pyaudio()
+
+        sample_rate = 16000
+        chunk_samples = 1280  # 80 ms chunks
+
+        while not self.stop.is_set():
+            cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
+            active_idx = cfg_idx if cfg_idx is not None else self.device_index
+            if active_idx is None:
+                active_idx, _ = find_best_microphone(self.cfg)
+            self.device_index = active_idx
+
+            stream = None
+            try:
+                with _PORTAUDIO_LOCK:
+                    stream = p.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=sample_rate,
+                        input=True,
+                        input_device_index=active_idx,
+                        frames_per_buffer=chunk_samples,
+                    )
+            except Exception as exc:
+                print(f"[voice] WakeWordDetector failed to open mic [{active_idx}]: {exc}")
+                time.sleep(1.0)
+                continue
+
+            pre_roll = collections.deque(maxlen=4)
+            try:
+                while not self.stop.is_set():
+                    new_cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
+                    if new_cfg_idx is not None and new_cfg_idx != self.device_index:
+                        break
+
+                    try:
+                        with _PORTAUDIO_LOCK:
+                            data = stream.read(chunk_samples, exception_on_overflow=False)
+                    except Exception:
+                        break
+
+                    if not data:
+                        continue
+
+                    arr = np.frombuffer(data, dtype=np.int16)
+                    rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
+                    Voice._latest_rms = rms
+                    Voice._latest_time = time.time()
+
+                    # Suppress wake word if assistant is speaking
+                    if Voice.is_speaking:
+                        self.guard.evaluate(0.0, is_speaking=True)
+                        pre_roll.clear()
+                        continue
+
+                    now = time.time()
+
+                    # Check if follow-up window expired without speech
+                    if self.listening_until > 0.0 and now >= self.listening_until:
+                        self.listening_until = 0.0
+                        if self.on_no_speech:
+                            try:
+                                self.on_no_speech()
+                            except Exception as ns_err:
+                                print(f"[voice] on_no_speech error: {ns_err}")
+
+                    # In follow-up window? Check if user started speaking directly
+                    in_followup = now < self.listening_until
+                    if in_followup and self.vad.is_speech(arr, rms):
+                        pre_roll.append(data)
+                        raw = self.record_utterance_with_vad(
+                            stream=stream,
+                            pre_roll=list(pre_roll),
+                            chunk_samples=chunk_samples,
+                            sample_rate=sample_rate,
+                        )
+                        pre_roll.clear()
+                        if raw:
+                            self._dispatch_utterance(raw)
+                        continue
+
+                    pre_roll.append(data)
+
+                    # openWakeWord prediction
+                    if getattr(self.cfg, "wake_word_enabled", True) and self.model is not None:
+                        pred = self.model.predict(arr)
+                        score = pred.get("hey_jarvis", 0.0)
+                        if self.guard.evaluate(score, is_speaking=Voice.is_speaking, now=now):
+                            # WAKE DETECTED!
+                            # 1. Fire wake callback immediately
+                            if self.on_wake:
+                                try:
+                                    self.on_wake()
+                                except Exception as cb_err:
+                                    print(f"[voice] on_wake error: {cb_err}")
+                            elif getattr(self.cfg, "chime_enabled", True):
+                                play_chime(non_blocking=True)
+
+                            # 2. Enter follow-up window & record with VAD
+                            self.listening_until = time.time() + self.followup_window
+                            raw = self.record_utterance_with_vad(
+                                stream=stream,
+                                pre_roll=list(pre_roll),
+                                chunk_samples=chunk_samples,
+                                sample_rate=sample_rate,
+                            )
+                            pre_roll.clear()
+                            if raw:
+                                self._dispatch_utterance(raw)
+            finally:
+                if stream is not None:
+                    try:
+                        with _PORTAUDIO_LOCK:
+                            stream.stop_stream()
+                            stream.close()
+                    except Exception:
+                        pass
+
+    def _dispatch_utterance(self, raw_bytes: bytes):
+        if self.on_utterance:
+            try:
+                self.on_utterance(raw_bytes)
+            except Exception as e:
+                print(f"[voice] dispatch utterance error: {e}")
+
+
 class Voice(threading.Thread):
     """Say 'Jarvis, open Chrome' in one go, or say 'Jarvis' and wait for 'Yes, sir?'."""
     _latest_rms = 0.0
     _latest_time = 0.0
     _last_raw_audio = None
+    is_speaking = False
 
     def __init__(self, cfg, ctx, stop_event):
         super().__init__(daemon=True)
@@ -485,12 +913,82 @@ class Voice(threading.Thread):
         self.current_mic_index = None
         self.current_mic_name = "Auto"
         self.groq_cooldown_until = 0.0
+        self.sensitivity = getattr(cfg, "wake_sensitivity", "balanced") if cfg else "balanced"
+        self.followup_window = float(getattr(cfg, "wake_followup_window", getattr(cfg, "command_window", 6.0))) if cfg else 6.0
+        self.wake_detector = None
+
+    def set_sensitivity(self, sensitivity):
+        self.sensitivity = sensitivity
+        if self.wake_detector:
+            self.wake_detector.set_sensitivity(sensitivity)
+
+    def get_sensitivity(self) -> float:
+        if self.wake_detector:
+            return self.wake_detector.get_sensitivity()
+        return parse_sensitivity(self.sensitivity)
+
+    def set_followup_window(self, seconds: float):
+        self.followup_window = float(seconds)
+        if self.wake_detector:
+            self.wake_detector.set_followup_window(seconds)
+
+    def get_followup_window(self) -> float:
+        if self.wake_detector:
+            return self.wake_detector.get_followup_window()
+        return self.followup_window
+
+    def _on_wake_detected(self):
+        now = time.time()
+        self.listening_until = now + self.followup_window
+        if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+            try:
+                self.ctx.overlay.post("wake", duration=0.6)
+                self.ctx.overlay.post("wake_detected")
+                self.ctx.overlay.post("listening", until=self.listening_until)
+            except Exception:
+                pass
+        if getattr(self.cfg, "chime_enabled", True):
+            play_chime(non_blocking=True)
+        if hasattr(self.ctx, "chirp"):
+            try:
+                self.ctx.chirp("wake")
+            except Exception:
+                pass
+
+    def _on_no_speech_detected(self):
+        self.listening_until = 0.0
+        if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+            try:
+                self.ctx.overlay.post("no_speech")
+                self.ctx.overlay.post("listening_done")
+            except Exception:
+                pass
+
+    def post_partial_speech(self, text: str, is_final: bool = False):
+        """Posts streaming partial or live speech transcript to the Dynamic Island."""
+        if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+            try:
+                self.ctx.overlay.post("live_speech", text=text, is_final=is_final)
+            except Exception:
+                pass
+
+    def _on_utterance_recorded(self, raw_bytes: bytes):
+        if not raw_bytes:
+            return
+        Voice._last_raw_audio = raw_bytes
+        try:
+            import speech_recognition as sr
+            audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
+            self.audio_q.put_nowait(audio)
+        except Exception:
+            pass
 
     def run(self):
         try:
             import speech_recognition as sr
         except ImportError:
-            self.ctx.say("Voice control needs the SpeechRecognition package.")
+            if hasattr(self.ctx, "say"):
+                self.ctx.say("Voice control needs the SpeechRecognition package.")
             return
 
         recognizer = sr.Recognizer()
@@ -499,91 +997,36 @@ class Voice(threading.Thread):
         recognizer.phrase_threshold = 0.3
         recognizer.non_speaking_duration = 0.5
 
-        # Auto-detect best physical microphone
+        # Probed microphone
         dev_idx, dev_name = find_best_microphone(self.cfg)
         self.current_mic_index = dev_idx
         self.current_mic_name = dev_name
         print(f"[voice] Connecting to microphone [{dev_idx}]: {dev_name}")
 
-        # Background worker for network recognition so microphone listening never stalls
+        # STT background worker
         worker = threading.Thread(target=self._recognition_worker, args=(recognizer, sr), daemon=True)
         worker.start()
 
+        # Dedicated openWakeWord detector at 16 kHz
+        self.wake_detector = WakeWordDetector(
+            cfg=self.cfg,
+            on_wake=self._on_wake_detected,
+            on_utterance=self._on_utterance_recorded,
+            on_no_speech=self._on_no_speech_detected,
+            stop_event=self.stop,
+            sensitivity=self.sensitivity,
+            followup_window=self.followup_window,
+            device_index=dev_idx,
+        )
+        self.wake_detector.start()
+
         while not self.stop.is_set():
             configured_idx = getattr(self.cfg, "mic_device_index", None)
-            active_idx = configured_idx if configured_idx is not None else self.current_mic_index
-
-            try:
-                with _PORTAUDIO_LOCK:
-                    mic = sr.Microphone(device_index=active_idx)
-                self.current_mic_index = active_idx
-            except Exception as exc:
-                print(f"[voice] failed to initialize microphone [{active_idx}]: {exc}")
-                time.sleep(1.0)
-                continue
-
-            try:
-                with mic as source:
-                    # Initial ambient noise calibration with strict ceiling clamp
-                    try:
-                        recognizer.adjust_for_ambient_noise(source, duration=0.8)
-                        if recognizer.energy_threshold > 750:
-                            recognizer.energy_threshold = 600
-                        elif recognizer.energy_threshold < 150:
-                            recognizer.energy_threshold = 250
-                    except Exception as e:
-                        print(f"[voice] ambient noise adjustment note: {e}")
-
-                    # If dynamic energy is disabled, ensure configured threshold is respected
-                    if not getattr(self.cfg, "mic_dynamic_energy", False):
-                        recognizer.energy_threshold = getattr(self.cfg, "mic_energy_threshold", 300)
-
-                    print(f"[voice] Listening online on device [{active_idx}] (trigger threshold: {recognizer.energy_threshold:.0f}, pause: {recognizer.pause_threshold:.1f}s)")
-
-                    # Hook source.stream.read to monitor audio levels live without opening extra streams
-                    orig_read = source.stream.read
-                    def hooked_read(size):
-                        chunk = orig_read(size)
-                        if chunk:
-                            try:
-                                arr = np.frombuffer(chunk, dtype=np.int16)
-                                if len(arr) > 0:
-                                    Voice._latest_rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
-                                    Voice._latest_time = time.time()
-                            except Exception:
-                                pass
-                        return chunk
-                    source.stream.read = hooked_read
-
-                    while not self.stop.is_set():
-                        # Check if device changed in settings
-                        new_cfg_idx = getattr(self.cfg, "mic_device_index", None)
-                        if new_cfg_idx is not None and new_cfg_idx != self.current_mic_index:
-                            print(f"[voice] Switching microphone to [{new_cfg_idx}]...")
-                            break
-
-                        # Keep thresholds synced with config
-                        recognizer.dynamic_energy_threshold = getattr(self.cfg, "mic_dynamic_energy", False)
-                        recognizer.pause_threshold = getattr(self.cfg, "mic_pause_threshold", 1.0)
-                        if not recognizer.dynamic_energy_threshold:
-                            recognizer.energy_threshold = getattr(self.cfg, "mic_energy_threshold", 300)
-
-                        phrase_time_limit = getattr(self.cfg, "mic_phrase_time_limit", 10.0)
-                        try:
-                            audio = recognizer.listen(source, timeout=1, phrase_time_limit=phrase_time_limit)
-                            try:
-                                self.audio_q.put_nowait(audio)
-                            except queue.Full:
-                                pass
-                        except sr.WaitTimeoutError:
-                            continue
-                        except Exception as loop_err:
-                            print(f"[voice] listen cycle note: {loop_err}")
-                            time.sleep(0.3)
-                            break
-            except Exception as stream_err:
-                print(f"[voice] stream error: {stream_err}")
-                time.sleep(0.5)
+            if configured_idx is not None and configured_idx != self.wake_detector.device_index:
+                print(f"[voice] Switching microphone to [{configured_idx}]...")
+                self.wake_detector.device_index = configured_idx
+                self.current_mic_index = configured_idx
+            self.stop.wait(timeout=0.5)
 
     def _fallback_google(self, recognizer, audio, sr):
         """Falls back to Google SpeechRecognition if Groq is unavailable."""
@@ -708,8 +1151,16 @@ class Voice(threading.Thread):
         command = None
         if now < self.listening_until:
             command = t
+            for alias in getattr(self.cfg, "wake_aliases", ["jarvis"]):
+                pattern = r"^\s*" + re.escape(alias) + r"\b"
+                match = re.search(pattern, command)
+                if match:
+                    stripped = command[match.end():].strip(" ,.!?")
+                    if stripped:
+                        command = stripped
+                    break
         else:
-            for alias in self.cfg.wake_aliases:
+            for alias in getattr(self.cfg, "wake_aliases", ["jarvis"]):
                 pattern = r"\b" + re.escape(alias) + r"\b"
                 match = re.search(pattern, t)
                 if match:
@@ -725,12 +1176,15 @@ class Voice(threading.Thread):
                 return
 
             if not command:
-                self.listening_until = now + getattr(self.cfg, "command_window", 7.0)
+                self.listening_until = now + getattr(self.cfg, "wake_followup_window", getattr(self.cfg, "command_window", 6.0))
                 try:
+                    self.ctx.overlay.post("wake", duration=0.6)
                     self.ctx.overlay.post("wake_detected")
                     self.ctx.overlay.post("listening", until=self.listening_until)
                 except Exception:
                     pass
+                if getattr(self.cfg, "chime_enabled", True):
+                    play_chime(non_blocking=True)
                 if hasattr(self.ctx, "chirp"):
                     try:
                         self.ctx.chirp("wake")
@@ -765,9 +1219,23 @@ class Voice(threading.Thread):
             except Exception:
                 pass
 
-        reply = run_command(command, self.ctx)
-        if reply:
-            self.ctx.say(reply)
+        # Hand off for intent resolution/processing: overlay receives 'thinking'
+        if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+            try:
+                self.ctx.overlay.post("thinking", active=True, timeout=8.0)
+            except Exception:
+                pass
+
+        try:
+            reply = run_command(command, self.ctx)
+            if reply:
+                self.ctx.say(reply)
+        finally:
+            if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+                try:
+                    self.ctx.overlay.post("thinking", active=False)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

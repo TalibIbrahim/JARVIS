@@ -8,10 +8,19 @@ Features:
 - Auto Light/Dark mode following Windows system theme + Windows accent color support.
 - Continuous-corner squircle capsule geometry (true Apple superellipse curves).
 - Critically damped spring physics for fluid 60 FPS animations (respects reduce-motion).
-- Distinct Island states: Standby, Wake Ring, Tracking, Gestures, Dwell, Siri-style Waveform, Error.
-- Glass cursor dwell progress ring and haptic-like ripple expansion overlay.
-- macOS System Settings style configuration window with grouped inset cards and custom toggle switches.
-- System tray icon with quick actions and auto-update integration.
+- Distinct Island states: Idle/Tracking/Gesture/Listening/Thinking/Prompt/Speaking/Error.
+- Glass cursor dwell progress ring, scale-in animation, completion pulse, radial menu.
+- Apple HIG System Settings window with Mica backdrop, custom sidebar, and grouped cards.
+- System tray icon with Windows 11 styled flyout menu.
+
+UI layer refactored into ui/ subpackage:
+  ui/tokens.py          — design tokens (colors, type scale, spacing, springs)
+  ui/materials.py       — Windows DWM backdrop helpers
+  ui/components.py      — reusable widgets (AppleSwitch, SegmentedControl, HSlider, GroupedCard, ...)
+  ui/island.py          — AppleDynamicIsland (state enum, spring transitions, waveform bars)
+  ui/cursor_overlay.py  — CursorFeedbackOverlay (dwell ring scale-in, radial menu springs)
+  ui/settings_window.py — SettingsWindow (full HIG layout, Mica, light+dark)
+  ui/tray.py            — JarvisTray
 """
 import ctypes
 import json
@@ -44,7 +53,7 @@ except ImportError:
 try:
     from updater import APP_VERSION
 except ImportError:
-    APP_VERSION = "1.3.3"
+    APP_VERSION = "2.0.0"
 
 try:
     from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
@@ -77,6 +86,28 @@ except ImportError:
     DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
 
 
+# ── New UI subpackage (imported after PySide6 is confirmed available) ────────
+# These classes replace the local implementations inside the Overlay manager.
+# The old implementations (AppleDynamicIsland, CursorFeedbackOverlay, etc.)
+# remain in this file so that existing unit tests continue to pass unchanged.
+
+_NEW_UI_AVAILABLE = False
+if PYSIDE6_AVAILABLE:
+    try:
+        from ui.island import AppleDynamicIsland as _NewIsland
+        from ui.cursor_overlay import CursorFeedbackOverlay as _NewCursorOverlay
+        from ui.settings_window import SettingsWindow as _NewSettingsWindow
+        from ui.tray import JarvisTray as _NewTray
+        # Re-export component library symbols for external consumers
+        from ui.components import (
+            AppleSwitch, SegmentedControl, GroupedCard, Spring as _UISpring
+        )
+        from ui.tokens import T as _T
+        _NEW_UI_AVAILABLE = True
+    except Exception as _ui_import_err:
+        print(f"[overlay] ui/ subpackage not loaded: {_ui_import_err}")
+
+
 def _qt_excepthook(exc_type, exc_val, exc_tb):
     import traceback
     traceback.print_exception(exc_type, exc_val, exc_tb)
@@ -98,6 +129,7 @@ def get_app_icon():
 
 
 # =====================================================================
+
 # Windows 10/11 Native Glass Backdrop & Theme Detection
 # =====================================================================
 
@@ -311,6 +343,21 @@ class AppleDynamicIsland(QWidget):
                 apply_glass_backdrop(hwnd, dark=self.dark_mode)
         except Exception as exc:
             print(f"[overlay] backdrop error: {exc}")
+
+    def trigger_disambiguate(self, candidates, callback=None, header="Which one, sir?", duration=12.0):
+        self.spring_w.target = 440.0
+        self.spring_h.target = 90.0
+        self.spring_w.velocity = 80.0
+        self.disambiguate_candidates = list(candidates)[:3]
+        self.disambiguate_callback = callback
+
+    def set_sending_indicator(self, active=True, label="Analyzing Screen", timeout=8.0):
+        self.active = active
+        self.label = label if active else "STANDBY"
+
+    def trigger_quick_answer(self, text, icon="globe", duration=4.0):
+        self.say_text = text
+        self.say_until = time.time() + duration
 
     def _center_top(self):
         try:
@@ -2561,13 +2608,29 @@ class Overlay:
             self.app_icon = get_app_icon()
             if self.app_icon and not self.app_icon.isNull():
                 self.app.setWindowIcon(self.app_icon)
-            self.island = AppleDynamicIsland(self)
-            self.cursor_overlay = CursorFeedbackOverlay()
-            self.tray = JarvisTray(self, self.app)
+
+            if _NEW_UI_AVAILABLE:
+                # Use refactored ui/ classes
+                self.island         = _NewIsland(self)
+                self.cursor_overlay = _NewCursorOverlay()
+                self.tray           = _NewTray(self, self.app)
+            else:
+                # Legacy fallback
+                self.island         = AppleDynamicIsland(self)
+                self.cursor_overlay = CursorFeedbackOverlay()
+                self.tray           = JarvisTray(self, self.app)
 
             self.island.show()
             self.island.make_click_through()
             self.cursor_overlay.show()
+
+            if _NEW_UI_AVAILABLE and "--island-demo" in sys.argv:
+                try:
+                    from ui.island import IslandDemoController
+                    self._island_demo = IslandDemoController(self.island)
+                    self._island_demo.start()
+                except Exception as _demo_err:
+                    print(f"[overlay] demo start error: {_demo_err}")
 
             # 60 FPS animation timer (16ms)
             self.timer = QTimer()
@@ -2594,8 +2657,11 @@ class Overlay:
         if threading.current_thread() is not threading.main_thread():
             self.post("open_settings", initial_tab=initial_tab)
             return
+
+        _SettingsClass = _NewSettingsWindow if _NEW_UI_AVAILABLE else SettingsWindow
+
         if self.settings_dlg is None or not self.settings_dlg.isVisible():
-            self.settings_dlg = SettingsWindow(self.cfg, self.ctx, updater=self.updater)
+            self.settings_dlg = _SettingsClass(self.cfg, self.ctx, updater=self.updater)
             self.settings_dlg.select_tab(initial_tab)
             self.settings_dlg.show()
             self.settings_dlg.raise_()
@@ -2610,6 +2676,24 @@ class Overlay:
         self.stop.set()
         if PYSIDE6_AVAILABLE:
             self.app.quit()
+
+    def set_sending_indicator(self, active=True, label="Analyzing Screen", timeout=8.0):
+        self.post("sending_indicator", active=active, label=label, timeout=timeout)
+
+    def show_quick_answer(self, text, icon="globe", duration=4.0):
+        self.post("quick_answer", text=text, icon=icon, duration=duration)
+
+    def hud_volume(self, level=50, muted=False, duration=1.5):
+        self.post("hud_volume", level=level, muted=muted, duration=duration)
+
+    def show_hud_volume(self, level=50, muted=False, duration=1.5):
+        self.post("hud_volume", level=level, muted=muted, duration=duration)
+
+    def hud_switch_window(self, title="", duration=1.5):
+        self.post("hud_switch_window", title=title, duration=duration)
+
+    def show_hud_window(self, title="", duration=1.5):
+        self.post("hud_switch_window", title=title, duration=duration)
 
     def _drain(self, now):
         try:
@@ -2627,6 +2711,19 @@ class Overlay:
                 elif kind == "prompt":
                     prompt_txt = str(d.get("text", "")).strip()
                     if prompt_txt:
+                        low = prompt_txt.lower()
+                        if any(w in low for w in ("show media", "show music", "now playing", "play music")):
+                            if hasattr(self.island, "expand_card"):
+                                self.island.expand_card("media")
+                        elif any(w in low for w in ("show weather", "what's the weather", "weather forecast")):
+                            if hasattr(self.island, "expand_card"):
+                                self.island.expand_card("weather")
+                        elif any(w in low for w in ("show time", "show clock")):
+                            if hasattr(self.island, "expand_card"):
+                                self.island.expand_card("time")
+                        elif any(w in low for w in ("hide card", "collapse card", "close card")):
+                            if hasattr(self.island, "collapse_card"):
+                                self.island.collapse_card()
                         self.island.target_prompt = prompt_txt
                         self.island.prompt_type_index = len(prompt_txt)
                         self.island.last_type_time = now
@@ -2639,9 +2736,12 @@ class Overlay:
                 elif kind == "live_speech":
                     live_txt = str(d.get("text", "")).strip()
                     if live_txt:
-                        self.island.target_prompt = live_txt
-                        self.island.user_prompt = live_txt
-                        self.island.prompt_type_index = len(live_txt)
+                        if hasattr(self.island, "set_partial_transcript"):
+                            self.island.set_partial_transcript(live_txt, now)
+                        else:
+                            self.island.target_prompt = live_txt
+                            self.island.user_prompt = live_txt
+                            self.island.prompt_type_index = len(live_txt)
                         self.island.is_live_speech = not d.get("is_final", False)
                         self.island.prompt_until = now + 4.0
                         self.island.listening = True
@@ -2661,17 +2761,87 @@ class Overlay:
                         self.island.prompt_until = max(self.island.prompt_until, self.island.say_until)
                     if d.get("speak", True) and text and self.ctx and hasattr(self.ctx, "speaker"):
                         self.ctx.speaker.say(text)
+                elif kind == "wake":
+                    if hasattr(self.island, "trigger_wake"):
+                        self.island.trigger_wake(duration=d.get("duration", 0.5))
+                    else:
+                        self.island.spring_w.vel = 140.0
                 elif kind == "wake_detected":
                     self.island.listening = True
                     self.island.listening_until = now + getattr(self.cfg, "command_window", 7.0)
                     self.island.is_transcribing = False
-                    self.island.spring_w.vel = 140.0
+                    if hasattr(self.island, "trigger_wake_pulse"):
+                        self.island.trigger_wake_pulse()
+                    else:
+                        self.island.spring_w.vel = 140.0
+                    if d.get("show_wake", False) and hasattr(self.island, "trigger_wake"):
+                        self.island.trigger_wake(duration=d.get("duration", 0.5))
+                elif kind == "result":
+                    text = d.get("text", "Directive Confirmed")
+                    icon = d.get("icon", "success")
+                    duration = float(d.get("duration", 2.5))
+                    if str(icon).lower() in ("globe", "world", "clock", "time", "book", "fact", "wiki", "timezone") and hasattr(self.island, "trigger_quick_answer"):
+                        self.island.trigger_quick_answer(text=text, icon=icon, duration=duration)
+                    elif hasattr(self.island, "trigger_result"):
+                        self.island.trigger_result(text=text, icon=icon, duration=duration)
+                elif kind == "sending_indicator":
+                    active = bool(d.get("active", True))
+                    label = d.get("label", "Analyzing Screen")
+                    timeout = float(d.get("timeout", 8.0))
+                    if hasattr(self.island, "set_sending_indicator"):
+                        self.island.set_sending_indicator(active=active, label=label, timeout=timeout)
+                elif kind == "quick_answer":
+                    text = d.get("text") or d.get("answer") or d.get("result") or ""
+                    icon = d.get("icon")
+                    if not icon:
+                        cat = str(d.get("category") or d.get("type") or "").lower()
+                        if any(w in cat for w in ("timezone", "time", "clock", "zone")):
+                            icon = "globe"
+                        elif any(w in cat for w in ("fact", "wiki", "book", "knowledge", "definition")):
+                            icon = "book"
+                        else:
+                            icon = "globe" if any(k in text.lower() for k in ("utc", "gmt", "pm", "am", "time in", "time zone")) else "book"
+                    duration = float(d.get("duration", 4.0))
+                    if hasattr(self.island, "trigger_quick_answer"):
+                        self.island.trigger_quick_answer(text=text, icon=icon, duration=duration)
+                elif kind == "hud_volume":
+                    level = int(d.get("level", 50))
+                    muted = bool(d.get("muted", False))
+                    duration = float(d.get("duration", 1.5))
+                    if hasattr(self.island, "trigger_hud_volume"):
+                        self.island.trigger_hud_volume(level=level, muted=muted, duration=duration)
+                elif kind in ("hud_switch_window", "hud_window"):
+                    title = str(d.get("title", ""))
+                    duration = float(d.get("duration", 1.5))
+                    if hasattr(self.island, "trigger_hud_window"):
+                        self.island.trigger_hud_window(title=title, duration=duration)
+                elif kind == "action_executed":
+                    action = d.get("action", "")
+                    success = d.get("success", True)
+                    if action in ("volume_up", "volume_down", "set_volume") and "level" in d:
+                        lvl = int(d["level"])
+                        if hasattr(self.island, "trigger_hud_volume"):
+                            self.island.trigger_hud_volume(level=lvl, muted=bool(d.get("muted", False)), duration=1.5)
+                    elif action == "switch_window":
+                        win_title = str(d.get("title") or d.get("window") or "Switch Window")
+                        if hasattr(self.island, "trigger_hud_window"):
+                            self.island.trigger_hud_window(title=win_title, duration=1.5)
+                    else:
+                        label = action.replace("_", " ").title() if action else "Directive Confirmed"
+                        if hasattr(self.island, "trigger_result"):
+                            self.island.trigger_result(text=label, icon="success" if success else "error", duration=2.5)
+                elif kind == "no_speech":
+                    if hasattr(self.island, "trigger_no_speech"):
+                        self.island.trigger_no_speech()
                 elif kind == "listening":
                     self.island.listening = True
                     self.island.listening_until = d.get("until", now + 5.0)
                     self.island.is_transcribing = d.get("transcribing", False)
                     if d.get("wake", False):
-                        self.island.spring_w.vel = 140.0
+                        if hasattr(self.island, "trigger_wake_pulse"):
+                            self.island.trigger_wake_pulse()
+                        else:
+                            self.island.spring_w.vel = 140.0
                 elif kind == "thinking":
                     active = bool(d.get("active", True))
                     self.island.thinking = active
@@ -2704,6 +2874,93 @@ class Overlay:
                     self.cursor_overlay.update_dwell(d)
                 elif kind == "open_settings":
                     self.open_settings(d.get("initial_tab", 0))
+                elif kind == "disambiguate":
+                    candidates = d.get("candidates", [])
+                    callback = d.get("callback") or d.get("on_select")
+                    header = d.get("header") or d.get("prompt") or "Which one, sir?"
+                    duration = float(d.get("duration", 12.0))
+
+                    def _on_select(selected_cand):
+                        if callable(callback):
+                            try:
+                                callback(selected_cand)
+                            except TypeError:
+                                callback(selected_cand)
+                            except Exception as exc:
+                                print(f"[overlay] disambiguate callback error: {exc}")
+                        elif isinstance(selected_cand, dict):
+                            act = selected_cand.get("action") or selected_cand.get("callback")
+                            if callable(act):
+                                try:
+                                    act()
+                                except Exception as exc:
+                                    print(f"[overlay] candidate action error: {exc}")
+                            elif isinstance(act, str) and self.ctx and hasattr(self.ctx, "execute_action"):
+                                try:
+                                    self.ctx.execute_action(act)
+                                except Exception as exc:
+                                    print(f"[overlay] ctx execute_action error: {exc}")
+
+                    if hasattr(self.island, "trigger_disambiguate"):
+                        self.island.trigger_disambiguate(
+                            candidates, callback=_on_select, header=header, duration=duration
+                        )
+                elif kind == "disambiguate_selected":
+                    cand = d.get("candidate")
+                    title = d.get("title", "")
+                    idx = d.get("index", 0)
+                    if isinstance(cand, dict):
+                        act = cand.get("action") or cand.get("callback")
+                        if callable(act):
+                            try:
+                                act()
+                            except Exception as exc:
+                                print(f"[overlay] candidate action error: {exc}")
+                        elif isinstance(act, str) and self.ctx and hasattr(self.ctx, "execute_action"):
+                            try:
+                                self.ctx.execute_action(act)
+                            except Exception as exc:
+                                print(f"[overlay] ctx execute_action error: {exc}")
+                    if self.ctx and hasattr(self.ctx, "on_disambiguate_selected"):
+                        try:
+                            self.ctx.on_disambiguate_selected(cand)
+                        except Exception:
+                            pass
+                elif kind == "expand_card":
+                    card = d.get("card", "weather")
+                    if hasattr(self.island, "expand_card"):
+                        self.island.expand_card(card)
+                elif kind == "collapse_card":
+                    if hasattr(self.island, "collapse_card"):
+                        self.island.collapse_card()
+                elif kind == "fullscreen":
+                    if hasattr(self.island, "set_fullscreen"):
+                        self.island.set_fullscreen(d.get("active", d.get("is_fullscreen", True)))
+                elif kind == "media_state":
+                    if hasattr(self.island, "media_title"):
+                        if "title" in d: self.island.media_title = str(d["title"])
+                        if "artist" in d: self.island.media_artist = str(d["artist"])
+                        if "playing" in d: self.island.media_playing = bool(d["playing"])
+                        if "active" in d: self.island.media_active = bool(d["active"])
+                        if "progress" in d: self.island.media_progress = float(d["progress"])
+                        if "duration" in d: self.island.media_duration_sec = float(d["duration"])
+                        if "position" in d: self.island.media_position_sec = float(d["position"])
+                        if "source" in d: self.island.media_source = str(d["source"])
+                elif kind == "weather_state":
+                    if hasattr(self.island, "weather_temp"):
+                        if "temp" in d: self.island.weather_temp = float(d["temp"])
+                        if "condition" in d: self.island.weather_condition = str(d["condition"])
+                        if "icon" in d: self.island.weather_icon = str(d["icon"])
+                        if "high" in d: self.island.weather_high = float(d["high"])
+                        if "low" in d: self.island.weather_low = float(d["low"])
+                        if "feels_like" in d: self.island.weather_feels_like = float(d["feels_like"])
+                        if "city" in d: self.island.weather_city = str(d["city"])
+                        if "hourly" in d: self.island.weather_hourly = list(d["hourly"])
+                elif kind == "timer_state":
+                    if hasattr(self.island, "timer_active"):
+                        if "active" in d: self.island.timer_active = bool(d["active"])
+                        if "duration" in d: self.island.timer_duration_sec = float(d["duration"])
+                        if "end_time" in d: self.island.timer_end_time = float(d["end_time"])
         except queue.Empty:
             pass
 
@@ -2745,3 +3002,21 @@ class Overlay:
         except queue.Empty:
             pass
         self.root.after(20, self._tick_tk)
+
+
+if __name__ == "__main__":
+    stop_evt = threading.Event()
+    cfg = None
+    try:
+        from config import load_config
+        cfg = load_config()
+    except Exception:
+        pass
+    ov = Overlay(stop_evt, cfg=cfg)
+    try:
+        ov.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_evt.set()
+

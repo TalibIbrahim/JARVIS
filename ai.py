@@ -66,7 +66,218 @@ WHITELIST_ACTIONS = {
     "power_mode",
     "status",
     "play_music",
+    "weather",
+    "time",
+    "now_playing",
+    "show_widget",
+    "toggle_widgets",
+    "open_folder",
+    "open_file",
+    "open_recent_file",
+    "show_last_download",
+    "remember_folder",
+    # Phase 5 System Control Actions
+    "set_volume",
+    "get_volume",
+    "brightness_up",
+    "brightness_down",
+    "set_brightness",
+    "get_brightness",
+    "toggle_night_light",
+    "snap_window",
+    "minimize_all",
+    "switch_to_app",
+    "move_to_other_monitor",
+    "sleep_system",
+    "toggle_wifi",
+    "toggle_bluetooth",
+    "toggle_do_not_disturb",
+    "shutdown_system",
+    "restart_system",
+    # Phase 6 Productivity, Scheduler & Routines
+    "set_timer",
+    "cancel_timer",
+    "timer_status",
+    "set_alarm",
+    "set_reminder",
+    "calculate",
+    "convert_units",
+    "quick_note",
+    "read_notes",
+    "type_text",
+    "dictation_mode",
+    "read_clipboard",
+    "summarize_clipboard",
+    "start_routine",
+    # Phase 7 Screen Awareness & Quick Answers
+    "screen_awareness",
+    "analyze_screen",
+    "world_time",
+    "quick_answer",
+    # Phase 8 Window Under Cursor & Gesture Actions
+    "open_this",
+    "copy_this",
+    "close_this",
 }
+
+# Action argument validation schemas
+ACTION_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "none": {},
+    "volume_up": {"steps": int},
+    "volume_down": {"steps": int},
+    "set_volume": {"level": int},
+    "get_volume": {},
+    "mute": {"toggle": bool},
+    "brightness_up": {"steps": int},
+    "brightness_down": {"steps": int},
+    "set_brightness": {"level": int},
+    "get_brightness": {},
+    "toggle_night_light": {},
+    "snap_window": {"direction": str},
+    "minimize_all": {},
+    "switch_to_app": {"app": str},
+    "move_to_other_monitor": {},
+    "close_window": {"confirm": bool},
+    "lock_workstation": {},
+    "sleep_system": {},
+    "screenshot": {"path": str},
+    "toggle_wifi": {},
+    "toggle_bluetooth": {},
+    "toggle_do_not_disturb": {},
+    "shutdown_system": {"confirmed": bool},
+    "restart_system": {"confirmed": bool},
+    "open_app": {"app": str},
+    "open_site": {"site": str},
+    "search": {"query": str},
+    "play_music": {"query": str, "platform": str},
+    "open_folder": {"folder": str},
+    "open_file": {"file": str},
+    "open_recent_file": {"folder": str, "extension": str},
+    "show_last_download": {},
+    "remember_folder": {"alias": str, "path": str, "confirmed": bool},
+    # Phase 6 schemas
+    "set_timer": {"duration": (int, float), "label": str},
+    "cancel_timer": {"label": str},
+    "timer_status": {},
+    "set_alarm": {"target_time": (int, float), "label": str},
+    "set_reminder": {"target_time": (int, float), "text": str},
+    "calculate": {"expression": str},
+    "convert_units": {"value": (int, float), "from_unit": str, "to_unit": str},
+    "quick_note": {"text": str},
+    "read_notes": {"count": int},
+    "type_text": {"text": str},
+    "dictation_mode": {"enabled": bool},
+    "read_clipboard": {},
+    "summarize_clipboard": {},
+    "start_routine": {"routine": str},
+    # Phase 7 schemas
+    "screen_awareness": {"query": str},
+    "analyze_screen": {"query": str},
+    "world_time": {"location": str},
+    "quick_answer": {"query": str},
+    # Phase 8 schemas
+    "open_this": {},
+    "copy_this": {},
+    "close_this": {"confirm": bool},
+}
+
+
+def validate_action_arguments(action: str, args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Validates arguments against the action schema.
+    Returns (valid: bool, message: str, sanitized_args: Dict[str, Any]).
+    """
+    if action not in WHITELIST_ACTIONS:
+        return False, f"Action '{action}' is not in the security whitelist", {}
+
+    schema = ACTION_SCHEMAS.get(action)
+    if schema is None:
+        return True, "Valid", dict(args)
+
+    sanitized = dict(args)
+    if action == "set_volume":
+        try:
+            lvl = int(args.get("level", 50))
+            sanitized["level"] = max(0, min(100, lvl))
+        except (ValueError, TypeError):
+            return False, "Argument 'level' must be an integer between 0 and 100", {}
+    elif action == "set_brightness":
+        try:
+            lvl = int(args.get("level", 50))
+            sanitized["level"] = max(0, min(100, lvl))
+        except (ValueError, TypeError):
+            return False, "Argument 'level' must be an integer between 0 and 100", {}
+    elif action in ("volume_up", "volume_down", "brightness_up", "brightness_down"):
+        if "steps" in args:
+            try:
+                sanitized["steps"] = max(1, min(50, int(args["steps"])))
+            except (ValueError, TypeError):
+                sanitized["steps"] = 5
+    elif action == "snap_window":
+        direction = str(args.get("direction", "")).strip().lower()
+        if direction not in ("left", "right", "up", "down", "maximize", "restore", "west", "east", "north", "south"):
+            return False, f"Invalid snap direction '{direction}'. Must be left, right, up, or down", {}
+        sanitized["direction"] = direction
+    elif action == "switch_to_app":
+        app = str(args.get("app", "")).strip()
+        if not app:
+            return False, "Argument 'app' must not be empty", {}
+        sanitized["app"] = app
+    elif action == "set_timer":
+        try:
+            dur = float(args.get("duration", 60.0))
+            if dur <= 0:
+                return False, "Timer duration must be greater than zero", {}
+            sanitized["duration"] = dur
+        except (ValueError, TypeError):
+            return False, "Argument 'duration' must be a valid number", {}
+        sanitized["label"] = str(args.get("label", "Timer")).strip() or "Timer"
+    elif action == "calculate":
+        expr = str(args.get("expression", "")).strip()
+        if not expr:
+            return False, "Expression cannot be empty", {}
+        sanitized["expression"] = expr
+    elif action == "convert_units":
+        try:
+            val = float(args.get("value", 0.0))
+            sanitized["value"] = val
+        except (ValueError, TypeError):
+            return False, "Argument 'value' must be a valid number", {}
+        from_u = str(args.get("from_unit", "")).strip()
+        to_u = str(args.get("to_unit", "")).strip()
+        if not from_u or not to_u:
+            return False, "Both 'from_unit' and 'to_unit' must be provided", {}
+        sanitized["from_unit"] = from_u
+        sanitized["to_unit"] = to_u
+    elif action == "quick_note":
+        txt = str(args.get("text", "")).strip()
+        if not txt:
+            return False, "Note text cannot be empty", {}
+        sanitized["text"] = txt
+    elif action == "type_text":
+        txt = str(args.get("text", "")).strip()
+        if not txt:
+            return False, "Text to type cannot be empty", {}
+        sanitized["text"] = txt
+    elif action == "start_routine":
+        rout = str(args.get("routine", "")).strip()
+        if not rout:
+            return False, "Routine name cannot be empty", {}
+        sanitized["routine"] = rout
+    elif action in ("screen_awareness", "analyze_screen"):
+        sanitized["query"] = str(args.get("query", "what's on my screen")).strip()
+    elif action == "world_time":
+        loc = str(args.get("location", "")).strip()
+        if not loc:
+            return False, "Argument 'location' cannot be empty", {}
+        sanitized["location"] = loc
+    elif action == "quick_answer":
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return False, "Argument 'query' cannot be empty", {}
+        sanitized["query"] = q
+
+    return True, "Valid", sanitized
 
 
 # =====================================================================
@@ -316,6 +527,17 @@ class GroqClient:
             "prompt": prompt,
         }
 
+        # Phase 8 Privacy Log: audit external cloud audio transmission
+        try:
+            from privacy_log import record_cloud_transmission
+            record_cloud_transmission(
+                destination="Groq STT",
+                payload_summary=f"Audio transcription ({len(wav_bytes)} bytes, model={model})",
+                metadata={"model": model, "language": language, "bytes": len(wav_bytes)},
+            )
+        except Exception:
+            pass
+
         try:
             resp = requests.post(url, headers=headers, files=files, data=data, timeout=self.timeout)
         except requests.exceptions.Timeout as exc:
@@ -353,6 +575,20 @@ class GroqClient:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
+        # Phase 8 Privacy Log: audit external cloud LLM chat transmission
+        try:
+            from privacy_log import record_cloud_transmission
+            user_msgs = [m.get("content", "") for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+            last_text = str(user_msgs[-1]) if user_msgs else ""
+            summary_snippet = (last_text[:50] + "...") if len(last_text) > 50 else last_text
+            record_cloud_transmission(
+                destination="Groq LLM",
+                payload_summary=f"Chat completion (model={model}, messages={len(messages)}, prompt='{summary_snippet}')",
+                metadata={"model": model, "messages_count": len(messages), "json_mode": json_mode},
+            )
+        except Exception:
+            pass
+
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
         except requests.exceptions.Timeout as exc:
@@ -372,7 +608,9 @@ class GroqClient:
             raise InvalidResponseError("Failed to parse chat completion response") from exc
 
     def describe_image(self, image_input: Any, prompt: Optional[str] = None,
-                       model: str = DEFAULT_VISION_MODEL) -> str:
+                       model: str = DEFAULT_VISION_MODEL,
+                       system_prompt: Optional[str] = None,
+                       max_tokens: int = 150) -> str:
         """
         Submits an image to Groq's multimodal vision endpoint for real-time visual scene analysis.
         Accepts:
@@ -413,12 +651,15 @@ class GroqClient:
         else:
             raise AIError("Unsupported image input format")
 
-        system_instruction = (
-            "You are J.A.R.V.I.S., the witty, brilliant AI assistant from Iron Man. "
-            "The user is showing an object or their surroundings to your camera. "
-            "Accurately identify what you see, answer their question, and address the user as 'sir'. "
-            "Be concise, natural, and limit your spoken reply to 1-2 sentences maximum."
-        )
+        if system_prompt:
+            system_instruction = system_prompt
+        else:
+            system_instruction = (
+                "You are J.A.R.V.I.S., the witty, brilliant AI assistant from Iron Man. "
+                "The user is showing an object or their surroundings to your camera. "
+                "Accurately identify what you see, answer their question, and address the user as 'sir'. "
+                "Be concise, natural, and limit your spoken reply to 1-2 sentences maximum."
+            )
 
         user_content = []
         user_prompt = prompt.strip() if prompt and prompt.strip() else "Identify what is in front of the camera, sir."
@@ -433,9 +674,22 @@ class GroqClient:
                     "content": user_content
                 }
             ],
-            "max_tokens": 120,
+            "max_tokens": max_tokens,
             "temperature": 0.2
         }
+
+        # Phase 8 Privacy Log: audit external cloud multimodal vision transmission
+        try:
+            from privacy_log import record_cloud_transmission
+            prompt_str = str(user_prompt)
+            prompt_snip = (prompt_str[:50] + "...") if len(prompt_str) > 50 else prompt_str
+            record_cloud_transmission(
+                destination="Groq Vision",
+                payload_summary=f"Vision analysis (model={model}, prompt='{prompt_snip}')",
+                metadata={"model": model, "prompt": prompt_str},
+            )
+        except Exception:
+            pass
 
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
@@ -687,6 +941,23 @@ def build_system_prompt(ctx: Any = None) -> str:
         "   - 'power_mode' (args: {'mode': 'standby' | 'wake' | 'quit'})\n"
         "   - 'status' (args: {})\n"
         "   - 'play_music' (args: {'query': '<artist or track>', 'platform': 'spotify' | 'youtube'})\n"
+        "   - 'set_volume' (args: {'level': 0-100})\n"
+        "   - 'get_volume' (args: {})\n"
+        "   - 'brightness_up' (args: {'steps': 10})\n"
+        "   - 'brightness_down' (args: {'steps': 10})\n"
+        "   - 'set_brightness' (args: {'level': 0-100})\n"
+        "   - 'get_brightness' (args: {})\n"
+        "   - 'toggle_night_light' (args: {})\n"
+        "   - 'snap_window' (args: {'direction': 'left' | 'right' | 'up' | 'down'})\n"
+        "   - 'minimize_all' (args: {})\n"
+        "   - 'switch_to_app' (args: {'app': '<name>'})\n"
+        "   - 'move_to_other_monitor' (args: {})\n"
+        "   - 'sleep_system' (args: {})\n"
+        "   - 'toggle_wifi' (args: {})\n"
+        "   - 'toggle_bluetooth' (args: {})\n"
+        "   - 'toggle_do_not_disturb' (args: {})\n"
+        "   - 'shutdown_system' (args: {'confirmed': true | false})\n"
+        "   - 'restart_system' (args: {'confirmed': true | false})\n"
         "7. Never output markdown fences (do not output ```json). Output raw JSON only."
     )
     return prompt
@@ -744,8 +1015,28 @@ def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> T
     """
     Executes a whitelisted action securely.
     Rejects unknown actions or arbitrary code execution.
-    Returns (executed: bool, message: str).
+    Returns (executed: bool, message: str) and notifies overlay on completion.
     """
+    executed, msg = _execute_whitelisted_action_impl(action, args, ctx)
+    if action and action != "none" and ctx and hasattr(ctx, "overlay") and ctx.overlay:
+        try:
+            ctx.overlay.post("action_executed", action=action, success=executed)
+        except Exception:
+            pass
+    if executed and action and action != "none":
+        try:
+            from context_resolver import get_context_resolver
+            get_context_resolver().record_turn(
+                user_utterance=str(args.get("_utterance", action)),
+                resolved_action=action,
+                arguments=args,
+            )
+        except Exception:
+            pass
+    return executed, msg
+
+
+def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any) -> Tuple[bool, str]:
     if action not in WHITELIST_ACTIONS or action == "none":
         return False, f"Action '{action}' is not executable"
 
@@ -755,29 +1046,120 @@ def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> T
     try:
         if action == "volume_up":
             steps = min(max(int(args.get("steps", 5)), 1), 25)
+            try:
+                import system_control
+                system_control.volume_up(steps=steps)
+            except Exception:
+                pass
             pyautogui.press("volumeup", presses=steps, _pause=False)
             return True, f"Volume increased by {steps}"
 
         elif action == "volume_down":
             steps = min(max(int(args.get("steps", 5)), 1), 25)
+            try:
+                import system_control
+                system_control.volume_down(steps=steps)
+            except Exception:
+                pass
             pyautogui.press("volumedown", presses=steps, _pause=False)
             return True, f"Volume decreased by {steps}"
 
         elif action == "mute":
+            try:
+                import system_control
+                system_control.mute(toggle=True)
+            except Exception:
+                pass
             pyautogui.press("volumemute", _pause=False)
             return True, "Mute toggled"
 
         elif action == "play_pause":
-            pyautogui.press("playpause", _pause=False)
+            try:
+                from media_adapter import get_media_adapter
+                get_media_adapter().play_pause()
+            except Exception:
+                pyautogui.press("playpause", _pause=False)
             return True, "Play/pause toggled"
 
         elif action == "next_track":
-            pyautogui.press("nexttrack", _pause=False)
+            try:
+                from media_adapter import get_media_adapter
+                get_media_adapter().next_track()
+            except Exception:
+                pyautogui.press("nexttrack", _pause=False)
             return True, "Skipped to next track"
 
         elif action == "previous_track":
-            pyautogui.press("prevtrack", _pause=False)
+            try:
+                from media_adapter import get_media_adapter
+                get_media_adapter().previous_track()
+            except Exception:
+                pyautogui.press("prevtrack", _pause=False)
             return True, "Previous track"
+
+        elif action == "weather":
+            from weather_client import get_weather_client
+            cfg = getattr(ctx, "cfg", None) or getattr(getattr(ctx, "engine", None), "cfg", None)
+            city = str(args.get("city", getattr(cfg, "weather_city", "New York") if cfg else "New York"))
+            lat = float(args.get("lat", getattr(cfg, "weather_lat", 40.7128) if cfg else 40.7128))
+            lon = float(args.get("lon", getattr(cfg, "weather_lon", -74.0060) if cfg else -74.0060))
+            units = getattr(cfg, "weather_units", "auto") if cfg else "auto"
+            client = get_weather_client()
+            w = client.get_weather(lat, lon, city=city, units=units)
+            if not w and city:
+                w = client.get_weather_for_city(city, units=units)
+            if w:
+                temp_int = int(round(w.temperature))
+                c_name = w.city.split(",")[0]
+                card_text = f"{c_name}: {temp_int}{w.unit_symbol}, {w.description}"
+                if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                    try:
+                        ctx.overlay.post("result", text=card_text, icon="weather", duration=4.0)
+                    except Exception:
+                        pass
+                return True, f"Weather telemetry retrieved for {c_name}"
+            return False, "Weather unavailable"
+
+        elif action == "time":
+            import datetime
+            now_str = datetime.datetime.now().strftime("%I:%M %p").lstrip("0")
+            if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                try:
+                    ctx.overlay.post("result", text=f"Time: {now_str}", icon="time", duration=3.0)
+                except Exception:
+                    pass
+            return True, f"Time: {now_str}"
+
+        elif action == "now_playing":
+            from media_adapter import get_media_adapter
+            adapter = get_media_adapter()
+            media = adapter.get_current_media() or adapter.refresh_sync()
+            if media and media.has_media:
+                card_text = f"{media.title} — {media.artist}" if media.artist else media.title
+                if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                    try:
+                        ctx.overlay.post("result", text=card_text, icon="media", duration=3.5)
+                    except Exception:
+                        pass
+                return True, f"Now playing: {card_text}"
+            return False, "No active media"
+
+        elif action == "show_widget":
+            widget = str(args.get("widget", "media")).strip().lower()
+            if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                try:
+                    ctx.overlay.post("expand_widget", widget=widget)
+                except Exception:
+                    pass
+            return True, f"Expanded {widget} widget"
+
+        elif action == "toggle_widgets":
+            if ctx and hasattr(ctx, "overlay") and ctx.overlay:
+                try:
+                    ctx.overlay.post("toggle_widgets")
+                except Exception:
+                    pass
+            return True, "Toggled island widgets"
 
         elif action == "open_app":
             app_req = str(args.get("app", "")).strip().lower()
@@ -842,8 +1224,9 @@ def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> T
             return True, "Window switched"
 
         elif action == "close_window":
-            pyautogui.hotkey("alt", "f4", _pause=False)
-            return True, "Window closed"
+            import system_control
+            confirm = bool(args.get("confirm", False))
+            return system_control.close_window(confirm=confirm)
 
         elif action == "dwell_toggle":
             mode = str(args.get("mode", "")).strip().lower()
@@ -913,6 +1296,253 @@ def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> T
             else:
                 webbrowser.open("https://www.google.com")
             return True, "Target practice canvas opened"
+
+        elif action == "open_folder":
+            import file_ops
+            folder = str(args.get("folder", "")).strip()
+            res = file_ops.open_folder(folder)
+            return res.success, res.message
+
+        elif action == "open_file":
+            import file_ops
+            filepath = str(args.get("file", "")).strip()
+            res = file_ops.open_file(filepath)
+            return res.success, res.message
+
+        elif action == "open_recent_file":
+            import file_ops
+            folder = str(args.get("folder", "downloads")).strip()
+            ext = args.get("extension")
+            res = file_ops.open_recent_file(folder=folder, extension=ext)
+            return res.success, res.message
+
+        elif action == "show_last_download":
+            import file_ops
+            res = file_ops.show_last_download()
+            return res.success, res.message
+
+        elif action == "remember_folder":
+            import file_ops
+            alias = str(args.get("alias", "")).strip()
+            path = str(args.get("path", "")).strip()
+            confirmed = bool(args.get("confirmed", True))
+            res = file_ops.remember_folder(alias=alias, path=path, confirmed=confirmed)
+            return res.success, res.message
+
+        elif action == "set_volume":
+            import system_control
+            lvl = int(args.get("level", 50))
+            return system_control.set_volume(lvl)
+
+        elif action == "get_volume":
+            import system_control
+            return system_control.get_volume()
+
+        elif action == "brightness_up":
+            import system_control
+            steps = int(args.get("steps", 10))
+            return system_control.brightness_up(steps)
+
+        elif action == "brightness_down":
+            import system_control
+            steps = int(args.get("steps", 10))
+            return system_control.brightness_down(steps)
+
+        elif action == "set_brightness":
+            import system_control
+            lvl = int(args.get("level", 50))
+            return system_control.set_brightness(lvl)
+
+        elif action == "get_brightness":
+            import system_control
+            return system_control.get_brightness()
+
+        elif action == "toggle_night_light":
+            import system_control
+            return system_control.toggle_night_light()
+
+        elif action == "snap_window":
+            import system_control
+            direction = str(args.get("direction", "left"))
+            return system_control.snap_window(direction)
+
+        elif action == "minimize_all":
+            import system_control
+            return system_control.minimize_all()
+
+        elif action == "switch_to_app":
+            import system_control
+            app_name = str(args.get("app", ""))
+            return system_control.switch_to_app(app_name)
+
+        elif action == "move_to_other_monitor":
+            import system_control
+            return system_control.move_to_other_monitor()
+
+        elif action == "sleep_system":
+            import system_control
+            return system_control.sleep_system()
+
+        elif action == "toggle_wifi":
+            import system_control
+            return system_control.toggle_wifi()
+
+        elif action == "toggle_bluetooth":
+            import system_control
+            return system_control.toggle_bluetooth()
+
+        elif action == "toggle_do_not_disturb":
+            import system_control
+            return system_control.toggle_do_not_disturb()
+
+        elif action == "shutdown_system":
+            import system_control
+            confirmed = bool(args.get("confirmed", False))
+            return system_control.shutdown_system(confirmed=confirmed)
+
+        elif action == "restart_system":
+            import system_control
+            confirmed = bool(args.get("confirmed", False))
+            return system_control.restart_system(confirmed=confirmed)
+
+        # Phase 6 Productivity, Scheduler & Routines Actions
+        elif action == "set_timer":
+            import scheduler
+            sched = scheduler.get_scheduler(ctx=ctx)
+            duration = float(args.get("duration", 60.0))
+            label = str(args.get("label", "Timer"))
+            item = sched.set_timer(duration, label=label)
+            return True, f"Timer set for {scheduler.format_duration(duration)} ({label})"
+
+        elif action == "cancel_timer":
+            import scheduler
+            sched = scheduler.get_scheduler(ctx=ctx)
+            label = args.get("label")
+            ok = sched.cancel_timer(label)
+            return ok, "Timer cancelled" if ok else "No active timer found"
+
+        elif action == "timer_status":
+            import scheduler
+            sched = scheduler.get_scheduler(ctx=ctx)
+            left = sched.get_time_left(args.get("label"))
+            if left is not None and left > 0:
+                return True, f"Time remaining: {scheduler.format_duration(left)}"
+            return False, "No active timer running"
+
+        elif action == "set_alarm":
+            import scheduler
+            sched = scheduler.get_scheduler(ctx=ctx)
+            target = float(args.get("target_time", time.time() + 3600))
+            label = str(args.get("label", "Alarm"))
+            item = sched.set_alarm(target, label=label)
+            return True, f"Alarm set for {label}"
+
+        elif action == "set_reminder":
+            import scheduler
+            sched = scheduler.get_scheduler(ctx=ctx)
+            target = float(args.get("target_time", time.time() + 3600))
+            text_val = str(args.get("text", "Reminder"))
+            item = sched.set_reminder(target, text=text_val)
+            return True, f"Reminder set: {text_val}"
+
+        elif action == "calculate":
+            import math_parser
+            expr = str(args.get("expression", ""))
+            ok, res, msg = math_parser.evaluate_expression(expr)
+            return ok, msg
+
+        elif action == "convert_units":
+            import math_parser
+            val = float(args.get("value", 0.0))
+            f_u = str(args.get("from_unit", ""))
+            t_u = str(args.get("to_unit", ""))
+            ok, res, msg = math_parser.convert_units(val, f_u, t_u)
+            return ok, msg
+
+        elif action == "quick_note":
+            import productivity
+            txt = str(args.get("text", ""))
+            ok, msg = productivity.add_note(txt)
+            return ok, msg
+
+        elif action == "read_notes":
+            import productivity
+            cnt = int(args.get("count", 3))
+            ok, msg, _ = productivity.read_notes(max_entries=cnt)
+            return ok, msg
+
+        elif action == "type_text":
+            import productivity
+            txt = str(args.get("text", ""))
+            ok = productivity.type_text(txt)
+            return ok, f"Typed text: {txt}" if ok else "Failed to type text"
+
+        elif action == "dictation_mode":
+            import productivity
+            enabled = bool(args.get("enabled", True))
+            res = productivity.set_dictation_mode(enabled)
+            return True, f"Dictation mode {'enabled' if res else 'disabled'}"
+
+        elif action == "read_clipboard":
+            import productivity
+            cb = productivity.get_clipboard_text()
+            if not cb:
+                return False, "Clipboard is empty"
+            return True, f"Clipboard content: {cb[:200]}"
+
+        elif action == "summarize_clipboard":
+            import productivity
+            cb = productivity.get_clipboard_text()
+            if not cb:
+                return False, "Clipboard is empty"
+            summary = productivity.summarize_text(cb)
+            return True, f"Clipboard summary: {summary}"
+
+        elif action == "start_routine":
+            import routines
+            rout = str(args.get("routine", ""))
+            ok, summary, _ = routines.execute_routine(rout, ctx=ctx)
+            return ok, summary
+
+        # Phase 7 Screen Awareness & Quick Answers
+        elif action in ("screen_awareness", "analyze_screen"):
+            import screen_awareness
+            query_txt = str(args.get("query", "what's on my screen"))
+            reply = screen_awareness.analyze_screen(query_txt, ctx)
+            return True, reply
+
+        elif action == "world_time":
+            import quick_answers
+            loc = str(args.get("location", ""))
+            reply = quick_answers.get_world_time(loc, ctx)
+            if reply:
+                return True, reply
+            return False, f"Could not determine time for {loc}"
+
+        elif action == "quick_answer":
+            import quick_answers
+            query_txt = str(args.get("query", ""))
+            reply = quick_answers.get_quick_answer(query_txt, ctx)
+            if reply:
+                return True, reply
+            return False, "Unable to find a quick answer"
+
+        # Phase 8 Window Under Cursor Actions
+        elif action == "open_this":
+            import window_resolver
+            ok, msg = window_resolver.open_this()
+            return ok, msg
+
+        elif action == "copy_this":
+            import window_resolver
+            ok, msg = window_resolver.copy_this()
+            return ok, msg
+
+        elif action == "close_this":
+            import window_resolver
+            confirm = bool(args.get("confirm", False))
+            ok, msg = window_resolver.close_this(confirm=confirm)
+            return ok, msg
 
     except Exception as exc:
         return False, f"Action execution error: {exc}"
