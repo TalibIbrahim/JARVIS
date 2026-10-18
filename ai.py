@@ -166,6 +166,13 @@ WHITELIST_ACTIONS = {
     "open_this",
     "copy_this",
     "close_this",
+    # Dynamic Island Actions (Phase 4)
+    "island_next_page",
+    "island_prev_page",
+    "island_show_page",
+    "island_toggle_expand",
+    "island_toggle_tracking",
+    "island_set_pin",
 }
 
 # Action argument validation schemas
@@ -227,6 +234,13 @@ ACTION_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "open_this": {},
     "copy_this": {},
     "close_this": {"confirm": bool},
+    # Dynamic Island Actions (Phase 4)
+    "island_next_page": {},
+    "island_prev_page": {},
+    "island_show_page": {"page": str},
+    "island_toggle_expand": {},
+    "island_toggle_tracking": {},
+    "island_set_pin": {"pinned": bool},
 }
 
 
@@ -324,6 +338,18 @@ def validate_action_arguments(action: str, args: Dict[str, Any]) -> Tuple[bool, 
         if not q:
             return False, "Argument 'query' cannot be empty", {}
         sanitized["query"] = q
+    elif action == "island_show_page":
+        p = str(args.get("page", "")).strip().lower()
+        if not p:
+            return False, "Argument 'page' must not be empty", {}
+        sanitized["page"] = p
+    elif action == "island_set_pin":
+        pinned = args.get("pinned", True)
+        if isinstance(pinned, str):
+            pinned = pinned.lower() not in ("false", "0", "no", "off")
+        else:
+            pinned = bool(pinned)
+        sanitized["pinned"] = pinned
 
     return True, "Valid", sanitized
 
@@ -1477,6 +1503,13 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
 
         elif action == "show_widget":
             widget = str(args.get("widget", "media")).strip().lower()
+            try:
+                from island_manager import get_island_page_manager
+                mgr = get_island_page_manager()
+                mgr.set_active_page(widget)
+                mgr.expand()
+            except Exception:
+                pass
             if ctx and hasattr(ctx, "overlay") and ctx.overlay:
                 try:
                     ctx.overlay.post("expand_widget", widget=widget)
@@ -1874,6 +1907,52 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             confirm = bool(args.get("confirm", False))
             ok, msg = window_resolver.close_this(confirm=confirm)
             return ok, msg
+
+        # Phase 4 Dynamic Island Actions
+        elif action == "island_next_page":
+            from island_manager import get_island_page_manager
+            mgr = get_island_page_manager()
+            page = mgr.next_page()
+            page_val = page.value if hasattr(page, "value") else str(page)
+            return True, f"Dynamic Island flipped to {page_val}"
+
+        elif action == "island_prev_page":
+            from island_manager import get_island_page_manager
+            mgr = get_island_page_manager()
+            page = mgr.previous_page()
+            page_val = page.value if hasattr(page, "value") else str(page)
+            return True, f"Dynamic Island flipped to {page_val}"
+
+        elif action == "island_show_page":
+            from island_manager import get_island_page_manager
+            mgr = get_island_page_manager()
+            page_name = str(args.get("page", "")).strip().lower()
+            ok = mgr.set_active_page(page_name)
+            if ok:
+                return True, f"Dynamic Island switched to {page_name}"
+            return False, f"Unknown page '{page_name}'"
+
+        elif action == "island_toggle_expand":
+            from island_manager import get_island_page_manager
+            mgr = get_island_page_manager()
+            expanded = mgr.toggle_expanded()
+            state_str = "expanded" if expanded else "collapsed"
+            return True, f"Dynamic Island {state_str}"
+
+        elif action == "island_toggle_tracking":
+            from island_manager import get_island_page_manager
+            mgr = get_island_page_manager()
+            tracking = mgr.toggle_tracking()
+            state_str = "enabled" if tracking else "disabled"
+            return True, f"Hand tracking {state_str}"
+
+        elif action == "island_set_pin":
+            from island_manager import get_island_page_manager
+            mgr = get_island_page_manager()
+            pinned = bool(args.get("pinned", True))
+            mgr.set_pin_open(pinned)
+            state_str = "pinned" if pinned else "unpinned"
+            return True, f"Dynamic Island {state_str}"
 
     except Exception as exc:
         return False, f"Action execution error: {exc}"

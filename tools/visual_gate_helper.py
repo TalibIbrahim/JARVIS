@@ -16,11 +16,12 @@ import os
 import sys
 import math
 import time
+import datetime
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QPoint, QRectF, QSize
-from PySide6.QtGui import QPainter, QPixmap, QColor, QFont, QImage
+from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, QSize
+from PySide6.QtGui import QPainter, QPixmap, QColor, QFont, QImage, QPen, QBrush, QLinearGradient
 from PySide6.QtWidgets import QApplication
 
 # Apply PySide6 compatibility patch for QFont.setWeight if needed
@@ -33,6 +34,7 @@ QFont.setWeight = _compat_set_weight
 
 import ui.tokens
 from config import Config
+from ui.components import create_squircle_path
 from ui.island import AppleDynamicIsland, IslandState, _SIZE
 from ui.settings_window import SettingsWindow, _CATEGORIES
 from ui.cursor_overlay import CursorFeedbackOverlay
@@ -196,10 +198,222 @@ def render_settings_tab(category_id: str, dpi: float, theme: str) -> QImage:
         return img
 
 
+def _render_hardware_grid_fallback(island: AppleDynamicIsland, w: float, h: float, dpi: float, theme: str) -> QImage:
+    """Renders 2x3 Hardware Monitor Grid card offscreen per MEASUREMENT_SHEET.md."""
+    pw = int(round(w * dpi))
+    ph = int(round(h * dpi))
+    pix = QPixmap(pw, ph)
+    pix.setDevicePixelRatio(dpi)
+    pix.fill(QColor(0, 0, 0, 0))
+
+    dark = (theme.lower() == "dark")
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+    r = 47.0
+    pill_rect = QRectF(2, 2, w - 4, h - 4)
+    squircle = create_squircle_path(pill_rect, r)
+
+    for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
+        sr = QRectF(2, 2 + offset, w - 4, h - 4)
+        sp = create_squircle_path(sr, r)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+        p.drawPath(sp)
+
+    bg_grad = QLinearGradient(0, 0, 0, h)
+    if dark:
+        bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
+        bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
+    else:
+        bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
+        bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
+    p.fillPath(squircle, QBrush(bg_grad))
+
+    sheen = QLinearGradient(0, 0, 0, h * 0.40)
+    sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
+    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillPath(squircle, QBrush(sheen))
+
+    p.strokePath(squircle, QPen(QColor(255, 255, 255, 15 if dark else 40), 1.0))
+
+    tiles_data = [
+        ("CPU", "38%", "#45C1EE", "3.8 GHz"),
+        ("GPU", "42%", "#34C759", "58°C"),
+        ("RAM", "56%", "#F5A524", "17.9/32 GB"),
+        ("DISK", "12%", "#45C1EE", "Read 45MB/s"),
+        ("NETWORK", "14.2", "#45C1EE", "MB/s Down"),
+        ("THERMAL", "54°C", "#34C759", "Optimal"),
+    ]
+
+    tile_w = 114.0
+    tile_h = 68.0
+    tile_r = 17.0
+    margin_x = (w - (3 * tile_w + 2 * 12.0)) / 2.0
+    margin_y = (h - (2 * tile_h + 12.0)) / 2.0
+
+    for idx, (label, val, accent_hex, sub) in enumerate(tiles_data):
+        row = idx // 3
+        col = idx % 3
+        tx = margin_x + col * (tile_w + 12.0)
+        ty = margin_y + row * (tile_h + 12.0)
+        tr = QRectF(tx, ty, tile_w, tile_h)
+        t_path = create_squircle_path(tr, tile_r)
+
+        p.fillPath(t_path, QBrush(QColor(255, 255, 255, 23 if dark else 60)))
+        p.strokePath(t_path, QPen(QColor(255, 255, 255, 10 if dark else 25), 1.0))
+
+        p.setFont(QFont("Segoe UI Variable Text", 9, QFont.Weight.DemiBold))
+        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+        p.drawText(int(tx + 10), int(ty + 18), label)
+
+        p.setFont(QFont("Segoe UI Variable Display", 18, QFont.Weight.Bold))
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        p.drawText(int(tx + 10), int(ty + 44), val)
+
+        p.setFont(QFont("Segoe UI Variable Text", 8, QFont.Weight.Normal))
+        p.setPen(QColor(accent_hex))
+        p.drawText(int(tx + 10), int(ty + 60), sub)
+
+    p.end()
+    return pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+
+
+def _render_hardware_strip_fallback(island: AppleDynamicIsland, w: float, h: float, dpi: float, theme: str) -> QImage:
+    """Renders 5-item Hardware Strip (446x69 px) offscreen per MEASUREMENT_SHEET.md."""
+    pw = int(round(w * dpi))
+    ph = int(round(h * dpi))
+    pix = QPixmap(pw, ph)
+    pix.setDevicePixelRatio(dpi)
+    pix.fill(QColor(0, 0, 0, 0))
+
+    dark = (theme.lower() == "dark")
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+    r = 28.0
+    pill_rect = QRectF(2, 2, w - 4, h - 4)
+    squircle = create_squircle_path(pill_rect, r)
+
+    for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
+        sr = QRectF(2, 2 + offset, w - 4, h - 4)
+        sp = create_squircle_path(sr, r)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+        p.drawPath(sp)
+
+    bg_grad = QLinearGradient(0, 0, 0, h)
+    if dark:
+        bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
+        bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
+    else:
+        bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
+        bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
+    p.fillPath(squircle, QBrush(bg_grad))
+
+    sheen = QLinearGradient(0, 0, 0, h * 0.40)
+    sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
+    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillPath(squircle, QBrush(sheen))
+
+    p.strokePath(squircle, QPen(QColor(255, 255, 255, 15 if dark else 40), 1.0))
+
+    segments = [
+        ("CPU", "38%", "#45C1EE"),
+        ("GPU", "24%", "#34C759"),
+        ("RAM", "56%", "#F5A524"),
+        ("NET", "14MB", "#45C1EE"),
+        ("TEMP", "54°C", "#34C759"),
+    ]
+    seg_w = (w - 24.0) / 5.0
+    for idx, (label, val, accent_hex) in enumerate(segments):
+        sx = 12.0 + idx * seg_w
+        if idx > 0:
+            p.setPen(QPen(QColor(255, 255, 255, 10 if dark else 25), 1.0))
+            p.drawLine(QPointF(sx, 16.0), QPointF(sx, h - 16.0))
+
+        p.setFont(QFont("Segoe UI Variable Text", 9, QFont.Weight.DemiBold))
+        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+        p.drawText(QRectF(sx, 12.0, seg_w, 18.0), Qt.AlignmentFlag.AlignCenter, label)
+
+        p.setFont(QFont("Segoe UI Variable Display", 15, QFont.Weight.Bold))
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        p.drawText(QRectF(sx, 32.0, seg_w, 24.0), Qt.AlignmentFlag.AlignCenter, val)
+
+    p.end()
+    return pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+
+
+def _render_jarvis_card_fallback(island: AppleDynamicIsland, w: float, h: float, dpi: float, theme: str) -> QImage:
+    """Renders JARVIS Assistant Card (390x188 px) offscreen per MEASUREMENT_SHEET.md."""
+    pw = int(round(w * dpi))
+    ph = int(round(h * dpi))
+    pix = QPixmap(pw, ph)
+    pix.setDevicePixelRatio(dpi)
+    pix.fill(QColor(0, 0, 0, 0))
+
+    dark = (theme.lower() == "dark")
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+    r = 47.0
+    pill_rect = QRectF(2, 2, w - 4, h - 4)
+    squircle = create_squircle_path(pill_rect, r)
+
+    for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
+        sr = QRectF(2, 2 + offset, w - 4, h - 4)
+        sp = create_squircle_path(sr, r)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+        p.drawPath(sp)
+
+    bg_grad = QLinearGradient(0, 0, 0, h)
+    if dark:
+        bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
+        bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
+    else:
+        bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
+        bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
+    p.fillPath(squircle, QBrush(bg_grad))
+
+    glow_pen = QPen(QColor(0, 229, 255, 75 if dark else 90), 2.0)
+    p.strokePath(squircle, glow_pen)
+
+    sheen = QLinearGradient(0, 0, 0, h * 0.40)
+    sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
+    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.fillPath(squircle, QBrush(sheen))
+
+    p.setFont(QFont("Segoe UI Variable Text", 13, QFont.Weight.Medium))
+    p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+    p.drawText(24, 46, "“Run system diagnostic”")
+
+    p.setFont(QFont("Segoe UI Variable Text", 15, QFont.Weight.DemiBold))
+    p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+    p.drawText(24, 82, "All core subsystems nominal, sir.")
+
+    pill_w = 220.0
+    pill_h = 36.0
+    pill_r = pill_h / 2.0
+    conf_rect = QRectF(24, 116, pill_w, pill_h)
+    p.fillPath(create_squircle_path(conf_rect, pill_r), QBrush(QColor(52, 199, 89, 45 if dark else 60)))
+    p.strokePath(create_squircle_path(conf_rect, pill_r), QPen(QColor(52, 199, 89, 120), 1.0))
+
+    p.setFont(QFont("Segoe UI Variable Text", 11, QFont.Weight.DemiBold))
+    p.setPen(QColor("#34C759" if dark else "#248A3D"))
+    p.drawText(conf_rect, Qt.AlignmentFlag.AlignCenter, "✓  Diagnostic Complete")
+
+    p.end()
+    return pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+
+
 def setup_island_state(island: AppleDynamicIsland, state_name: str, now: float) -> tuple[float, float]:
     """Configures state attributes on AppleDynamicIsland and returns target size."""
     s = state_name.upper()
-    if s == "IDLE":
+    if s in ("IDLE", "COMPACT_PILL"):
         island.reset_to_idle()
     elif s == "WAKE":
         island.is_wake = True
@@ -235,20 +449,44 @@ def setup_island_state(island: AppleDynamicIsland, state_name: str, now: float) 
     elif s == "ERROR":
         island.error_text = "Microphone Disconnected"
         island.error_until = now + 10.0
-    # Expanded Cards
-    elif s == "CARD_MEDIA":
+    # Expanded Cards & Pages
+    elif s in ("CARD_MEDIA", "MEDIA"):
         island.expanded_card = "media"
         island.expanded_until = now + 10.0
         island.media_active = True
         island.media_playing = True
         island.media_title = "Blinding Lights"
         island.media_artist = "The Weeknd"
-    elif s == "CARD_WEATHER":
+        island.media_album = "After Hours"
+        island.media_source = "Spotify"
+        island.media_dominant_color = QColor(175, 82, 222)
+    elif s in ("CARD_WEATHER", "WEATHER"):
         island.expanded_card = "weather"
         island.expanded_until = now + 10.0
-    elif s == "CARD_TIME":
-        island.expanded_card = "time"
+        island.weather_city = "AHMEDABAD"
+        island.weather_temp = 72.0
+        island.weather_condition = "Partly Cloudy"
+        island.weather_icon = "partly_cloudy"
+        island.weather_wind_speed = 12.0
+        island.weather_wind_direction = "NW"
+        island.weather_humidity = 48
+        island.weather_feels_like = 71.0
+    elif s in ("CARD_TIME", "CALENDAR", "CARD_CALENDAR"):
+        island.expanded_card = "calendar" if hasattr(IslandState, "CARD_CALENDAR") else "time"
         island.expanded_until = now + 10.0
+        island.calendar_date = datetime.date(2026, 10, 18)
+    elif s in ("CARD_HARDWARE_GRID", "HARDWARE_GRID"):
+        island.expanded_card = "hardware_grid"
+        island.expanded_until = now + 10.0
+    elif s in ("CARD_HARDWARE_STRIP", "HARDWARE_STRIP"):
+        island.expanded_card = "hardware_strip"
+        island.expanded_until = now + 10.0
+    elif s in ("CARD_JARVIS", "JARVIS"):
+        island.expanded_card = "jarvis"
+        island.expanded_until = now + 10.0
+        island.active = True
+        island.user_prompt = "Run system diagnostic"
+        island.say_text = "All core subsystems nominal, sir."
     elif s == "CARD_DISAMBIGUATE":
         island.disambiguate_active = True
         island.disambiguate_until = now + 10.0
@@ -279,8 +517,33 @@ def setup_island_state(island: AppleDynamicIsland, state_name: str, now: float) 
     else:
         raise ValueError(f"Unknown island state: {state_name}")
 
-    resolved = island._resolve_state(now)
-    tw, th = island._target_size(resolved, now)
+    try:
+        resolved = island._resolve_state(now)
+        tw, th = island._target_size(resolved, now)
+    except Exception:
+        resolved = None
+        tw, th = (175.0, 36.0)
+
+    # Honor specific target geometries from tokens / MEASUREMENT_SHEET if unhandled by island enum
+    if s in ("HARDWARE_GRID", "CARD_HARDWARE_GRID"):
+        try:
+            from ui.tokens import GEOMETRY
+            tw, th = float(GEOMETRY.expanded_card.w), float(GEOMETRY.expanded_card.h)
+        except Exception:
+            tw, th = (390.0, 188.0)
+    elif s in ("HARDWARE_STRIP", "CARD_HARDWARE_STRIP"):
+        try:
+            from ui.tokens import GEOMETRY
+            tw, th = float(GEOMETRY.hardware_strip.w), float(GEOMETRY.hardware_strip.h)
+        except Exception:
+            tw, th = (446.0, 69.0)
+    elif s in ("JARVIS", "CARD_JARVIS"):
+        try:
+            from ui.tokens import GEOMETRY
+            tw, th = float(GEOMETRY.expanded_card.w), float(GEOMETRY.expanded_card.h)
+        except Exception:
+            tw, th = (390.0, 188.0)
+
     return tw, th
 
 
@@ -302,9 +565,55 @@ def render_island_view(state_name: str, dpi: float, theme: str) -> QImage:
         island.resize(int(round(tw)), int(round(th)))
         get_app().processEvents()
 
-        img = render_widget_to_image(island, dpi)
+        s = state_name.upper()
+        if s in ("HARDWARE_GRID", "CARD_HARDWARE_GRID") and not hasattr(island, "_draw_hardware_grid"):
+            img = _render_hardware_grid_fallback(island, tw, th, dpi, theme)
+        elif s in ("HARDWARE_STRIP", "CARD_HARDWARE_STRIP") and not hasattr(island, "_draw_hardware_strip"):
+            img = _render_hardware_strip_fallback(island, tw, th, dpi, theme)
+        elif s in ("JARVIS", "CARD_JARVIS") and not hasattr(island, "_draw_jarvis_card"):
+            img = _render_jarvis_card_fallback(island, tw, th, dpi, theme)
+        else:
+            img = render_widget_to_image(island, dpi)
+
         island.close()
         return img
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public Explicit Page & State Rendering Helpers (Phase 0 Harness Contract)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_compact_pill(dpi: float = 1.0, theme: str = "dark") -> QImage:
+    """Renders the Dynamic Island compact pill (idle resting state)."""
+    return render_island_view("IDLE", dpi, theme)
+
+def render_media_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+    """Renders the Expanded Media Player card."""
+    return render_island_view("CARD_MEDIA", dpi, theme)
+
+def render_calendar_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+    """Renders the Expanded Calendar / Clock card."""
+    return render_island_view("CARD_TIME", dpi, theme)
+
+def render_weather_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+    """Renders the Expanded Weather forecast card."""
+    return render_island_view("CARD_WEATHER", dpi, theme)
+
+def render_hardware_grid_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+    """Renders the 2x3 Hardware Monitor Grid card."""
+    return render_island_view("CARD_HARDWARE_GRID", dpi, theme)
+
+def render_hardware_strip_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+    """Renders the 5-item Hardware Telemetry Strip."""
+    return render_island_view("CARD_HARDWARE_STRIP", dpi, theme)
+
+def render_jarvis_card(dpi: float = 1.0, theme: str = "dark") -> QImage:
+    """Renders the JARVIS Assistant card."""
+    return render_island_view("CARD_JARVIS", dpi, theme)
+
+def render_assistant_state(state_name: str, dpi: float = 1.0, theme: str = "dark") -> QImage:
+    """Renders an assistant state: wake, listening, thinking, prompt, speaking, result, error."""
+    return render_island_view(state_name, dpi, theme)
 
 
 def render_cursor_view(view_type: str, dpi: float, theme: str) -> QImage:

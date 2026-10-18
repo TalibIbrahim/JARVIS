@@ -17,7 +17,8 @@ import threading
 import time
 import numpy as np
 
-from commands import run_command
+from commands import run_command, handle_island_voice_command
+intercept_island_voice = handle_island_voice_command
 from voice_profile import get_voice_profile
 from ai import (
     get_api_key,
@@ -1512,6 +1513,12 @@ class Voice(threading.Thread):
                 pass
 
         try:
+            # Direct intercept for Dynamic Island voice navigation
+            island_reply = handle_island_voice_command(command, self.ctx)
+            if island_reply:
+                self.ctx.say(island_reply)
+                return
+
             reply = run_command(command, self.ctx)
             if reply:
                 self.ctx.say(reply)

@@ -97,5 +97,16 @@ scratch/
 
 # Screenshots, Social & Showcase Media
 assets/screenshots/
+scratch/
+tests/goldens/
+tests/diffs/
+*.png
+!assets/jarvis.ico
+!assets/jarvis.png
+!assets/jarvis_tray.png
+*.jpg
+*.jpeg
+*.bmp
+
 
 

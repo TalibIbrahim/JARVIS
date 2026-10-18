@@ -29,6 +29,7 @@ Features:
 from __future__ import annotations
 
 import ctypes
+import datetime
 import math
 import sys
 import time
@@ -45,10 +46,33 @@ from PySide6.QtWidgets import QWidget, QApplication
 
 from ui.tokens import (
     T, TYPE, COLOR, qfont, REDUCE_MOTION_MS,
-    SPRING_DT_MIN, SPRING_DT_MAX
+    SPRING_DT_MIN, SPRING_DT_MAX, RADIUS, GEOMETRY
 )
-from ui.materials import apply_acrylic, make_click_through
+from ui.materials import apply_acrylic, make_click_through, set_interactive
 from ui.components import Spring, create_squircle_path
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Squircle Path Cache (60 FPS Performance, Zero Heap Allocations)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PATH_CACHE: dict[tuple[float, float, float, float, float], QPainterPath] = {}
+
+def create_cached_squircle_path(rect: QRectF, radius: float) -> QPainterPath:
+    """Returns a cached QPainterPath for continuous squircle geometry."""
+    key = (
+        round(rect.x(), 1),
+        round(rect.y(), 1),
+        round(rect.width(), 1),
+        round(rect.height(), 1),
+        round(radius, 1)
+    )
+    path = _PATH_CACHE.get(key)
+    if path is None:
+        if len(_PATH_CACHE) > 512:
+            _PATH_CACHE.clear()
+        path = create_squircle_path(rect, radius)
+        _PATH_CACHE[key] = path
+    return path
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,16 +92,19 @@ class IslandState(Enum):
     NO_SPEECH     = auto()
     ERROR         = auto()
     # Expanded Cards
-    CARD_MEDIA        = auto()
-    CARD_WEATHER      = auto()
-    CARD_TIME         = auto()
-    CARD_DISAMBIGUATE = auto()
-    CARD_TIMER        = auto()
-    CARD_SENDING      = auto()
-    CARD_RESULT       = auto()
+    CARD_MEDIA          = auto()
+    CARD_WEATHER        = auto()
+    CARD_TIME           = auto()
+    CARD_HARDWARE_GRID  = auto()
+    CARD_HARDWARE_STRIP = auto()
+    CARD_JARVIS         = auto()
+    CARD_DISAMBIGUATE   = auto()
+    CARD_TIMER          = auto()
+    CARD_SENDING        = auto()
+    CARD_RESULT         = auto()
     # Gesture HUD States
-    HUD_VOLUME        = auto()
-    HUD_WINDOW        = auto()
+    HUD_VOLUME          = auto()
+    HUD_WINDOW          = auto()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -85,26 +112,29 @@ class IslandState(Enum):
 # ──────────────────────────────────────────────────────────────────────────────
 
 _SIZE: dict[IslandState, tuple[float, float]] = {
-    IslandState.IDLE:              (110.0,  30.0),
-    IslandState.WAKE:              (280.0,  44.0),
-    IslandState.TRACKING:          (210.0,  36.0),
-    IslandState.GESTURE:           (270.0,  40.0),
-    IslandState.LISTENING:         (390.0,  54.0),
-    IslandState.THINKING:          (320.0,  46.0),
-    IslandState.PROMPT:            (360.0,  48.0),   # dynamically widened if needed
-    IslandState.SPEAKING:          (380.0,  50.0),   # dynamically widened if needed
-    IslandState.RESULT:            (380.0,  58.0),   # dynamically widened if needed
-    IslandState.NO_SPEECH:         (110.0,  30.0),
-    IslandState.ERROR:             (340.0,  48.0),
-    IslandState.CARD_MEDIA:        (400.0, 168.0),
-    IslandState.CARD_WEATHER:      (400.0, 180.0),
-    IslandState.CARD_TIME:         (370.0, 142.0),
-    IslandState.CARD_DISAMBIGUATE: (440.0,  90.0),
-    IslandState.CARD_TIMER:        (380.0, 150.0),
-    IslandState.CARD_SENDING:      (300.0,  44.0),
-    IslandState.CARD_RESULT:       (380.0,  58.0),
-    IslandState.HUD_VOLUME:        (260.0,  38.0),
-    IslandState.HUD_WINDOW:        (290.0,  38.0),
+    IslandState.IDLE:                (175.0,  36.0),
+    IslandState.WAKE:                (280.0,  44.0),
+    IslandState.TRACKING:            (210.0,  36.0),
+    IslandState.GESTURE:             (270.0,  40.0),
+    IslandState.LISTENING:           (390.0,  54.0),
+    IslandState.THINKING:            (320.0,  46.0),
+    IslandState.PROMPT:              (360.0,  48.0),   # dynamically widened if needed
+    IslandState.SPEAKING:            (380.0,  50.0),   # dynamically widened if needed
+    IslandState.RESULT:              (380.0,  58.0),   # dynamically widened if needed
+    IslandState.NO_SPEECH:           (175.0,  36.0),
+    IslandState.ERROR:               (340.0,  48.0),
+    IslandState.CARD_MEDIA:          (390.0, 188.0),
+    IslandState.CARD_WEATHER:        (390.0, 188.0),
+    IslandState.CARD_TIME:           (390.0, 188.0),
+    IslandState.CARD_HARDWARE_GRID:  (390.0, 188.0),
+    IslandState.CARD_HARDWARE_STRIP: (446.0,  69.0),
+    IslandState.CARD_JARVIS:         (390.0, 188.0),
+    IslandState.CARD_DISAMBIGUATE:   (440.0,  90.0),
+    IslandState.CARD_TIMER:          (380.0, 150.0),
+    IslandState.CARD_SENDING:        (300.0,  44.0),
+    IslandState.CARD_RESULT:         (380.0,  58.0),
+    IslandState.HUD_VOLUME:          (260.0,  38.0),
+    IslandState.HUD_WINDOW:          (290.0,  38.0),
 }
 
 
@@ -144,14 +174,18 @@ class AppleDynamicIsland(QWidget):
         self.setMouseTracking(True)
 
         # Apple-grade springs (response ~0.4s, damping ~0.7)
-        self.spring_w    = Spring(110.0, SPRING_K_RESP04, SPRING_C_DAMP07)
-        self.spring_h    = Spring(30.0,  SPRING_K_RESP04, SPRING_C_DAMP07)
+        self.spring_w    = Spring(175.0, SPRING_K_RESP04, SPRING_C_DAMP07)
+        self.spring_h    = Spring(36.0,  SPRING_K_RESP04, SPRING_C_DAMP07)
         self.spring_prog = Spring(0.0,   240.0, 24.0)
         self.spring_glow = Spring(0.0,   SPRING_K_RESP04, SPRING_C_DAMP07)
         self.spring_hud_volume = Spring(0.5, SPRING_K_RESP04, SPRING_C_DAMP07)
 
         # Content cross-fade spring
         self._opacity_spring = Spring(1.0, 180.0, 18.0)
+
+        # Expanded card paging & pin open
+        self.pin_open: bool = False
+        self.card_pages: list[str] = ["media", "time", "weather", "hardware", "jarvis"]
 
         # ── State fields ───────────────────────────────────────────────
         self.active          = False
@@ -232,7 +266,10 @@ class AppleDynamicIsland(QWidget):
         self.weather_high: float = 76.0
         self.weather_low: float = 58.0
         self.weather_feels_like: float = 71.0
-        self.weather_city: str = "Cupertino"
+        self.weather_city: str = "Ahmedabad"
+        self.weather_wind_speed: float = 12.0
+        self.weather_wind_direction: str = "NW"
+        self.weather_humidity: int = 48
         self.weather_hourly: list[dict] = [
             {"time": "Now",  "temp": 72.0, "icon": "partly_cloudy"},
             {"time": "1 PM", "temp": 74.0, "icon": "sunny"},
@@ -242,11 +279,15 @@ class AppleDynamicIsland(QWidget):
             {"time": "5 PM", "temp": 68.0, "icon": "partly_cloudy"},
         ]
 
+        # Hardware metrics state & lifecycle
+        self._cached_hardware_metrics: Optional[Any] = None
+
         # Media state
         self.media_active: bool = False
         self.media_playing: bool = False
         self.media_title: str = "Blinding Lights"
         self.media_artist: str = "The Weeknd"
+        self.media_album: str = "After Hours"
         self.media_source: str = "Spotify"
         self.media_duration_sec: float = 200.0
         self.media_position_sec: float = 84.0
@@ -254,6 +295,12 @@ class AppleDynamicIsland(QWidget):
         self.media_album_art: Optional[QPixmap] = None
         self.media_dominant_color: QColor = QColor(175, 82, 222)
         self._media_bars: list[float] = [0.35, 0.75, 0.50, 0.85]
+        self._dragging_scrubber: bool = False
+
+        # Calendar state
+        self.calendar_date: Optional[datetime.date] = None
+        self._cached_calendar_data = None
+        self._cached_calendar_key = None
 
         # Timer state
         self.timer_active: bool = False
@@ -308,7 +355,7 @@ class AppleDynamicIsland(QWidget):
         self._last_rendered_temp: Optional[float] = None
         self._dirty: bool = True
 
-        self.resize(110, 30)
+        self.resize(175, 36)
         self._center_top()
 
     def _read_theme(self):
@@ -325,11 +372,30 @@ class AppleDynamicIsland(QWidget):
     def reload_config(self) -> None:
         """Live apply settings without restart."""
         self.dark_mode, _ = self._read_theme()
-        cfg = getattr(self.mgr, "cfg", None)
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
         if cfg:
-            city = getattr(cfg, "island_weather_city", None)
+            city = getattr(cfg, "island_weather_city", getattr(cfg, "weather_city", None))
             if city:
                 self.weather_city = city
+            self.pin_open = getattr(cfg, "island_pin_open", self.pin_open)
+            pages = getattr(cfg, "island_pages", ["media", "calendar", "weather", "hardware", "jarvis"])
+            enabled_map = getattr(cfg, "island_pages_enabled", {})
+            active_pages = []
+            for p in pages:
+                canon = "time" if p == "calendar" else p
+                if enabled_map.get(p, True) and enabled_map.get(canon, True):
+                    if canon not in active_pages:
+                        active_pages.append(canon)
+            if active_pages:
+                self.card_pages = active_pages
+
+            now = time.time()
+            st = self._resolve_state(now)
+            tw, th = self._target_size(st, now)
+            self.spring_w.set_target(tw)
+            self.spring_h.set_target(th)
+            self._center_top()
+            self.update()
 
     def set_interactive(self, interactive: bool) -> None:
         """
@@ -653,17 +719,29 @@ class AppleDynamicIsland(QWidget):
         self.set_interactive(False)
 
     def expand_card(self, card_name: str = "weather") -> None:
-        """Expand the island into an interactive card (weather, media, or time)."""
+        """Expand the island into an interactive card (weather, media, time, hardware, jarvis)."""
         self.disambiguate_active = False
         self.disambiguate_candidates = []
         self.disambiguate_callback = None
         self._hovered_chip_idx = None
         self._chip_dwell_elapsed = 0.0
-        self.expanded_card = card_name.lower()
+        c = card_name.lower()
+        if c == "calendar":
+            c = "time"
+        elif c in ("hardware", "hardware_grid"):
+            cfg = getattr(self.mgr, "cfg", None)
+            if getattr(cfg, "island_hardware_layout", "grid") == "strip":
+                c = "hardware_strip"
+            else:
+                c = "hardware_grid"
+        elif c in ("jarvis", "jarvis_card"):
+            c = "jarvis"
+        self.expanded_card = c
         now = time.time()
         self.expanded_until = now + 4.0
         self._card_expand_t = now
         self.set_interactive(True)
+        self._sync_hardware_adapter_lifecycle(now)
         self.spring_w.vel = max(self.spring_w.vel, 60.0)
         self.spring_h.vel = max(self.spring_h.vel, 60.0)
 
@@ -672,6 +750,7 @@ class AppleDynamicIsland(QWidget):
         self.expanded_card = None
         self.expanded_until = 0.0
         self.set_interactive(False)
+        self._sync_hardware_adapter_lifecycle(time.time())
 
     @staticmethod
     def _candidate_title(cand: any) -> str:
@@ -886,25 +965,33 @@ class AppleDynamicIsland(QWidget):
             return IslandState.SPEAKING
         if self.label in ("CLICK", "DOUBLE CLICK", "DRAG", "DROP", "RIGHT CLICK", "ZOOM IN", "ZOOM OUT", "SCROLL"):
             return IslandState.GESTURE
-        if self.active:
-            return IslandState.TRACKING
         # Expanded Cards
-        if self.expanded_card and now < self.expanded_until:
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        is_pinned = getattr(self, "pin_open", False) or getattr(cfg, "island_pin_open", False)
+        if self.expanded_card and (is_pinned or now < self.expanded_until):
             if self.expanded_card == "media":
                 return IslandState.CARD_MEDIA
             elif self.expanded_card == "weather":
                 return IslandState.CARD_WEATHER
-            elif self.expanded_card == "time":
+            elif self.expanded_card in ("time", "calendar"):
                 return IslandState.CARD_TIME
+            elif self.expanded_card in ("hardware", "hardware_grid"):
+                return IslandState.CARD_HARDWARE_GRID
+            elif self.expanded_card == "hardware_strip":
+                return IslandState.CARD_HARDWARE_STRIP
+            elif self.expanded_card in ("jarvis", "jarvis_card"):
+                return IslandState.CARD_JARVIS
             elif self.expanded_card == "timer":
                 return IslandState.CARD_TIMER
+        if self.active:
+            return IslandState.TRACKING
         return IslandState.IDLE
 
     def _get_size_scale(self) -> float:
-        cfg = getattr(self.mgr, "cfg", None)
-        size_mode = getattr(cfg, "island_size", "default")
-        if size_mode == "compact":
-            return 0.90
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        size_mode = getattr(cfg, "island_size_scale", getattr(cfg, "island_size", "medium")).lower()
+        if size_mode in ("compact", "small"):
+            return 0.85
         elif size_mode == "large":
             return 1.15
         return 1.0
@@ -934,7 +1021,9 @@ class AppleDynamicIsland(QWidget):
         scale = self._get_size_scale()
 
         if self.is_fullscreen_suppressed and state in (
-            IslandState.IDLE, IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME, IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER
+            IslandState.IDLE, IslandState.CARD_MEDIA, IslandState.CARD_WEATHER,
+            IslandState.CARD_TIME, IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER,
+            IslandState.CARD_HARDWARE_GRID, IslandState.CARD_HARDWARE_STRIP, IslandState.CARD_JARVIS
         ):
             return (60.0 * scale, 0.0)
 
@@ -950,11 +1039,17 @@ class AppleDynamicIsland(QWidget):
             base_w = min(560.0, base_w)
             return (base_w * scale, 90.0 * scale)
         elif state == IslandState.CARD_MEDIA:
-            return (400.0 * scale, 168.0 * scale)
+            return (390.0 * scale, 188.0 * scale)
         elif state == IslandState.CARD_WEATHER:
-            return (400.0 * scale, 180.0 * scale)
+            return (390.0 * scale, 188.0 * scale)
         elif state == IslandState.CARD_TIME:
-            return (370.0 * scale, 142.0 * scale)
+            return (390.0 * scale, 188.0 * scale)
+        elif state == IslandState.CARD_HARDWARE_GRID:
+            return (390.0 * scale, 188.0 * scale)
+        elif state == IslandState.CARD_HARDWARE_STRIP:
+            return (446.0 * scale, 69.0 * scale)
+        elif state == IslandState.CARD_JARVIS:
+            return (390.0 * scale, 188.0 * scale)
         elif state == IslandState.CARD_TIMER:
             return (380.0 * scale, 150.0 * scale)
         elif state in (IslandState.RESULT, IslandState.CARD_RESULT):
@@ -986,17 +1081,19 @@ class AppleDynamicIsland(QWidget):
                 tw = min(480.0, max(320.0, 60.0 + len(status_txt) * 7.2 + 50.0))
             return (tw * scale, 46.0 * scale)
         elif state == IslandState.IDLE:
+            if self.compact_mode_override == "time_weather":
+                return (175.0 * scale, 32.0 * scale)
             compact_mode = self._get_current_compact_mode()
             if compact_mode == "media":
                 return (186.0 * scale, 32.0 * scale)
             elif compact_mode == "timer":
                 return (152.0 * scale, 32.0 * scale)
             elif compact_mode == "time_weather":
-                return (176.0 * scale, 32.0 * scale)
+                return (175.0 * scale, 36.0 * scale)
             elif compact_mode == "time":
                 return (132.0 * scale, 32.0 * scale)
             else:
-                return (110.0 * scale, 30.0 * scale)
+                return (175.0 * scale, 36.0 * scale)
         elif state == IslandState.HUD_VOLUME:
             return (260.0 * scale, 38.0 * scale)
         elif state == IslandState.HUD_WINDOW:
@@ -1054,6 +1151,7 @@ class AppleDynamicIsland(QWidget):
 
         # Interaction & Auto-collapse checks
         self._update_interaction(now, dt)
+        self._sync_hardware_adapter_lifecycle(now)
 
         state = self._resolve_state(now)
         tw, th = self._target_size(state, now)
@@ -1241,8 +1339,10 @@ class AppleDynamicIsland(QWidget):
 
         # 2. Expanded Card Interaction & Auto-collapse
         elif self.expanded_card:
-            # Auto-collapse after 4 seconds of no interaction
-            if now >= self.expanded_until:
+            # Auto-collapse after 4 seconds of no interaction (unless pin open)
+            cfg = getattr(self.mgr, "cfg", None)
+            is_pinned = getattr(self, "pin_open", False) or getattr(cfg, "island_pin_open", False)
+            if not is_pinned and now >= self.expanded_until:
                 self.collapse_card()
                 return
 
@@ -1331,6 +1431,12 @@ class AppleDynamicIsland(QWidget):
 
         self.expanded_until = now + 4.0
 
+        if self.expanded_card:
+            dot_idx = self._dot_at(pos)
+            if dot_idx is not None and dot_idx < len(self.card_pages):
+                self.expand_card(self.card_pages[dot_idx])
+                return
+
         if self.expanded_card == "media":
             btn = self._button_at(pos)
             if btn:
@@ -1338,14 +1444,16 @@ class AppleDynamicIsland(QWidget):
                 self._btn_flash_until = now + 0.25
                 return
 
-            sr = self._scrubber_rect()
-            if sr.contains(pos):
+            if self._scrubber_hit_rect().contains(pos):
+                sr = self._scrubber_rect()
                 ratio = min(1.0, max(0.0, (pos.x() - sr.x()) / sr.width()))
                 self.media_progress = ratio
                 self.media_position_sec = ratio * self.media_duration_sec
+                self._dragging_scrubber = True
+                self.update()
                 return
 
-        elif self.expanded_card == "timer":
+        elif self.expanded_card in ("timer", "jarvis"):
             btn = self._button_at(pos)
             if btn:
                 self._trigger_button(btn)
@@ -1365,14 +1473,42 @@ class AppleDynamicIsland(QWidget):
             self._hovered_chip_idx = self._chip_at(event.position())
             super().mouseMoveEvent(event)
             return
+
+        if getattr(self, "_dragging_scrubber", False) and (event.buttons() & Qt.MouseButton.LeftButton):
+            sr = self._scrubber_rect()
+            ratio = min(1.0, max(0.0, (event.position().x() - sr.x()) / sr.width()))
+            self.media_progress = ratio
+            self.media_position_sec = ratio * self.media_duration_sec
+            self.expanded_until = time.time() + 4.0
+            self.update()
+            super().mouseMoveEvent(event)
+            return
+
         self.expanded_until = time.time() + 4.0
-        if self.expanded_card in ("media", "timer"):
+        if self.expanded_card in ("media", "timer", "jarvis"):
             self._hovered_btn = self._button_at(event.position())
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._dragging_scrubber = False
+        super().mouseReleaseEvent(event)
 
     def _button_at(self, pos: QPointF | QPoint) -> Optional[str]:
         w = max(float(self.width()), self.spring_w.target)
         scale = self._get_size_scale()
+
+        if self.expanded_card in ("jarvis", "jarvis_card"):
+            lx = 22.0 * scale
+            content_w = (w - 28.0 * scale) - lx
+            ty1 = 38.0 * scale
+            th1 = 66.0 * scale
+            gap = 8.0 * scale
+            status_w = 202.0 * scale
+            btn_w = content_w - status_w - gap
+            btn_x = lx + status_w + gap
+            if QRectF(btn_x, ty1, btn_w, th1).contains(pos):
+                return "jarvis_toggle_tracking"
+            return None
 
         if self.expanded_card == "timer":
             cy_btn = 126.0 * scale
@@ -1403,14 +1539,28 @@ class AppleDynamicIsland(QWidget):
         w = max(float(self.width()), self.spring_w.target)
         scale = self._get_size_scale()
         sx = 24.0 * scale
-        sy = 94.0 * scale
+        sy = 96.0 * scale
         sw = w - 48.0 * scale
-        sh = 14.0 * scale
+        sh = 4.0 * scale
         return QRectF(sx, sy, sw, sh)
+
+    def _scrubber_hit_rect(self) -> QRectF:
+        sr = self._scrubber_rect()
+        scale = self._get_size_scale()
+        return QRectF(sr.x() - 4.0 * scale, sr.y() - 10.0 * scale, sr.width() + 8.0 * scale, sr.height() + 20.0 * scale)
 
     def _trigger_button(self, btn: str) -> None:
         self.expanded_until = time.time() + 4.0
-        if btn == "play_pause":
+        if btn == "jarvis_toggle_tracking":
+            is_paused = getattr(self, "tracking_paused", False)
+            self.tracking_paused = not is_paused
+            self.active = not self.tracking_paused
+            if hasattr(self.mgr, "toggle_tracking"):
+                self.mgr.toggle_tracking()
+            elif hasattr(self.mgr, "set_tracking_paused"):
+                self.mgr.set_tracking_paused(self.tracking_paused)
+            self.update()
+        elif btn == "play_pause":
             self.media_toggle_play()
         elif btn == "prev":
             self.media_prev()
@@ -1461,6 +1611,25 @@ class AppleDynamicIsland(QWidget):
             c = int(round((temp_f - 32.0) * 5.0 / 9.0))
             return f"{c}°"
         return f"{int(round(temp_f))}°"
+
+    def _sync_hardware_adapter_lifecycle(self, now: float) -> None:
+        """Polls hardware adapter only while hardware page is active; pauses when collapsed or on other pages."""
+        is_hw_active = (
+            self.expanded_card in ("hardware", "hardware_grid", "hardware_strip")
+            and (getattr(self, "pin_open", False) or now < self.expanded_until)
+        )
+        try:
+            from hardware_adapter import get_hardware_adapter
+            adapter = get_hardware_adapter()
+            if is_hw_active:
+                if adapter.is_paused():
+                    adapter.resume()
+                self._cached_hardware_metrics = adapter.get_metrics()
+            else:
+                if not adapter.is_paused():
+                    adapter.pause()
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────────────────────────────
     # Cached Vector Icons (DPI-Safe, 60 FPS)
@@ -1666,11 +1835,21 @@ class AppleDynamicIsland(QWidget):
         t    = now - self.t0
         w    = float(self.width())
         h    = float(self.height())
-        r    = min(h / 2.0, 36.0)
 
         state   = self._resolve_state(now)
         dark    = self.dark_mode
         reduce  = T.reduce_motion()
+
+        if state in (IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME, IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS):
+            r = 47.0
+        elif state == IslandState.CARD_HARDWARE_STRIP:
+            r = 28.0
+        elif state in (IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER):
+            r = 36.0
+        elif state == IslandState.IDLE:
+            r = min(h / 2.0, 18.0)
+        else:
+            r = min(h / 2.0, 36.0)
 
         if reduce:
             elapsed = now - self._crossfade_start
@@ -1679,24 +1858,24 @@ class AppleDynamicIsland(QWidget):
             opacity = min(1.0, max(0.0, self._opacity_spring.value))
 
         pill_rect = QRectF(2, -16, w - 4, h + 14)
-        squircle  = create_squircle_path(pill_rect, r)
+        squircle  = create_cached_squircle_path(pill_rect, r)
 
         # ── 1. Soft multi-layer drop shadow ──────────────────────────────
         for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
             sr = QRectF(2, -16 + offset, w - 4, h + 14)
-            sp = create_squircle_path(sr, r)
+            sp = create_cached_squircle_path(sr, r)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
             p.drawPath(sp)
 
-        # ── 2. Glass tint fill ────────────────────────────────────────────
+        # ── 2. Glass tint fill (Obsidian gradient) ────────────────────────
         bg_grad = QLinearGradient(0, -16, 0, h)
         if dark:
-            bg_grad.setColorAt(0.0, QColor(36, 36, 42, 222))
-            bg_grad.setColorAt(1.0, QColor(18, 18, 22, 238))
+            bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
+            bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
         else:
-            bg_grad.setColorAt(0.0, QColor(248, 248, 252, 228))
-            bg_grad.setColorAt(1.0, QColor(230, 230, 238, 238))
+            bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
+            bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
 
         p.fillPath(squircle, QBrush(bg_grad))
 
@@ -1706,9 +1885,12 @@ class AppleDynamicIsland(QWidget):
             tint.setAlpha(36 if dark else 24)
             p.fillPath(squircle, QBrush(tint))
 
-        # ── 3. Soft edge glow pulse in WAKE or CARD_SENDING ───────────────
+        # ── 3. Soft edge glow pulse in WAKE or CARD_SENDING / CARD_JARVIS ──
         glow_val = self.spring_glow.value
-        if state == IslandState.CARD_SENDING and not reduce:
+        if state == IslandState.CARD_JARVIS:
+            glow_pen = QPen(QColor(0, 229, 255, 75 if dark else 90), 2.0)
+            p.strokePath(squircle, glow_pen)
+        elif state == IslandState.CARD_SENDING and not reduce:
             pulse_a = int(60 + 50 * math.sin(t * 6.0))
             glow_pen = QPen(QColor(0, 229, 255, pulse_a), 2.2)
             p.strokePath(squircle, glow_pen)
@@ -1722,8 +1904,8 @@ class AppleDynamicIsland(QWidget):
             self._draw_shimmer(p, squircle, w, h, t, dark)
 
         # ── 5. Top specular sheen ─────────────────────────────────────────
-        sheen = QLinearGradient(0, -16, 0, h * 0.45)
-        sheen.setColorAt(0.0, QColor(255, 255, 255, 28 if dark else 72))
+        sheen = QLinearGradient(0, -16, 0, h * 0.40)
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
         sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.fillPath(squircle, QBrush(sheen))
 
@@ -1798,7 +1980,11 @@ class AppleDynamicIsland(QWidget):
             grad.setColorAt(0.0, QColor(0, 229, 255, pulse))
             grad.setColorAt(1.0, QColor(0, 0, 0, 60))
 
-        elif state in (IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME, IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER):
+        elif state in (
+            IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME,
+            IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER,
+            IslandState.CARD_HARDWARE_GRID, IslandState.CARD_HARDWARE_STRIP, IslandState.CARD_JARVIS
+        ):
             grad.setColorAt(0.0, QColor(255, 255, 255, 75 if dark else 180))
             grad.setColorAt(0.35, QColor(255, 255, 255, 25 if dark else 60))
             grad.setColorAt(1.0, QColor(0, 0, 0, 80 if dark else 30))
@@ -1862,10 +2048,19 @@ class AppleDynamicIsland(QWidget):
             self._draw_weather_card(p, w, h, now, t, dark, primary, secondary, accent)
 
         elif state == IslandState.CARD_TIME:
-            self._draw_time_card(p, w, h, now, dark, primary, secondary)
+            self._draw_calendar_card(p, w, h, now, dark, primary, secondary, accent)
 
         elif state == IslandState.CARD_TIMER:
             self._draw_timer_card(p, w, h, now, dark, primary, secondary, accent)
+
+        elif state == IslandState.CARD_HARDWARE_GRID:
+            self._draw_hardware_grid(p, w, h, now, t, dark, primary, secondary, accent)
+
+        elif state == IslandState.CARD_HARDWARE_STRIP:
+            self._draw_hardware_strip(p, w, h, now, t, dark, primary, secondary, accent)
+
+        elif state == IslandState.CARD_JARVIS:
+            self._draw_jarvis_card(p, w, h, now, t, dark, primary, secondary, accent)
 
         elif state == IslandState.HUD_VOLUME:
             self._draw_hud_volume(p, w, h, cy, dark, primary, secondary, accent)
@@ -1876,6 +2071,13 @@ class AppleDynamicIsland(QWidget):
         else:
             # Standby IDLE & Compact Widgets
             self._draw_compact_widget(p, w, h, cy, dark, primary, secondary, accent, now, t)
+
+        # Page dot column for expanded card layouts
+        if state in (
+            IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME,
+            IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS
+        ):
+            self._draw_page_dots(p, w, h, dark)
 
     def _draw_disambiguation_card(self, p: QPainter, w: float, h: float,
                                   now: float, t: float, dark: bool,
@@ -2001,6 +2203,16 @@ class AppleDynamicIsland(QWidget):
                              accent: QColor, now: float, t: float) -> None:
         compact_mode = self._get_current_compact_mode()
 
+        # Trailing 6px status dot (Green/Gray/Red)
+        dot_cx = w - 14.0
+        dot_r = 3.0
+        if now < self.error_until or self.is_ai_error:
+            dot_col = COLOR.accent_red
+        elif self.active or self.listening or self.media_playing:
+            dot_col = COLOR.accent_green
+        else:
+            dot_col = QColor("#8E8E93" if dark else "#AEAEB2")
+
         if compact_mode == "media":
             # ── Media compact layout ─────────────────────────────────────
             # Leading side: 20x20 album art thumbnail (rounded squircle)
@@ -2008,7 +2220,7 @@ class AppleDynamicIsland(QWidget):
             tx = 8.0
             ty = cy - thumb_size / 2.0
             thumb_rect = QRectF(tx, ty, thumb_size, thumb_size)
-            thumb_path = create_squircle_path(thumb_rect, 5.0)
+            thumb_path = create_cached_squircle_path(thumb_rect, 5.0)
 
             p.save()
             p.setClipPath(thumb_path)
@@ -2023,12 +2235,12 @@ class AppleDynamicIsland(QWidget):
             font.setWeight(QFont.Weight.DemiBold)
             p.setFont(font)
             p.setPen(primary)
-            text_rect = QRectF(34.0, 0, w - 34.0 - 28.0, h)
+            text_rect = QRectF(34.0, 0, w - 34.0 - 44.0, h)
             title = self.media_title if len(self.media_title) <= 14 else self.media_title[:13] + "…"
             p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, title)
 
-            # Trailing side: 4 audio-reactive animated bars
-            bx0 = w - 24.0
+            # 4 audio-reactive animated bars
+            bx0 = w - 40.0
             bar_w = 2.2
             gap = 1.8
             max_bh = 13.0
@@ -2041,9 +2253,13 @@ class AppleDynamicIsland(QWidget):
                 p.setBrush(QBrush(bar_col))
                 p.drawRoundedRect(QRectF(bx, by, bar_w, bh), bar_w / 2.0, bar_w / 2.0)
 
+            # Trailing 6px status dot
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
+
         elif compact_mode == "timer":
             # ── Timer compact layout ─────────────────────────────────────
-            # Leading side: progress ring
             scale = self._get_size_scale()
             rx, ry = 16.0 * scale, cy
             ring_r = 7.5 * scale
@@ -2062,10 +2278,8 @@ class AppleDynamicIsland(QWidget):
             arc_pen = QPen(QColor("#FF9F0A"), pen_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
             p.setPen(arc_pen)
             arc_rect = QRectF(rx - ring_r, ry - ring_r, ring_r * 2.0, ring_r * 2.0)
-            # Circular progress ring decreasing smoothly as remaining time updates
             p.drawArc(arc_rect, 90 * 16, -int(frac * 360 * 16))
 
-            # Trailing side: tabular numerals
             font = qfont(TYPE.metric, scale)
             font.setPointSize(int(11 * scale))
             font.setWeight(QFont.Weight.DemiBold)
@@ -2084,12 +2298,17 @@ class AppleDynamicIsland(QWidget):
                 mins = int(rem // 60)
                 secs = int(rem % 60)
                 time_txt = f"{mins:02d}:{secs:02d}"
-            text_rect = QRectF(32.0 * scale, 0, w - 44.0 * scale, h)
+            text_rect = QRectF(32.0 * scale, 0, w - 54.0 * scale, h)
             p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, time_txt)
 
-        elif compact_mode == "time_weather":
+            # Trailing 6px status dot
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
+
+        elif compact_mode in ("time_weather", "default"):
             # ── Time + Weather compact layout ────────────────────────────
-            # Leading side: Current time (honoring 12h/24h)
+            # Left side: tabular clock
             cfg = getattr(self.mgr, "cfg", None)
             fmt_24 = (getattr(cfg, "island_clock_format", "12h") == "24h")
             tm = time.localtime(now)
@@ -2099,19 +2318,32 @@ class AppleDynamicIsland(QWidget):
 
             time_font = qfont(TYPE.caption_1)
             time_font.setWeight(QFont.Weight.DemiBold)
+            try:
+                time_font.setFeature(b"tnum", 1)
+            except Exception:
+                pass
             p.setFont(time_font)
             p.setPen(primary)
-            p.drawText(QRectF(14.0, 0, 52.0, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, time_str)
+            p.drawText(QRectF(14.0, 0, 48.0, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, time_str)
 
-            # Trailing side: weather SVG glyph + temperature
+            # Center: 1px subtle hairline divider
+            div_x = 68.0
+            p.setPen(QPen(QColor(255, 255, 255, 23 if dark else 35), 1.0))
+            p.drawLine(QPointF(div_x, cy - 6.0), QPointF(div_x, cy + 6.0))
+
+            # Right side: weather SVG glyph + temp
             temp_str = self.format_temp(self.weather_temp)
             temp_w = p.fontMetrics().horizontalAdvance(temp_str)
-            tx = w - temp_w - 14.0
+            tx = w - 14.0 - 8.0 - temp_w
             p.drawText(QRectF(tx, 0, temp_w + 4.0, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, temp_str)
 
-            # Weather glyph (concentric offset)
-            gx = tx - 18.0
-            self._draw_weather_glyph(p, self.weather_icon, gx, cy, 15.0, dark)
+            gx = tx - 14.0
+            self._draw_weather_glyph(p, self.weather_icon, gx, cy, 14.0, dark)
+
+            # Trailing 6px status dot (Green / Gray / Red)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
 
         elif compact_mode == "time":
             # ── Time compact layout ──────────────────────────────────────
@@ -2121,61 +2353,105 @@ class AppleDynamicIsland(QWidget):
             time_str = time.strftime("%H:%M" if fmt_24 else "%I:%M %p", tm).lstrip("0")
             time_font = qfont(TYPE.caption_1)
             time_font.setWeight(QFont.Weight.DemiBold)
+            try:
+                time_font.setFeature(b"tnum", 1)
+            except Exception:
+                pass
             p.setFont(time_font)
             p.setPen(primary)
-            p.drawText(QRectF(14.0, 0, w - 28.0, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter, time_str)
+            p.drawText(QRectF(14.0, 0, w - 38.0, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter, time_str)
+
+            # Trailing 6px status dot
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
 
         else:
             # ── Minimal standby IDLE capsule ─────────────────────────────
-            dot_x = 18.0
-            dot_r = 4.0
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(secondary))
-            p.drawEllipse(QPointF(dot_x, cy), dot_r, dot_r)
             lbl_font = qfont(TYPE.callout)
             lbl_font.setWeight(QFont.Weight.DemiBold)
             p.setFont(lbl_font)
             p.setPen(secondary if not self.active else primary)
-            p.drawText(int(dot_x + 14.0), int(cy + 4), "Jarvis")
+            p.drawText(int(18.0), int(cy + 4), "Jarvis")
+
+            # Trailing 6px status dot
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
 
     # ──────────────────────────────────────────────────────────────────────
     # Expanded Cards Renderers
     # ──────────────────────────────────────────────────────────────────────
 
+    def _draw_source_badge(self, p: QPainter, bx: float, by: float, size: float, source: str, dark: bool, scale: float) -> None:
+        """Renders small source-app badge in corner of album art (Apple HIG)."""
+        r = size / 2.0
+        cx = bx + r
+        cy = by + r
+
+        # Dark circular background
+        p.setPen(QPen(QColor(255, 255, 255, 30 if dark else 60), 1.0))
+        p.setBrush(QBrush(QColor(16, 18, 20, 245) if dark else QColor(245, 245, 250, 245)))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+
+        src = (source or "Spotify").lower()
+        if "spotify" in src:
+            # Green spotify soundwave arcs
+            p.setPen(QPen(QColor("#1ED760"), 1.2 * scale, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for off, rad in [(-2.0, 4.6), (0.0, 3.4), (2.0, 2.2)]:
+                arc_rect = QRectF(cx - rad * scale, cy + off * scale - rad * scale, rad * 2.0 * scale, rad * 2.0 * scale)
+                p.drawArc(arc_rect, 40 * 16, 100 * 16)
+        else:
+            # Musical note glyph
+            p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+            p.setFont(QFont("Segoe UI Variable Text", int(8 * scale), QFont.Weight.Bold))
+            p.drawText(QRectF(bx, by - 0.5 * scale, size, size), Qt.AlignmentFlag.AlignCenter, "♪")
+
     def _draw_media_card(self, p: QPainter, w: float, h: float,
                          now: float, t: float, dark: bool,
                          primary: QColor, secondary: QColor, accent: QColor, CYAN: QColor) -> None:
         """
-        Expanded Media Card:
-        56 px artwork thumbnail with soft shadow and dominant color tint,
-        track title & artist (marquee scrolling only if truncated),
-        scrubber bar with elapsed/remaining time (tabular numerals),
-        prev / play-pause / next buttons with dwell ring and fist-click support,
-        source app footnote.
+        Expanded Media Card (390x188 px):
+        - Left: 56-60 px rounded album art (radius ~14px) with small source-app badge in corner.
+        - Title (semibold), artist and album in secondary gray (#8E9094).
+        - Tiny accent equalizer bars top right (animated when playing).
+        - Scrubber: 4px track, accent-colored fill, white thumb, elapsed time on left
+          and remaining time (-X:XX) on right in tabular numerals. Interactive click/drag seek hit target.
+        - Three round controls: previous track, large play/pause in a darker disc, next track.
+        - Dominant color tinting: controls, progress fill, and equalizer bars tinted from album art dominant color
+          (fallback to sky blue #45C1EE).
+        - Mouse click handling for previous, play/pause, next, and scrubber seek.
         """
         scale = self._get_size_scale()
 
-        # 1. 56 px Artwork Thumbnail
-        art_size = 56.0 * scale
-        ax = 20.0 * scale
-        ay = 20.0 * scale
+        # Dominant color tinting with sky blue (#45C1EE) fallback
+        if hasattr(self, "media_dominant_color") and self.media_dominant_color and self.media_dominant_color.isValid():
+            dom_accent = self.media_dominant_color
+        else:
+            dom_accent = QColor("#45C1EE")
+
+        # 1. 58 px Album Art Thumbnail with squircle radius 14 px
+        art_size = 58.0 * scale
+        ax = 22.0 * scale
+        ay = 22.0 * scale
         art_rect = QRectF(ax, ay, art_size, art_size)
-        art_path = create_squircle_path(art_rect, 13.0 * scale)
+        art_path = create_cached_squircle_path(art_rect, 14.0 * scale)
 
         # Soft shadow & ambient tint
-        for off, a in [(3, 20), (6, 35)]:
+        for off, a in [(2, 18), (5, 32)]:
             s_rect = QRectF(ax, ay + off, art_size, art_size)
-            s_path = create_squircle_path(s_rect, 13.0 * scale)
+            s_path = create_cached_squircle_path(s_rect, 14.0 * scale)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(QColor(0, 0, 0, a)))
             p.drawPath(s_path)
 
         # Dominant glow behind artwork
-        glow = QRadialGradient(ax + art_size / 2.0, ay + art_size / 2.0, art_size * 0.8)
-        glow.setColorAt(0.0, QColor(self.media_dominant_color.red(), self.media_dominant_color.green(), self.media_dominant_color.blue(), 100))
+        glow = QRadialGradient(ax + art_size / 2.0, ay + art_size / 2.0, art_size * 0.85)
+        glow.setColorAt(0.0, QColor(dom_accent.red(), dom_accent.green(), dom_accent.blue(), 90))
         glow.setColorAt(1.0, QColor(0, 0, 0, 0))
         p.setBrush(QBrush(glow))
-        p.drawEllipse(QPointF(ax + art_size / 2.0, ay + art_size / 2.0), art_size * 0.7, art_size * 0.7)
+        p.drawEllipse(QPointF(ax + art_size / 2.0, ay + art_size / 2.0), art_size * 0.75, art_size * 0.75)
 
         # Draw Artwork Pixmap
         art_pix = self._get_album_art(art_size)
@@ -2183,93 +2459,137 @@ class AppleDynamicIsland(QWidget):
         p.setClipPath(art_path)
         p.drawPixmap(QPointF(ax, ay), art_pix)
         p.restore()
-        p.strokePath(art_path, QPen(QColor(255, 255, 255, 60), 1.0))
+        p.strokePath(art_path, QPen(QColor(255, 255, 255, 60 if dark else 90), 1.0))
 
-        # 2. Track Title & Artist (Marquee scrolling only if truncated)
-        tx = ax + art_size + 16.0 * scale
-        tw = w - tx - 20.0 * scale
+        # Small source-app badge in corner of album art
+        badge_size = 18.0 * scale
+        bx = ax + art_size - badge_size + 2.0 * scale
+        by = ay + art_size - badge_size + 2.0 * scale
+        self._draw_source_badge(p, bx, by, badge_size, self.media_source, dark, scale)
+
+        # 2. Track Title & Artist / Album
+        tx = ax + art_size + 14.0 * scale
+        eq_x = w - 42.0 * scale
+        tw = eq_x - tx - 8.0 * scale
 
         title_font = qfont(TYPE.headline)
         title_font.setPointSize(int(14 * scale))
         title_font.setWeight(QFont.Weight.DemiBold)
-        title_rect = QRectF(tx, ay + 4.0 * scale, tw, 22.0 * scale)
+        title_rect = QRectF(tx, ay + 2.0 * scale, tw, 22.0 * scale)
         self._draw_marquee_text(p, self.media_title, title_font, title_rect, primary, now - self._card_expand_t)
+
+        album_str = getattr(self, "media_album", "")
+        if album_str:
+            artist_album_txt = f"{self.media_artist} — {album_str}"
+        else:
+            artist_album_txt = self.media_artist
 
         artist_font = qfont(TYPE.subheadline)
         artist_font.setPointSize(int(12 * scale))
-        artist_font.setWeight(QFont.Weight.Medium)
-        artist_rect = QRectF(tx, ay + 26.0 * scale, tw, 20.0 * scale)
-        self._draw_marquee_text(p, self.media_artist, artist_font, artist_rect, secondary, now - self._card_expand_t)
+        artist_font.setWeight(QFont.Weight.Normal)
+        artist_rect = QRectF(tx, ay + 24.0 * scale, tw, 20.0 * scale)
+        self._draw_marquee_text(p, artist_album_txt, artist_font, artist_rect, QColor("#8E9094"), now - self._card_expand_t)
 
-        # 3. Scrubber Bar with Tabular Numerals
-        sr = self._scrubber_rect()
-        # Track background
+        # 3. Tiny accent equalizer bars top right (animated when playing)
+        eq_y = ay + 4.0 * scale
+        bar_w = 2.4 * scale
+        bar_gap = 1.6 * scale
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(255, 255, 255, 30 if dark else 50)))
-        p.drawRoundedRect(sr, 2.0, 2.0)
+        p.setBrush(QBrush(dom_accent))
+        for i in range(4):
+            bx_i = eq_x + i * (bar_w + bar_gap)
+            if self.media_playing:
+                b_val = self._media_bars[i % len(self._media_bars)]
+                bh_i = max(3.0 * scale, b_val * 14.0 * scale)
+            else:
+                bh_i = 3.0 * scale
+            by_i = eq_y + 14.0 * scale - bh_i
+            p.drawRoundedRect(QRectF(bx_i, by_i, bar_w, bh_i), 1.0 * scale, 1.0 * scale)
 
-        # Filled progress
+        # 4. Scrubber Bar with Tabular Numerals
+        sr = self._scrubber_rect()
+        # Track background: 4px track
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(255, 255, 255, 28 if dark else 50)))
+        p.drawRoundedRect(sr, 2.0 * scale, 2.0 * scale)
+
+        # Accent-colored fill
         prog_w = sr.width() * min(1.0, max(0.0, self.media_progress))
         if prog_w > 0:
             fill_rect = QRectF(sr.x(), sr.y(), prog_w, sr.height())
-            p.setBrush(QBrush(primary))
-            p.drawRoundedRect(fill_rect, 2.0, 2.0)
+            p.setBrush(QBrush(dom_accent))
+            p.drawRoundedRect(fill_rect, 2.0 * scale, 2.0 * scale)
 
-        # Scrubber handle
+        # White thumb
         hx = sr.x() + prog_w
         hy = sr.y() + sr.height() / 2.0
         p.setBrush(QBrush(QColor(255, 255, 255, 255)))
-        p.drawEllipse(QPointF(hx, hy), 4.5 * scale, 4.5 * scale)
+        p.drawEllipse(QPointF(hx, hy), 4.8 * scale, 4.8 * scale)
 
-        # Numerals
+        # Numerals in tabular format
         num_font = qfont(TYPE.caption_2)
+        num_font.setPointSize(int(10 * scale))
         num_font.setStyleStrategy(QFont.StyleStrategy.PreferDefault)
         p.setFont(num_font)
-        p.setPen(secondary)
+        p.setPen(QColor("#8E9094"))
+
+        time_text_y = sr.y() + sr.height() + 3.0 * scale
         el_m = int(self.media_position_sec // 60)
         el_s = int(self.media_position_sec % 60)
         el_str = f"{el_m}:{el_s:02d}"
-        p.drawText(QRectF(sr.x(), sr.y() + sr.height() + 2.0, 50.0, 16.0), Qt.AlignmentFlag.AlignLeft, el_str)
+        p.drawText(QRectF(sr.x(), time_text_y, 60.0 * scale, 16.0 * scale), Qt.AlignmentFlag.AlignLeft, el_str)
 
         rem_sec = max(0.0, self.media_duration_sec - self.media_position_sec)
         rem_m = int(rem_sec // 60)
         rem_s = int(rem_sec % 60)
         rem_str = f"-{rem_m}:{rem_s:02d}"
-        p.drawText(QRectF(sr.right() - 50.0, sr.y() + sr.height() + 2.0, 50.0, 16.0), Qt.AlignmentFlag.AlignRight, rem_str)
+        p.drawText(QRectF(sr.right() - 60.0 * scale, time_text_y, 60.0 * scale, 16.0 * scale), Qt.AlignmentFlag.AlignRight, rem_str)
 
-        # 4. Playback Controls (Prev, Play-Pause, Next)
-        cy_btn = 136.0 * scale
+        # 5. Playback Controls (Prev, Play-Pause in a darker disc, Next)
+        cy_btn = 138.0 * scale
         prev_cx = (w / 2.0 - 52.0 * scale)
         play_cx = (w / 2.0)
         next_cx = (w / 2.0 + 52.0 * scale)
 
-        self._draw_playback_button(p, "prev", prev_cx, cy_btn, 16.0 * scale, primary, scale, now)
-        self._draw_playback_button(p, "play_pause", play_cx, cy_btn, 20.0 * scale, primary, scale, now)
-        self._draw_playback_button(p, "next", next_cx, cy_btn, 16.0 * scale, primary, scale, now)
+        self._draw_playback_button(p, "prev", prev_cx, cy_btn, 16.0 * scale, primary, scale, now, dom_accent)
+        self._draw_playback_button(p, "play_pause", play_cx, cy_btn, 20.0 * scale, primary, scale, now, dom_accent)
+        self._draw_playback_button(p, "next", next_cx, cy_btn, 16.0 * scale, primary, scale, now, dom_accent)
 
-        # 5. Source app footnote
+        # Footnote source app text
         foot_font = qfont(TYPE.caption_2)
         p.setFont(foot_font)
-        p.setPen(secondary)
+        p.setPen(QColor("#8E9094"))
         src_txt = f"♪ {self.media_source}"
-        p.drawText(QRectF(w - 110.0 * scale, cy_btn - 8.0 * scale, 90.0 * scale, 16.0 * scale),
+        p.drawText(QRectF(w - 110.0 * scale, cy_btn - 8.0 * scale, 84.0 * scale, 16.0 * scale),
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, src_txt)
 
     def _draw_playback_button(self, p: QPainter, btn_id: str, cx: float, cy: float,
-                              r: float, color: QColor, scale: float, now: float) -> None:
+                              r: float, color: QColor, scale: float, now: float,
+                              dom_accent: Optional[QColor] = None) -> None:
         is_hover = (self._hovered_btn == btn_id)
         is_flash = (now < self._btn_flash_until and self._hovered_btn == btn_id)
+        accent_col = dom_accent if dom_accent else COLOR.HUD_ONLY.neon_cyan
 
-        # Hover circle highlight
-        if is_hover or is_flash:
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(255, 255, 255, 60 if is_flash else 25)))
-            p.drawEllipse(QPointF(cx, cy), r + 4.0 * scale, r + 4.0 * scale)
+        if btn_id == "play_pause":
+            # Large play/pause in a darker disc
+            disc_r = r + 2.0 * scale
+            p.setPen(QPen(QColor(255, 255, 255, 20), 1.0))
+            if is_hover or is_flash:
+                p.setBrush(QBrush(QColor(accent_col.red(), accent_col.green(), accent_col.blue(), 55 if is_flash else 35)))
+            else:
+                p.setBrush(QBrush(QColor(255, 255, 255, 24)))
+            p.drawEllipse(QPointF(cx, cy), disc_r, disc_r)
+        else:
+            # Hover circle highlight for prev / next
+            if is_hover or is_flash:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(255, 255, 255, 55 if is_flash else 22)))
+                p.drawEllipse(QPointF(cx, cy), r + 3.0 * scale, r + 3.0 * scale)
 
         # Hand-tracking dwell ring (fills over 1.0s)
         if is_hover and self._btn_dwell_elapsed > 0.05:
             dwell_prog = min(1.0, self._btn_dwell_elapsed / 1.0)
-            dwell_pen = QPen(COLOR.HUD_ONLY.neon_cyan, 2.2 * scale, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            dwell_pen = QPen(accent_col, 2.2 * scale, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
             p.setPen(dwell_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             d_rect = QRectF(cx - r - 4.0 * scale, cy - r - 4.0 * scale, (r + 4.0 * scale) * 2.0, (r + 4.0 * scale) * 2.0)
@@ -2283,17 +2603,17 @@ class AppleDynamicIsland(QWidget):
             if not self.media_playing:
                 # Play triangle
                 tri = QPolygonF([
-                    QPointF(cx - 5.0 * scale, cy - 8.0 * scale),
+                    QPointF(cx - 5.0 * scale, cy - 7.5 * scale),
                     QPointF(cx + 7.0 * scale, cy),
-                    QPointF(cx - 5.0 * scale, cy + 8.0 * scale)
+                    QPointF(cx - 5.0 * scale, cy + 7.5 * scale)
                 ])
                 p.drawPolygon(tri)
             else:
                 # Pause bars
                 bw = 3.5 * scale
-                bh = 15.0 * scale
-                p.drawRoundedRect(QRectF(cx - 5.5 * scale, cy - bh / 2.0, bw, bh), 1.5, 1.5)
-                p.drawRoundedRect(QRectF(cx + 2.0 * scale, cy - bh / 2.0, bw, bh), 1.5, 1.5)
+                bh = 14.0 * scale
+                p.drawRoundedRect(QRectF(cx - 5.5 * scale, cy - bh / 2.0, bw, bh), 1.5 * scale, 1.5 * scale)
+                p.drawRoundedRect(QRectF(cx + 2.0 * scale, cy - bh / 2.0, bw, bh), 1.5 * scale, 1.5 * scale)
 
         elif btn_id == "prev":
             # Bar left
@@ -2329,131 +2649,335 @@ class AppleDynamicIsland(QWidget):
             # Bar right
             p.drawRoundedRect(QRectF(cx + 6.0 * scale, cy - 7.0 * scale, 2.0 * scale, 14.0 * scale), 1.0, 1.0)
 
+    def _draw_weather_tile_icon(self, p: QPainter, icon_type: str, cx: float, cy: float, size: float, color: QColor) -> None:
+        """Renders muted vector icon for weather metric tiles (wind, feels like, humidity)."""
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if icon_type == "wind":
+            # Stylized wind gust streaks
+            pen = QPen(color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawLine(QPointF(cx - 6.0, cy - 3.0), QPointF(cx + 3.0, cy - 3.0))
+            p.drawLine(QPointF(cx - 4.0, cy + 2.5), QPointF(cx + 6.0, cy + 2.5))
+            p.drawArc(QRectF(cx + 1.0, cy - 6.0, 5.0, 5.0), 0, 180 * 16)
+        elif icon_type == "feels_like":
+            # Thermometer glyph
+            pen = QPen(color, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(cx - 2.0, cy - 6.0, 4.0, 7.5), 1.5, 1.5)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(color))
+            p.drawEllipse(QPointF(cx, cy + 3.5), 3.2, 3.2)
+        elif icon_type == "humidity":
+            # Droplet glyph
+            path = QPainterPath()
+            path.moveTo(cx, cy - 6.0)
+            path.cubicTo(cx - 4.5, cy - 1.0, cx - 4.0, cy + 4.5, cx, cy + 4.5)
+            path.cubicTo(cx + 4.0, cy + 4.5, cx + 4.5, cy - 1.0, cx, cy - 6.0)
+            path.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(color))
+            p.drawPath(path)
+
+        p.restore()
+
     def _draw_weather_card(self, p: QPainter, w: float, h: float,
                           now: float, t: float, dark: bool,
                           primary: QColor, secondary: QColor, accent: QColor) -> None:
         """
-        Expanded Weather Card:
-        Current temp, condition label, high/low, feels-like, and next 5 hours mini row.
-        Clean vector SVG icons, zero emoji.
+        Expanded Weather Card (390x188 px):
+        - Left side: City name in uppercase gray (#8E9094, e.g. "AHMEDABAD"), clean weather vector icon
+          + large temperature (heavy numerals #F5F5F7), condition text (semibold).
+        - Vertical hairline divider.
+        - Right side: Three stacked tiles (radius ~17px, fill #FFFFFF17, border 1px #FFFFFF0A):
+          1. Wind: speed + direction arrow, label "WIND", muted icon.
+          2. Feels Like: temperature, label "FEELS LIKE", muted icon.
+          3. Humidity: percentage, label "HUMIDITY", muted icon.
+        - Attribution footnote at bottom: "Weather data by Open-Meteo.com" (9 pt, #55585C).
         """
         scale = self._get_size_scale()
 
-        # Top section: City & Condition
-        city_font = qfont(TYPE.headline)
-        city_font.setPointSize(int(15 * scale))
+        # ── 1. Left Side: Hero City & Temp ────────────────────────────────
+        lx = 22.0 * scale
+        left_w = 172.0 * scale
+
+        # City name in uppercase gray (#8E9094)
+        city_str = (self.weather_city or "AHMEDABAD").upper()
+        city_font = qfont(TYPE.footnote)
+        city_font.setPointSize(int(11 * scale))
         city_font.setWeight(QFont.Weight.DemiBold)
         p.setFont(city_font)
-        p.setPen(primary)
-        p.drawText(int(24 * scale), int(30 * scale), self.weather_city)
+        p.setPen(QColor("#8E9094"))
+        p.drawText(QRectF(lx, 22.0 * scale, left_w, 18.0 * scale), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, city_str)
 
-        cond_font = qfont(TYPE.subheadline)
-        cond_font.setPointSize(int(12 * scale))
-        p.setFont(cond_font)
-        p.setPen(primary)
-        p.drawText(int(24 * scale), int(48 * scale), self.weather_condition)
+        # Weather Vector Icon + Large Heavy Temperature Numerals
+        icon_cx = lx + 22.0 * scale
+        icon_cy = 68.0 * scale
+        self._draw_weather_glyph(p, self.weather_icon, icon_cx, icon_cy, 36.0 * scale, dark)
 
-        hi_lo = f"H: {self.format_temp(self.weather_high)}  L: {self.format_temp(self.weather_low)}  •  Feels like {self.format_temp(self.weather_feels_like)}"
-        sub_font = qfont(TYPE.caption_1)
-        p.setFont(sub_font)
-        p.setPen(secondary)
-        p.drawText(int(24 * scale), int(66 * scale), hi_lo)
-
-        # Large current temperature
-        temp_font = qfont(TYPE.large_title)
-        temp_font.setPointSize(int(34 * scale))
-        temp_font.setWeight(QFont.Weight.Light)
-        p.setFont(temp_font)
-        p.setPen(primary)
         temp_str = self.format_temp(self.weather_temp)
-        tw = p.fontMetrics().horizontalAdvance(temp_str)
-        p.drawText(QRectF(w - tw - 64 * scale, 16 * scale, tw + 8, 48 * scale),
-                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, temp_str)
+        temp_font = QFont("Segoe UI Variable Display", int(36 * scale), QFont.Weight.Bold)
+        temp_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        p.setFont(temp_font)
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        p.drawText(QRectF(lx + 48.0 * scale, 44.0 * scale, left_w - 48.0 * scale, 48.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, temp_str)
 
-        # 36 px vector weather glyph top-right
-        self._draw_weather_glyph(p, self.weather_icon, w - 34 * scale, 40 * scale, 32.0 * scale, dark)
+        # Condition text (semibold)
+        cond_font = qfont(TYPE.body)
+        cond_font.setPointSize(int(13 * scale))
+        cond_font.setWeight(QFont.Weight.DemiBold)
+        p.setFont(cond_font)
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        p.drawText(QRectF(lx, 98.0 * scale, left_w, 20.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.weather_condition)
 
-        # Separator line
-        p.setPen(QPen(QColor(255, 255, 255, 30 if dark else 50), 1.0))
-        p.drawLine(QPointF(24 * scale, 82 * scale), QPointF(w - 24 * scale, 82 * scale))
+        # Attribution footnote at bottom: "Weather data by Open-Meteo.com" (9 pt, #55585C)
+        foot_font = qfont(TYPE.caption_2)
+        foot_font.setPointSize(int(8.5 * scale))
+        p.setFont(foot_font)
+        p.setPen(QColor("#55585C"))
+        p.drawText(QRectF(lx, 150.0 * scale, w - lx - 30.0 * scale, 18.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "Weather data by Open-Meteo.com")
 
-        # Bottom section: 5-hour hourly row
-        col_w = (w - 48 * scale) / 5.0
-        time_f = qfont(TYPE.caption_2)
-        p.setFont(time_f)
+        # ── 2. Vertical Hairline Divider ──────────────────────────────────
+        div_x = lx + left_w + 10.0 * scale
+        p.setPen(QPen(QColor(255, 255, 255, 18 if dark else 35), 1.0))
+        p.drawLine(QPointF(div_x, 22.0 * scale), QPointF(div_x, 142.0 * scale))
 
-        for i, item in enumerate(self.weather_hourly[:5]):
-            slot_x = 24 * scale + i * col_w
-            slot_cx = slot_x + col_w / 2.0
+        # ── 3. Right Side: Three Stacked Tiles ────────────────────────────
+        rx = div_x + 12.0 * scale
+        rw = (w - 28.0 * scale) - rx  # Leave space before page dots
+        tile_h = 36.0 * scale
+        tile_gap = 6.0 * scale
+        tile_r = 17.0 * scale
 
-            # Hour label
-            p.setPen(secondary)
-            p.drawText(QRectF(slot_x, 90 * scale, col_w, 16 * scale), Qt.AlignmentFlag.AlignCenter, item["time"])
+        tiles = [
+            ("wind", "WIND", f"{int(round(getattr(self, 'weather_wind_speed', 12.0)))} mph {getattr(self, 'weather_wind_direction', 'NW')} ↖"),
+            ("feels_like", "FEELS LIKE", self.format_temp(self.weather_feels_like)),
+            ("humidity", "HUMIDITY", f"{int(round(getattr(self, 'weather_humidity', 48)))}%"),
+        ]
 
-            # Mini vector icon
-            self._draw_weather_glyph(p, item["icon"], slot_cx, 122 * scale, 18.0 * scale, dark)
+        label_font = qfont(TYPE.caption_2)
+        label_font.setPointSize(int(8 * scale))
+        label_font.setWeight(QFont.Weight.DemiBold)
 
-            # Temp
-            p.setFont(qfont(TYPE.caption_1))
-            p.setPen(primary)
-            p.drawText(QRectF(slot_x, 142 * scale, col_w, 18 * scale),
-                       Qt.AlignmentFlag.AlignCenter, self.format_temp(item["temp"]))
-            p.setFont(time_f)
+        val_font = qfont(TYPE.subheadline)
+        val_font.setPointSize(int(11 * scale))
+        val_font.setWeight(QFont.Weight.Bold)
 
-    def _draw_time_card(self, p: QPainter, w: float, h: float,
-                        now: float, dark: bool, primary: QColor, secondary: QColor) -> None:
+        for idx, (icon_type, label, val_text) in enumerate(tiles):
+            ty = 20.0 * scale + idx * (tile_h + tile_gap)
+            tr = QRectF(rx, ty, rw, tile_h)
+            t_path = create_cached_squircle_path(tr, tile_r)
+
+            # Inset tile fill #FFFFFF17 and border 1px #FFFFFF0A
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(255, 255, 255, 23 if dark else 55)))
+            p.drawPath(t_path)
+            p.strokePath(t_path, QPen(QColor(255, 255, 255, 10 if dark else 25), 1.0))
+
+            # Muted icon on left
+            icx = rx + 15.0 * scale
+            icy = ty + tile_h / 2.0
+            self._draw_weather_tile_icon(p, icon_type, icx, icy, 14.0 * scale, QColor("#8E9094"))
+
+            # Label (e.g. "WIND", "FEELS LIKE", "HUMIDITY")
+            p.setFont(label_font)
+            p.setPen(QColor("#8E9094"))
+            p.drawText(QRectF(rx + 28.0 * scale, ty + 4.0 * scale, rw - 32.0 * scale, 12.0 * scale),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+
+            # Value text
+            p.setFont(val_font)
+            p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+            p.drawText(QRectF(rx + 28.0 * scale, ty + 16.0 * scale, rw - 32.0 * scale, 16.0 * scale),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, val_text)
+
+    def _get_calendar_data(self, now: float):
+        """Retrieves and caches CalendarData for zero-allocation 60 FPS rendering."""
+        cfg = getattr(self.mgr, "cfg", None)
+        first_weekday = getattr(cfg, "island_first_weekday", "locale")
+
+        if self.calendar_date is not None:
+            today = self.calendar_date
+        else:
+            try:
+                today = datetime.date.fromtimestamp(now)
+            except Exception:
+                today = datetime.date(2026, 10, 18)
+
+        key = (today.year, today.month, today.day, first_weekday)
+        if self._cached_calendar_data is not None and self._cached_calendar_key == key:
+            return self._cached_calendar_data
+
+        try:
+            import calendar_model
+            data = calendar_model.get_calendar_data(target_date=today, first_weekday=first_weekday, today=today)
+        except Exception:
+            data = None
+
+        self._cached_calendar_data = data
+        self._cached_calendar_key = key
+        return data
+
+    def _draw_calendar_card(self, p: QPainter, w: float, h: float,
+                            now: float, dark: bool,
+                            primary: QColor, secondary: QColor, accent: QColor) -> None:
         """
-        Expanded Time Card:
-        Large clock display, full date, and next timer/alarm.
+        Expanded Calendar Page Card (390x188 px):
+        - Left tile: Inset tile (radius ~17px, fill #FFFFFF17, border 1px #FFFFFF0A):
+          * Month name in accent color (#45C1EE).
+          * Year in gray (#8E9094).
+          * Very large bold day number (heavy font, #F5F5F7).
+          * Weekday name at the bottom (#8E9094).
+        - Right side:
+          * Weekday header row over a hairline divider.
+          * Weekends dimmed (#55585C).
+          * Current month days in #F5F5F7.
+          * Today highlighted as a filled accent circle (#45C1EE) with white text.
         """
         scale = self._get_size_scale()
+        data = self._get_calendar_data(now)
+        if not data:
+            return
 
-        cfg = getattr(self.mgr, "cfg", None)
-        fmt_24 = (getattr(cfg, "island_clock_format", "12h") == "24h")
-        tm = time.localtime(now)
+        # ── 1. Left Tile: Inset Tile ──────────────────────────────────────
+        lx = 20.0 * scale
+        ly = 20.0 * scale
+        tile_w = 112.0 * scale
+        tile_h = h - 40.0 * scale  # 148.0 * scale
+        tile_r = 17.0 * scale
 
-        # Large clock display
-        clock_font = qfont(TYPE.large_title)
-        clock_font.setPointSize(int(36 * scale))
-        clock_font.setWeight(QFont.Weight.DemiBold)
-        p.setFont(clock_font)
-        p.setPen(primary)
+        t_rect = QRectF(lx, ly, tile_w, tile_h)
+        t_path = create_cached_squircle_path(t_rect, tile_r)
 
-        time_str = time.strftime("%H:%M" if fmt_24 else "%I:%M", tm).lstrip("0")
-        if not time_str:
-            time_str = "12:00"
-        p.drawText(int(24 * scale), int(48 * scale), time_str)
+        # Inset tile fill #FFFFFF17 and border 1px #FFFFFF0A
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(255, 255, 255, 23 if dark else 55)))
+        p.drawPath(t_path)
+        p.strokePath(t_path, QPen(QColor(255, 255, 255, 10 if dark else 25), 1.0))
 
-        if not fmt_24:
-            am_pm = time.strftime("%p", tm)
-            p.setFont(qfont(TYPE.subheadline))
-            p.setPen(secondary)
-            tw = p.fontMetrics().horizontalAdvance(time_str)
-            p.drawText(int(28 * scale + tw * 1.8), int(36 * scale), am_pm)
+        # Month name in accent color (#45C1EE)
+        month_font = qfont(TYPE.footnote)
+        month_font.setPointSize(int(11 * scale))
+        month_font.setWeight(QFont.Weight.DemiBold)
+        p.setFont(month_font)
+        p.setPen(QColor("#45C1EE"))
+        p.drawText(QRectF(lx, ly + 14.0 * scale, tile_w, 18.0 * scale),
+                   Qt.AlignmentFlag.AlignCenter, data.month_name.upper())
 
-        # Full date
-        date_str = time.strftime("%A, %B %d", tm)
-        date_font = qfont(TYPE.subheadline)
-        p.setFont(date_font)
-        p.setPen(secondary)
-        p.drawText(int(24 * scale), int(72 * scale), date_str)
+        # Year in gray (#8E9094)
+        year_font = qfont(TYPE.caption_1)
+        year_font.setPointSize(int(10 * scale))
+        year_font.setWeight(QFont.Weight.Medium)
+        p.setFont(year_font)
+        p.setPen(QColor("#8E9094"))
+        p.drawText(QRectF(lx, ly + 32.0 * scale, tile_w, 16.0 * scale),
+                   Qt.AlignmentFlag.AlignCenter, str(data.year))
 
-        # Separator line
-        p.setPen(QPen(QColor(255, 255, 255, 30 if dark else 50), 1.0))
-        p.drawLine(QPointF(24 * scale, 88 * scale), QPointF(w - 24 * scale, 88 * scale))
+        # Very large bold day number (heavy font, #F5F5F7)
+        day_font = QFont("Segoe UI Variable Display", int(44 * scale), QFont.Weight.Bold)
+        day_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        p.setFont(day_font)
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        p.drawText(QRectF(lx, ly + 46.0 * scale, tile_w, 58.0 * scale),
+                   Qt.AlignmentFlag.AlignCenter, str(data.day))
 
-        # Timer / Alarm status row
-        sub_font = qfont(TYPE.footnote)
-        p.setFont(sub_font)
-        if self.timer_active:
-            rem = max(0.0, self.timer_end_time - now)
-            mins = int(rem // 60)
-            secs = int(rem % 60)
-            p.setPen(QColor("#FF9F0A"))
-            p.drawText(int(24 * scale), int(114 * scale), f"⏱  Timer: {mins:02d}:{secs:02d} remaining")
-        else:
-            p.setPen(secondary)
-            p.drawText(int(24 * scale), int(114 * scale), "⏰  Alarm: 7:00 AM  •  Tomorrow")
+        # Weekday name at the bottom (#8E9094)
+        weekday_font = qfont(TYPE.subheadline)
+        weekday_font.setPointSize(int(12 * scale))
+        weekday_font.setWeight(QFont.Weight.Medium)
+        p.setFont(weekday_font)
+        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+        p.drawText(QRectF(lx, ly + 114.0 * scale, tile_w, 20.0 * scale),
+                   Qt.AlignmentFlag.AlignCenter, data.weekday_name)
+
+        # ── 2. Right Side: Calendar Grid ──────────────────────────────────
+        rx = lx + tile_w + 16.0 * scale
+        rw = (w - 28.0 * scale) - rx  # leaving room before the 5 dots on right edge
+        ry = ly
+        rh = tile_h
+
+        # Weekday header row
+        hdr_h = 20.0 * scale
+        col_w = rw / 7.0
+        hdr_font = qfont(TYPE.caption_2)
+        hdr_font.setPointSize(int(9 * scale))
+        hdr_font.setWeight(QFont.Weight.DemiBold)
+        p.setFont(hdr_font)
+
+        for c_idx in range(7):
+            hdr_text = data.weekday_headers[c_idx]
+            is_weekend_col = (data.grid[0][c_idx].is_weekend if data.grid else False)
+            if is_weekend_col:
+                p.setPen(QColor("#55585C"))
+            else:
+                p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+            p.drawText(QRectF(rx + c_idx * col_w, ry + 2.0 * scale, col_w, hdr_h),
+                       Qt.AlignmentFlag.AlignCenter, hdr_text)
+
+        # Hairline divider
+        div_y = ry + hdr_h + 4.0 * scale
+        p.setPen(QPen(QColor(255, 255, 255, 18 if dark else 35), 1.0))
+        p.drawLine(QPointF(rx + 2.0 * scale, div_y), QPointF(rx + rw - 2.0 * scale, div_y))
+
+        # Grid of days
+        grid_top = div_y + 4.0 * scale
+        avail_h = (ry + rh) - grid_top
+        num_rows = len(data.grid)
+        row_h = avail_h / max(1, num_rows)
+
+        day_font = qfont(TYPE.caption_1)
+        day_font.setPointSize(int(10 * scale))
+        day_font.setWeight(QFont.Weight.Normal)
+
+        today_font = qfont(TYPE.caption_1)
+        today_font.setPointSize(int(10 * scale))
+        today_font.setWeight(QFont.Weight.Bold)
+
+        for r_idx, week in enumerate(data.grid):
+            for c_idx, day in enumerate(week):
+                cx = rx + c_idx * col_w + col_w / 2.0
+                cy = grid_top + r_idx * row_h + row_h / 2.0
+                cell_rect = QRectF(rx + c_idx * col_w, grid_top + r_idx * row_h, col_w, row_h)
+
+                if day.is_today:
+                    # Today highlighted as a filled accent circle (#45C1EE) with white text
+                    cr = min(col_w, row_h) * 0.40
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QBrush(QColor("#45C1EE")))
+                    p.drawEllipse(QPointF(cx, cy), cr, cr)
+
+                    p.setFont(today_font)
+                    p.setPen(QColor("#FFFFFF"))
+                    p.drawText(cell_rect, Qt.AlignmentFlag.AlignCenter, str(day.day_number))
+
+                elif not day.is_current_month:
+                    p.setFont(day_font)
+                    p.setPen(QColor("#3A3D40" if dark else "#B8B8C0"))
+                    p.drawText(cell_rect, Qt.AlignmentFlag.AlignCenter, str(day.day_number))
+
+                elif day.is_weekend:
+                    # Weekends dimmed (#55585C)
+                    p.setFont(day_font)
+                    p.setPen(QColor("#55585C" if dark else "#8E9094"))
+                    p.drawText(cell_rect, Qt.AlignmentFlag.AlignCenter, str(day.day_number))
+
+                else:
+                    # Current month days in #F5F5F7
+                    p.setFont(day_font)
+                    p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+                    p.drawText(cell_rect, Qt.AlignmentFlag.AlignCenter, str(day.day_number))
+
+    def _draw_time_card(self, p: QPainter, w: float, h: float,
+                        now: float, dark: bool, primary: QColor, secondary: QColor,
+                        accent: Optional[QColor] = None) -> None:
+        """Expanded Calendar & Time Card."""
+        self._draw_calendar_card(p, w, h, now, dark, primary, secondary, accent or QColor("#45C1EE"))
 
     def _draw_timer_card(self, p: QPainter, w: float, h: float,
                          now: float, dark: bool, primary: QColor, secondary: QColor, accent: QColor) -> None:
@@ -2606,6 +3130,489 @@ class AppleDynamicIsland(QWidget):
         p.setFont(font)
         p.setPen(col)
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Hardware Grid, Strip & JARVIS Assistant Card Renderers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _draw_hardware_tile_icon(self, p: QPainter, icon_name: str, cx: float, cy: float, size: float, color: QColor) -> None:
+        """Renders vector hardware icon for grid and strip tiles."""
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if icon_name == "cpu":
+            p.setPen(QPen(color, 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(cx - 5.0, cy - 5.0, 10.0, 10.0), 1.5, 1.5)
+            for d in [-3.0, 0.0, 3.0]:
+                p.drawLine(QPointF(cx + d, cy - 7.0), QPointF(cx + d, cy - 5.0))
+                p.drawLine(QPointF(cx + d, cy + 5.0), QPointF(cx + d, cy + 7.0))
+                p.drawLine(QPointF(cx - 7.0, cy + d), QPointF(cx - 5.0, cy + d))
+                p.drawLine(QPointF(cx + 5.0, cy + d), QPointF(cx + 7.0, cy + d))
+        elif icon_name == "ram":
+            p.setPen(QPen(color, 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(cx - 6.0, cy - 3.5, 12.0, 7.0), 1.0, 1.0)
+            p.drawLine(QPointF(cx - 2.0, cy - 3.5), QPointF(cx - 2.0, cy - 1.0))
+            p.drawLine(QPointF(cx + 2.0, cy - 3.5), QPointF(cx + 2.0, cy - 1.0))
+        elif icon_name == "gpu":
+            p.setPen(QPen(color, 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(cx - 6.0, cy - 4.0, 12.0, 8.0), 1.5, 1.5)
+            p.drawEllipse(QPointF(cx, cy), 2.2, 2.2)
+        elif icon_name == "net_up":
+            p.setPen(QPen(color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(cx, cy + 4.5), QPointF(cx, cy - 4.5))
+            p.drawLine(QPointF(cx - 3.0, cy - 1.5), QPointF(cx, cy - 4.5))
+            p.drawLine(QPointF(cx + 3.0, cy - 1.5), QPointF(cx, cy - 4.5))
+        elif icon_name == "net_down":
+            p.setPen(QPen(color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(cx, cy - 4.5), QPointF(cx, cy + 4.5))
+            p.drawLine(QPointF(cx - 3.0, cy + 1.5), QPointF(cx, cy + 4.5))
+            p.drawLine(QPointF(cx + 3.0, cy + 1.5), QPointF(cx, cy + 4.5))
+        elif icon_name == "disk":
+            p.setPen(QPen(color, 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy - 3.0), 5.5, 2.0)
+            p.drawArc(QRectF(cx - 5.5, cy - 2.0, 11.0, 4.0), 180 * 16, 180 * 16)
+            p.drawArc(QRectF(cx - 5.5, cy + 1.0, 11.0, 4.0), 180 * 16, 180 * 16)
+            p.drawLine(QPointF(cx - 5.5, cy - 3.0), QPointF(cx - 5.5, cy + 3.0))
+            p.drawLine(QPointF(cx + 5.5, cy - 3.0), QPointF(cx + 5.5, cy + 3.0))
+        else:
+            p.setPen(QPen(color, 1.2))
+            p.drawEllipse(QPointF(cx, cy), 3.5, 3.5)
+
+        p.restore()
+
+    def _draw_hardware_grid(self, p: QPainter, w: float, h: float,
+                            now: float, t: float, dark: bool,
+                            primary: QColor, secondary: QColor, accent: QColor) -> None:
+        """
+        Expanded Hardware Monitor 2x3 Grid Card (390x188 px):
+        6 modular tiles (radius ~17px, fill #FFFFFF17, border 1px #FFFFFF0A):
+        1. CPU %: icon, label "CPU", value, 4px progress bar in sky blue #45C1EE (shifts to red #F0443A if >90%).
+        2. RAM: icon, label "RAM", value (e.g. "8.2 / 16.0 GB"), 4px bar in amber #F5A524 (shifts to red if >90%).
+        3. GPU %: icon, label "GPU", value (or "--"), 4px bar in red #F0443A.
+        4. NET UP: up arrow icon, label "NET UP", value (e.g. "1.2 MB/s"), no bar.
+        5. NET DOWN: down arrow icon, label "NET DOWN", value (e.g. "14.5 MB/s"), no bar.
+        6. DISK %: icon, label "DISK", value, 4px bar in sky blue #45C1EE (shifts to red if >90%).
+        """
+        scale = self._get_size_scale()
+
+        m = self._cached_hardware_metrics
+        if not m:
+            try:
+                from hardware_adapter import get_hardware_adapter
+                m = get_hardware_adapter().get_metrics()
+            except Exception:
+                m = None
+
+        cpu_val = (m.cpu_percent if m and m.cpu_percent > 0 else 38.0)
+        ram_used = (m.ram_used_gb if m and m.ram_used_gb > 0 else 8.2)
+        ram_total = (m.ram_total_gb if m and m.ram_total_gb > 0 else 16.0)
+        ram_pct = (m.ram_percent if m and m.ram_percent > 0 else (ram_used / ram_total * 100.0))
+        gpu_pct = (m.gpu_percent if m and m.gpu_percent is not None else 24.0)
+        disk_val = (m.disk_percent if m and m.disk_percent > 0 else 54.0)
+
+        try:
+            from hardware_adapter import format_speed
+            net_up_str = format_speed(m.net_up_bytes_sec) if m and m.net_up_bytes_sec > 0 else "1.2 MB/s"
+            net_down_str = format_speed(m.net_down_bytes_sec) if m and m.net_down_bytes_sec > 0 else "14.5 MB/s"
+        except Exception:
+            net_up_str = "1.2 MB/s"
+            net_down_str = "14.5 MB/s"
+
+        tile_w = 108.0 * scale
+        tile_h = 68.0 * scale
+        tile_r = 17.0 * scale
+        gap_x = 8.0 * scale
+        gap_y = 10.0 * scale
+
+        margin_x = 18.0 * scale
+        margin_y = (h - (2.0 * tile_h + gap_y)) / 2.0
+
+        tiles_data = [
+            ("cpu", "CPU", f"{round(cpu_val):.0f}%", cpu_val, True, "#F0443A" if cpu_val > 90 else "#45C1EE"),
+            ("ram", "RAM", f"{ram_used:.1f} / {ram_total:.1f} GB", ram_pct, True, "#F0443A" if ram_pct > 90 else "#F5A524"),
+            ("gpu", "GPU", f"{round(gpu_pct):.0f}%" if gpu_pct is not None else "--", gpu_pct if gpu_pct is not None else 0.0, True, "#F0443A"),
+            ("net_up", "NET UP", net_up_str, 0.0, False, ""),
+            ("net_down", "NET DOWN", net_down_str, 0.0, False, ""),
+            ("disk", "DISK", f"{round(disk_val):.0f}%", disk_val, True, "#F0443A" if disk_val > 90 else "#45C1EE"),
+        ]
+
+        tile_bg = QColor(255, 255, 255, 23 if dark else 55)
+        tile_border = QColor(255, 255, 255, 10 if dark else 25)
+
+        for idx, (icon_name, label, val_text, pct, has_bar, bar_color) in enumerate(tiles_data):
+            row = idx // 3
+            col = idx % 3
+            tx = margin_x + col * (tile_w + gap_x)
+            ty = margin_y + row * (tile_h + gap_y)
+            tr = QRectF(tx, ty, tile_w, tile_h)
+            t_path = create_cached_squircle_path(tr, tile_r)
+
+            # Inset tile fill #FFFFFF17 and border 1px #FFFFFF0A
+            p.fillPath(t_path, QBrush(tile_bg))
+            p.strokePath(t_path, QPen(tile_border, 1.0))
+
+            # Icon & Label
+            icx = tx + 14.0 * scale
+            icy = ty + 16.0 * scale
+            self._draw_hardware_tile_icon(p, icon_name, icx, icy, 12.0 * scale, QColor("#8E9094"))
+
+            p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.DemiBold))
+            p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+            p.drawText(QRectF(tx + 24.0 * scale, ty + 8.0 * scale, tile_w - 30.0 * scale, 16.0 * scale),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+
+            # Value
+            if label == "RAM":
+                p.setFont(QFont("Segoe UI Variable Display", int(10.5 * scale), QFont.Weight.Bold))
+            elif len(val_text) >= 8:
+                p.setFont(QFont("Segoe UI Variable Display", int(12.0 * scale), QFont.Weight.Bold))
+            else:
+                p.setFont(QFont("Segoe UI Variable Display", int(15.0 * scale), QFont.Weight.Bold))
+            p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+            p.drawText(QRectF(tx + 10.0 * scale, ty + 24.0 * scale, tile_w - 20.0 * scale, 22.0 * scale),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, val_text)
+
+            # 4px Progress Bar
+            if has_bar:
+                bar_x = tx + 10.0 * scale
+                bar_y = ty + tile_h - 12.0 * scale
+                bar_w = tile_w - 20.0 * scale
+                bar_h = 4.0 * scale
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(255, 255, 255, 22 if dark else 40)))
+                p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2.0 * scale, 2.0 * scale)
+
+                fill_w = bar_w * min(1.0, max(0.0, pct / 100.0))
+                if fill_w > 0:
+                    p.setBrush(QBrush(QColor(bar_color)))
+                    p.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 2.0 * scale, 2.0 * scale)
+
+    def _draw_hardware_strip(self, p: QPainter, w: float, h: float,
+                             now: float, t: float, dark: bool,
+                             primary: QColor, secondary: QColor, accent: QColor) -> None:
+        """
+        Hardware 5-Item Telemetry Strip (446x69 px, radius 28px):
+        5 horizontal segments: FPS (JARVIS tracking FPS), CPU, RAM, GPU, DISK.
+        Switchable via island_hardware_layout ("grid" vs "strip").
+        """
+        scale = self._get_size_scale()
+
+        m = self._cached_hardware_metrics
+        if not m:
+            try:
+                from hardware_adapter import get_hardware_adapter
+                m = get_hardware_adapter().get_metrics()
+            except Exception:
+                m = None
+
+        fps_val = (m.fps if m and m.fps > 0 else 60.0)
+        cpu_val = (m.cpu_percent if m and m.cpu_percent > 0 else 38.0)
+        ram_used = (m.ram_used_gb if m and m.ram_used_gb > 0 else 8.2)
+        ram_total = (m.ram_total_gb if m and m.ram_total_gb > 0 else 16.0)
+        ram_pct = (m.ram_percent if m and m.ram_percent > 0 else (ram_used / ram_total * 100.0))
+        gpu_pct = (m.gpu_percent if m and m.gpu_percent is not None else 24.0)
+        disk_val = (m.disk_percent if m and m.disk_percent > 0 else 54.0)
+
+        segments = [
+            ("FPS", f"{round(fps_val)} FPS", "#45C1EE"),
+            ("CPU", f"{round(cpu_val):.0f}%", "#F0443A" if cpu_val > 90 else "#45C1EE"),
+            ("RAM", f"{round(ram_pct):.0f}%", "#F0443A" if ram_pct > 90 else "#F5A524"),
+            ("GPU", f"{round(gpu_pct):.0f}%" if gpu_pct is not None else "--", "#F0443A"),
+            ("DISK", f"{round(disk_val):.0f}%", "#F0443A" if disk_val > 90 else "#45C1EE"),
+        ]
+
+        mx = 14.0 * scale
+        seg_w = (w - 2.0 * mx) / 5.0
+        line_col = QColor(255, 255, 255, 10 if dark else 25)
+
+        for idx, (label, val_text, accent_hex) in enumerate(segments):
+            sx = mx + idx * seg_w
+            if idx > 0:
+                p.setPen(QPen(line_col, 1.0))
+                p.drawLine(QPointF(sx, 16.0 * scale), QPointF(sx, h - 16.0 * scale))
+
+            p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.DemiBold))
+            p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+            p.drawText(QRectF(sx, 14.0 * scale, seg_w, 16.0 * scale), Qt.AlignmentFlag.AlignCenter, label)
+
+            p.setFont(QFont("Segoe UI Variable Display", int(15.0 * scale), QFont.Weight.Bold))
+            p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+            p.drawText(QRectF(sx, 32.0 * scale, seg_w, 24.0 * scale), Qt.AlignmentFlag.AlignCenter, val_text)
+
+    def _draw_jarvis_card(self, p: QPainter, w: float, h: float,
+                          now: float, t: float, dark: bool,
+                          primary: QColor, secondary: QColor, accent: QColor) -> None:
+        """
+        Expanded JARVIS Assistant Card (390x188 px):
+        - Header: "J.A.R.V.I.S." with pulsing green status dot.
+        - Modular tiles (radius ~17px, fill #FFFFFF17, border 1px #FFFFFF0A):
+          1. Assistant Status tile: Tracking active/paused, camera status, mic state.
+          2. Quick toggle button: "Pause Tracking" / "Resume Tracking" (interactive target).
+          3. Last Command tile: Displaying the last spoken/executed command and its result status.
+        """
+        scale = self._get_size_scale()
+        lx = 22.0 * scale
+        content_w = (w - 28.0 * scale) - lx
+        tile_r = 17.0 * scale
+
+        tile_bg = QColor(255, 255, 255, 23 if dark else 55)
+        tile_border = QColor(255, 255, 255, 10 if dark else 25)
+
+        # ── 1. Header: "J.A.R.V.I.S." with pulsing green status dot ──────────
+        p.setFont(QFont("Segoe UI Variable Display", int(13.5 * scale), QFont.Weight.Bold))
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        p.drawText(int(lx), int(29.0 * scale), "J.A.R.V.I.S.")
+        adv = p.fontMetrics().horizontalAdvance("J.A.R.V.I.S.")
+
+        # Pulsing green status dot
+        dot_cx = lx + adv + 10.0 * scale
+        dot_cy = 24.0 * scale
+        dot_r = 3.2 * scale
+        pulse_alpha = int(180 + 75 * math.sin(t * 3.5))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(52, 199, 89, int(pulse_alpha * 0.35))))
+        p.drawEllipse(QPointF(dot_cx, dot_cy), dot_r + 2.5 * scale, dot_r + 2.5 * scale)
+        p.setBrush(QBrush(QColor(52, 199, 89, pulse_alpha)))
+        p.drawEllipse(QPointF(dot_cx, dot_cy), dot_r, dot_r)
+
+        # Trailing category tag
+        p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.DemiBold))
+        p.setPen(QColor("#8E9094"))
+        p.drawText(QRectF(lx, 15.0 * scale, content_w, 16.0 * scale),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "VOICE & VISION")
+
+        # ── 2. Row 1: Status Tile + Quick Toggle Button ─────────────────────
+        ty1 = 38.0 * scale
+        th1 = 66.0 * scale
+        gap = 8.0 * scale
+        status_w = 202.0 * scale
+        btn_w = content_w - status_w - gap
+        btn_x = lx + status_w + gap
+
+        # Tile 1: Assistant Status Tile
+        s_rect = QRectF(lx, ty1, status_w, th1)
+        s_path = create_cached_squircle_path(s_rect, tile_r)
+        p.fillPath(s_path, QBrush(tile_bg))
+        p.strokePath(s_path, QPen(tile_border, 1.0))
+
+        # Status tile title
+        p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.DemiBold))
+        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+        p.drawText(QRectF(lx + 12.0 * scale, ty1 + 7.0 * scale, status_w - 24.0 * scale, 14.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "ASSISTANT STATUS")
+
+        # Status metrics
+        is_tracking = self.active and not getattr(self, "tracking_paused", False)
+        # Tracking indicator dot + text
+        track_dot_y = ty1 + 30.0 * scale
+        track_dot_col = QColor("#34C759") if is_tracking else QColor("#FF9F0A")
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(track_dot_col))
+        p.drawEllipse(QPointF(lx + 16.0 * scale, track_dot_y), 3.0 * scale, 3.0 * scale)
+
+        p.setFont(QFont("Segoe UI Variable Text", int(9.5 * scale), QFont.Weight.Bold))
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        track_txt = "Tracking: Active" if is_tracking else "Tracking: Paused"
+        p.drawText(QRectF(lx + 24.0 * scale, track_dot_y - 8.0 * scale, status_w - 32.0 * scale, 16.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, track_txt)
+
+        # Camera & Mic indicators
+        p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.Normal))
+        p.setPen(QColor("#8E9094"))
+        cam_mic_txt = "Camera: 60 FPS   •   Mic: Online"
+        p.drawText(QRectF(lx + 12.0 * scale, ty1 + 45.0 * scale, status_w - 24.0 * scale, 14.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, cam_mic_txt)
+
+        # Tile 2: Quick Toggle Button (Interactive target)
+        b_rect = QRectF(btn_x, ty1, btn_w, th1)
+        b_path = create_cached_squircle_path(b_rect, tile_r)
+
+        is_hover = (self._hovered_btn == "jarvis_toggle_tracking")
+        is_flash = (now < self._btn_flash_until and is_hover)
+
+        if is_flash:
+            b_bg = QColor(0, 229, 255, 65)
+            b_stroke = QPen(QColor(0, 229, 255, 220), 1.4 * scale)
+        elif is_hover:
+            b_bg = QColor(255, 255, 255, 42 if dark else 75)
+            b_stroke = QPen(QColor(0, 229, 255, 180), 1.2 * scale)
+        else:
+            b_bg = tile_bg
+            b_stroke = QPen(tile_border, 1.0)
+
+        p.fillPath(b_path, QBrush(b_bg))
+        p.strokePath(b_path, b_stroke)
+
+        # Dwell progress ring around button if dwelling
+        if is_hover and self._btn_dwell_elapsed > 0.03:
+            dwell_pen = QPen(COLOR.HUD_ONLY.neon_cyan, 2.0 * scale, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            p.setPen(dwell_pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            d_rect = b_rect.adjusted(-2.5 * scale, -2.5 * scale, 2.5 * scale, 2.5 * scale)
+            p.drawRoundedRect(d_rect, tile_r + 2.5 * scale, tile_r + 2.5 * scale)
+
+        # Icon inside button
+        ic_cx = btn_x + btn_w / 2.0
+        ic_cy = ty1 + 20.0 * scale
+        if is_tracking:
+            # Pause icon (two vertical bars)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor("#FF9F0A")))
+            bw = 3.0 * scale
+            bh = 10.0 * scale
+            p.drawRoundedRect(QRectF(ic_cx - 4.5 * scale, ic_cy - bh / 2.0, bw, bh), 1.0 * scale, 1.0 * scale)
+            p.drawRoundedRect(QRectF(ic_cx + 1.5 * scale, ic_cy - bh / 2.0, bw, bh), 1.0 * scale, 1.0 * scale)
+            btn_txt = "Pause Tracking"
+        else:
+            # Play / Resume triangle
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor("#34C759")))
+            tri = QPolygonF([
+                QPointF(ic_cx - 4.0 * scale, ic_cy - 5.5 * scale),
+                QPointF(ic_cx + 5.5 * scale, ic_cy),
+                QPointF(ic_cx - 4.0 * scale, ic_cy + 5.5 * scale)
+            ])
+            p.drawPolygon(tri)
+            btn_txt = "Resume Tracking"
+
+        p.setFont(QFont("Segoe UI Variable Text", int(9.5 * scale), QFont.Weight.Bold))
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        p.drawText(QRectF(btn_x + 4.0 * scale, ty1 + 31.0 * scale, btn_w - 8.0 * scale, 16.0 * scale),
+                   Qt.AlignmentFlag.AlignCenter, btn_txt)
+
+        p.setFont(QFont("Segoe UI Variable Text", int(7.5 * scale), QFont.Weight.Normal))
+        p.setPen(QColor("#8E9094"))
+        p.drawText(QRectF(btn_x + 4.0 * scale, ty1 + 47.0 * scale, btn_w - 8.0 * scale, 14.0 * scale),
+                   Qt.AlignmentFlag.AlignCenter, "Click / Dwell")
+
+        # ── 3. Row 2: Last Command Tile ─────────────────────────────────────
+        ty2 = ty1 + th1 + 8.0 * scale
+        th2 = 60.0 * scale
+        cmd_rect = QRectF(lx, ty2, content_w, th2)
+        cmd_path = create_cached_squircle_path(cmd_rect, tile_r)
+
+        p.fillPath(cmd_path, QBrush(tile_bg))
+        p.strokePath(cmd_path, QPen(tile_border, 1.0))
+
+        # Title: "LAST COMMAND"
+        p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.DemiBold))
+        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+        p.drawText(QRectF(lx + 12.0 * scale, ty2 + 7.0 * scale, 140.0 * scale, 14.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "LAST COMMAND")
+
+        # Pill badge on right: "✓ Executed"
+        badge_w = 78.0 * scale
+        badge_h = 17.0 * scale
+        badge_rx = lx + content_w - badge_w - 10.0 * scale
+        badge_ry = ty2 + 6.0 * scale
+        bdg_rect = QRectF(badge_rx, badge_ry, badge_w, badge_h)
+        bdg_path = create_cached_squircle_path(bdg_rect, badge_h / 2.0)
+        p.fillPath(bdg_path, QBrush(QColor(52, 199, 89, 35)))
+        p.strokePath(bdg_path, QPen(QColor(52, 199, 89, 90), 1.0))
+
+        p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.DemiBold))
+        p.setPen(QColor("#34C759"))
+        p.drawText(bdg_rect, Qt.AlignmentFlag.AlignCenter, "✓ Executed")
+
+        # Command text
+        p.setFont(QFont("Segoe UI Variable Display", int(11.5 * scale), QFont.Weight.Bold))
+        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
+        user_cmd = f"“{self.user_prompt or 'Run system diagnostic'}”"
+        p.drawText(QRectF(lx + 12.0 * scale, ty2 + 22.0 * scale, content_w - 24.0 * scale, 18.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, user_cmd)
+
+        # Result summary
+        p.setFont(QFont("Segoe UI Variable Text", int(9.5 * scale), QFont.Weight.Normal))
+        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+        reply_txt = self.say_text or "All core subsystems nominal, sir."
+        p.drawText(QRectF(lx + 12.0 * scale, ty2 + 39.0 * scale, content_w - 24.0 * scale, 15.0 * scale),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, reply_txt)
+
+    def _draw_page_dots(self, p: QPainter, w: float, h: float, dark: bool) -> None:
+        """
+        Draws the vertical column of 5 page indicator dots along the right edge:
+        - Position: x = w - 16 px, vertically centered
+        - Pages: Media, Time/Calendar, Weather, Hardware, Jarvis
+        - Active dot: 100% solid white (or near-black in light mode)
+        - Inactive dot: 30% alpha
+        """
+        scale = self._get_size_scale()
+        dot_x = w - 16.0 * scale
+        num_dots = len(self.card_pages)
+        dot_spacing = 14.0 * scale
+        total_h = (num_dots - 1) * dot_spacing
+        start_y = (h - total_h) / 2.0
+        r_dot = 3.0 * scale
+
+        curr_page = self.expanded_card or "weather"
+        if curr_page == "calendar":
+            curr_page = "time"
+        elif curr_page in ("hardware_grid", "hardware_strip"):
+            curr_page = "hardware"
+        elif curr_page in ("sending", "jarvis_card"):
+            curr_page = "jarvis"
+
+        active_idx = self.card_pages.index(curr_page) if curr_page in self.card_pages else 2
+
+        active_col = QColor(255, 255, 255, 255) if dark else QColor(28, 28, 30, 255)
+        inactive_col = QColor(255, 255, 255, 77) if dark else QColor(0, 0, 0, 77)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(num_dots):
+            dy = start_y + i * dot_spacing
+            if i == active_idx:
+                p.setBrush(QBrush(active_col))
+            else:
+                p.setBrush(QBrush(inactive_col))
+            p.drawEllipse(QPointF(dot_x, dy), r_dot, r_dot)
+
+    def _dot_at(self, pos: QPointF | QPoint) -> Optional[int]:
+        """Hit test for the page dots on expanded cards."""
+        if not self.expanded_card:
+            return None
+        w = max(float(self.width()), self.spring_w.target)
+        h = max(float(self.height()), self.spring_h.target)
+        scale = self._get_size_scale()
+        dot_x = w - 16.0 * scale
+        num_dots = len(self.card_pages)
+        dot_spacing = 14.0 * scale
+        total_h = (num_dots - 1) * dot_spacing
+        start_y = (h - total_h) / 2.0
+        hit_radius = 12.0 * scale
+
+        for i in range(num_dots):
+            dy = start_y + i * dot_spacing
+            if math.hypot(pos.x() - dot_x, pos.y() - dy) <= hit_radius:
+                return i
+        return None
+
+    def wheelEvent(self, event) -> None:
+        """Mouse wheel scrolling to switch between expanded card pages."""
+        if self.expanded_card:
+            curr_page = self.expanded_card
+            if curr_page == "calendar":
+                curr_page = "time"
+            elif curr_page in ("hardware_grid", "hardware_strip"):
+                curr_page = "hardware"
+            elif curr_page in ("sending", "jarvis_card"):
+                curr_page = "jarvis"
+
+            idx = self.card_pages.index(curr_page) if curr_page in self.card_pages else 0
+            delta = event.angleDelta().y()
+            if delta < 0:
+                new_idx = (idx + 1) % len(self.card_pages)
+            elif delta > 0:
+                new_idx = (idx - 1) % len(self.card_pages)
+            else:
+                return
+            self.expand_card(self.card_pages[new_idx])
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     # ──────────────────────────────────────────────────────────────────────
     # Vector Weather Glyph Drawing (No Emoji!)

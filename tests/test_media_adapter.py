@@ -3,24 +3,36 @@ tests/test_media_adapter.py — Unit tests for SMTC Media Session Adapter.
 
 Verifies:
   - Metadata parsing (title, artist, album, timeline, thumbnail bytes, status).
-  - Background async polling and thread safety.
+  - Dominant vibrant color extraction from artwork (excluding near-black/near-white).
+  - Missing artwork fallback generation.
+  - Timeline seeking with app-without-seek local fallback.
+  - Multi-session arbitration (prioritizing actively playing session over paused).
   - Command debouncing (250 ms threshold prevents command floods).
-  - PyAutoGUI fallback execution when backend fails or is unsupported.
-  - Listener callbacks on metadata change.
+  - Hardware media key fallback execution when backend fails or is unsupported.
+  - Background async polling and thread safety.
   - Zero Qt imports; 100% testable with mock backends.
 """
 
 import asyncio
+import io
 import time
 import unittest
 from unittest.mock import MagicMock, patch
+
+from PIL import Image
 
 from media_adapter import (
     MediaAdapter,
     MediaMetadata,
     SMTCBackendProtocol,
+    WinRTSMTCBackend,
+    extract_dominant_color,
+    generate_fallback_artwork,
     get_media_adapter,
     set_media_adapter,
+    STATUS_PLAYING,
+    STATUS_PAUSED,
+    STATUS_STOPPED,
 )
 
 
@@ -42,9 +54,12 @@ class MockSMTCBackend:
         self.play_pause_calls = 0
         self.next_calls = 0
         self.prev_calls = 0
+        self.seek_calls = 0
+        self.last_seek_pos = 0.0
         self.play_pause_succeeds = True
         self.next_succeeds = True
         self.prev_succeeds = True
+        self.seek_succeeds = True
         self.available = True
 
     def is_available(self) -> bool:
@@ -77,6 +92,14 @@ class MockSMTCBackend:
         self.metadata.is_playing = False
         return True
 
+    async def seek(self, position_seconds: float) -> bool:
+        self.seek_calls += 1
+        self.last_seek_pos = position_seconds
+        if self.seek_succeeds:
+            self.metadata.position = position_seconds
+            return True
+        return False
+
     def close(self):
         pass
 
@@ -95,9 +118,10 @@ class TestMediaAdapter(unittest.TestCase):
         self.adapter.stop()
 
     def test_01_metadata_properties(self):
-        """Verifies metadata extraction and has_media helper."""
+        """Verifies metadata extraction and has_media / has_thumbnail helpers."""
         meta = self.mock_backend.metadata
         self.assertTrue(meta.has_media)
+        self.assertTrue(meta.has_thumbnail)
         self.assertEqual(meta.title, "Starboy")
         self.assertEqual(meta.artist, "The Weeknd")
         self.assertEqual(meta.album, "Starboy")
@@ -108,6 +132,7 @@ class TestMediaAdapter(unittest.TestCase):
 
         empty_meta = MediaMetadata()
         self.assertFalse(empty_meta.has_media)
+        self.assertFalse(empty_meta.has_thumbnail)
 
     def test_02_sync_refresh_and_state(self):
         """Synchronous refresh updates and returns cached metadata."""
@@ -145,7 +170,7 @@ class TestMediaAdapter(unittest.TestCase):
 
     @patch("pyautogui.press")
     def test_05_pyautogui_fallback_when_backend_fails(self, mock_press):
-        """When SMTC backend returns False, falls back to pyautogui hardware media key."""
+        """When SMTC backend returns False, falls back to hardware media key."""
         self.mock_backend.play_pause_succeeds = False
 
         res = self.adapter.play_pause()
@@ -180,6 +205,116 @@ class TestMediaAdapter(unittest.TestCase):
         self.adapter.stop()
         self.assertIn("Initial", updates)
         self.assertIn("Second Song", updates)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # New Phase 2 Tests: Seeking, Dominant Color, Artwork, Multi-Session
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def test_08_seek_success(self):
+        """Timeline seeking invokes backend and updates position."""
+        self.adapter.refresh_sync()
+        success = self.adapter.seek(45.5)
+
+        self.assertTrue(success)
+        self.assertEqual(self.mock_backend.seek_calls, 1)
+        self.assertEqual(self.mock_backend.last_seek_pos, 45.5)
+        self.assertEqual(self.adapter.get_current_media().position, 45.5)
+
+    def test_09_seek_app_without_seek_fallback(self):
+        """When SMTC seek returns False, applies optimistic local position fallback."""
+        self.adapter.refresh_sync()
+        self.mock_backend.seek_succeeds = False
+
+        success = self.adapter.seek(120.0)
+        self.assertFalse(success)
+        self.assertEqual(self.mock_backend.seek_calls, 1)
+        # Position is still updated locally as app-without-seek fallback
+        self.assertEqual(self.adapter.get_current_media().position, 120.0)
+
+    def test_10_seek_clamps_to_duration_and_zero(self):
+        """Seeking beyond track bounds clamps to 0 and duration."""
+        self.adapter.refresh_sync()
+
+        # Negative position clamped to 0.0
+        self.adapter.seek(-10.0)
+        self.assertEqual(self.mock_backend.last_seek_pos, 0.0)
+
+        # Over-duration clamped to duration (230.0)
+        self.adapter.seek(9999.0)
+        self.assertEqual(self.mock_backend.last_seek_pos, 230.0)
+
+    def test_11_extract_dominant_color_vibrant(self):
+        """Dominant color extraction extracts vibrant color from album artwork."""
+        # Create an in-memory image with vibrant red (#E61919)
+        img = Image.new("RGB", (64, 64), color=(230, 25, 25))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        raw_bytes = buf.getvalue()
+
+        color = extract_dominant_color(raw_bytes)
+        self.assertEqual(color.upper(), "#E61919")
+
+    def test_12_extract_dominant_color_fallback_and_edge_cases(self):
+        """None, empty, pure black, and pure white fall back cleanly."""
+        default = "#45C1EE"
+        self.assertEqual(extract_dominant_color(None, default), default)
+        self.assertEqual(extract_dominant_color(b"", default), default)
+        self.assertEqual(extract_dominant_color(b"not_an_image", default), default)
+
+        # Pure black (0, 0, 0) is excluded as near-black
+        img_black = Image.new("RGB", (32, 32), color=(0, 0, 0))
+        buf_black = io.BytesIO()
+        img_black.save(buf_black, format="PNG")
+        self.assertEqual(extract_dominant_color(buf_black.getvalue(), default), default)
+
+        # Pure white (255, 255, 255) is excluded as near-white
+        img_white = Image.new("RGB", (32, 32), color=(255, 255, 255))
+        buf_white = io.BytesIO()
+        img_white.save(buf_white, format="PNG")
+        self.assertEqual(extract_dominant_color(buf_white.getvalue(), default), default)
+
+    def test_13_missing_artwork_fallback_generation(self):
+        """generate_fallback_artwork returns valid PNG bytes when artwork is missing."""
+        png_bytes = generate_fallback_artwork("Blinding Lights", "The Weeknd")
+        self.assertTrue(png_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(png_bytes), 100)
+
+        # MediaMetadata get_artwork_bytes fallback integration
+        meta_no_art = MediaMetadata(title="Song", artist="Artist", thumbnail_bytes=None)
+        self.assertIsNone(meta_no_art.get_artwork_bytes(fallback=False))
+        art = meta_no_art.get_artwork_bytes(fallback=True)
+        self.assertIsNotNone(art)
+        self.assertTrue(art.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_14_multi_session_arbitration(self):
+        """_select_active_session prioritizes actively playing session over paused ones."""
+        backend = WinRTSMTCBackend()
+
+        # Mock Session 1: Paused Spotify
+        s1 = MagicMock()
+        info1 = MagicMock()
+        info1.playback_status = STATUS_PAUSED
+        s1.get_playback_info.return_value = info1
+
+        # Mock Session 2: Actively playing Edge / YouTube
+        s2 = MagicMock()
+        info2 = MagicMock()
+        info2.playback_status = STATUS_PLAYING
+        s2.get_playback_info.return_value = info2
+
+        # Mock Manager with both sessions
+        mock_mgr = MagicMock()
+        mock_mgr.get_sessions.return_value = [s1, s2]
+        mock_mgr.get_current_session.return_value = s1  # Windows OS default might still point to s1
+
+        # Multi-session arbitration should pick s2 because it is PLAYING!
+        chosen = backend._select_active_session(mock_mgr)
+        self.assertEqual(chosen, s2)
+
+        # If s2 pauses and s1 stays paused, picks current session
+        info2.playback_status = STATUS_PAUSED
+        chosen_paused = backend._select_active_session(mock_mgr)
+        self.assertIn(chosen_paused, [s1, s2])
 
 
 if __name__ == "__main__":

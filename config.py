@@ -135,6 +135,27 @@ class Config:
     hide_fullscreen: bool = True        # hide island when fullscreen app or game active
     island_size: str = "default"        # "compact", "default", "large"
 
+    # --- dynamic island pages & settings (Phase 1) ---
+    island_pages: list[str] = field(default_factory=lambda: ["media", "calendar", "weather", "hardware", "jarvis"])
+    island_pages_enabled: dict[str, bool] = field(default_factory=lambda: {
+        "media": True,
+        "calendar": True,
+        "weather": True,
+        "hardware": True,
+        "jarvis": True,
+    })
+    island_compact_mode: str = "time_weather"       # "time_weather" or "media_aware"
+    island_time_format: str = "auto"               # "auto", "12h", "24h"
+    island_first_weekday: str = "locale"           # "locale", "sunday", "monday"
+    island_hardware_layout: str = "grid"           # "grid", "strip"
+    island_size_scale: str = "medium"              # "medium", "small", "large"
+    island_shape_style: str = "pill"               # "pill", "notch"
+    island_backdrop_blur: bool = False             # backdrop acrylic/blur
+    island_backdrop_opacity: float = 0.95          # background opacity (0.0 - 1.0)
+    island_pin_open: bool = False                  # suppress auto-collapse when pinned
+    island_expand_trigger: str = "hover"           # "hover", "click", "dwell", "fist", "voice"
+    island_hide_fullscreen: bool = True            # hide island when fullscreen app active
+
     # --- updates ---
     auto_update_check: bool = True      # automatically check for GitHub releases on startup
 
@@ -184,6 +205,26 @@ class Config:
             {"action": "set_volume", "args": {"level": 20}},
         ],
     })
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Returns serializable dictionary of all configuration fields."""
+        result: Dict[str, Any] = {}
+        for f in fields(self):
+            val = getattr(self, f.name)
+            if isinstance(val, (str, int, float, bool, list, dict)) or val is None:
+                result[f.name] = val
+            else:
+                result[f.name] = str(val)
+        return result
+
+    def update(self, **kwargs) -> None:
+        """Dynamically updates configuration fields with safe type coercion."""
+        field_map = {f.name: f for f in fields(self)}
+        for key, value in kwargs.items():
+            if key in field_map:
+                default_val = getattr(self, key)
+                coerced = _coerce_field_value(key, value, default_val)
+                setattr(self, key, coerced)
 
 
 
@@ -412,4 +453,23 @@ def remember_folder_alias(alias: str, folder_path: str, cfg: Optional[Config] = 
     except Exception as exc:
         print(f"[config] remember_folder_alias error: {exc}")
         return False
+
+
+def update_island_settings(cfg: Optional[Config] = None, config_path: Optional[str] = None, **kwargs) -> bool:
+    """
+    Applies live dynamic updates to Dynamic Island settings and atomically persists to disk.
+    Synchronizes live state with IslandPageManager if active.
+    """
+    target_cfg = cfg if cfg is not None else load_config(config_path)
+    target_cfg.update(**kwargs)
+
+    # Live sync with IslandPageManager if available
+    try:
+        from island_manager import get_island_page_manager
+        get_island_page_manager().apply_config(target_cfg)
+    except Exception:
+        pass
+
+    return save_config(target_cfg, path=config_path)
+
 

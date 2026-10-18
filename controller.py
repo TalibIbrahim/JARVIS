@@ -15,6 +15,7 @@ import math
 import sys
 import threading
 import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyautogui
 
@@ -149,6 +150,7 @@ class Controller:
 
         # Dwell clicker engine
         self.dwell = DwellClicker(cfg)
+        self.island_buttons = {}
 
         # Decoupled 120+ Hz cursor update thread
         self._stop_thread = threading.Event()
@@ -306,6 +308,9 @@ class Controller:
 
     def _handle_dwell_action(self, act):
         if act == "click":
+            btn = self.get_island_button_at(self.cur_x, self.cur_y)
+            if btn:
+                self.trigger_island_button(btn)
             pyautogui.click(_pause=False)
         elif act == "double_click":
             pyautogui.doubleClick(_pause=False)
@@ -320,6 +325,190 @@ class Controller:
                 self.button_down = True
         elif act == "scroll":
             self.scroll_mode_active = not self.scroll_mode_active
+
+    def get_island_button_at(self, x: float, y: float) -> Optional[str]:
+        """
+        Hit-tests interactive island buttons at screen coordinate (x, y):
+        Supported buttons: 'prev', 'play_pause', 'next', page dots ('dot_0'..'dot_4'), 'pause_tracking_toggle'.
+        """
+        # 1. Custom registered button rects: name -> (x1, y1, x2, y2)
+        if hasattr(self, "island_buttons") and isinstance(self.island_buttons, dict):
+            for name, rect in self.island_buttons.items():
+                if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                    return name
+
+        # 2. Overlay / Island UI Hit Test
+        if self.overlay and hasattr(self.overlay, "island"):
+            island = self.overlay.island
+            if hasattr(island, "get_island_button_at"):
+                try:
+                    res = island.get_island_button_at(x, y)
+                    if res:
+                        return res
+                except Exception:
+                    pass
+
+            # Map screen (x, y) into local island coordinates
+            try:
+                geom = getattr(island, "geometry", None)
+                if callable(geom):
+                    g = geom()
+                    gx, gy = float(g.x()), float(g.y())
+                    gw, gh = float(g.width()), float(g.height())
+                else:
+                    gx, gy = float(getattr(island, "x", 0)), float(getattr(island, "y", 0))
+                    gw, gh = float(getattr(island, "width", self.sw)), float(getattr(island, "height", 220))
+
+                if gx <= x <= (gx + gw) and gy <= y <= (gy + gh):
+                    local_x = x - gx
+                    local_y = y - gy
+                    from collections import namedtuple
+                    Pt = namedtuple("Pt", ["x", "y"])
+                    pt = Pt(local_x, local_y)
+
+                    if hasattr(island, "_button_at"):
+                        btn = island._button_at(pt)
+                        if btn:
+                            return btn
+
+                    if hasattr(island, "_dot_at"):
+                        dot = island._dot_at(pt)
+                        if dot is not None:
+                            return f"dot_{dot}"
+            except Exception:
+                pass
+
+        # 3. Default Geometry Fallback for Top-Screen Expanded Island
+        # Centered horizontally at top of primary screen (y: 0 to 220)
+        if 0 <= y <= 220:
+            cx = self.sw / 2.0
+            scale = 1.0
+            cy_btn = 136.0 * scale
+            # Prev, Play/Pause, Next
+            if abs(y - cy_btn) <= 28.0 * scale:
+                if abs(x - (cx - 52.0 * scale)) <= 24.0 * scale:
+                    return "prev"
+                if abs(x - cx) <= 26.0 * scale:
+                    return "play_pause"
+                if abs(x - (cx + 52.0 * scale)) <= 24.0 * scale:
+                    return "next"
+
+            # Page dots column (right edge of card: x ~ cx + 179)
+            dot_x = cx + 179.0 * scale
+            if abs(x - dot_x) <= 16.0 * scale and 50.0 * scale <= y <= 160.0 * scale:
+                dot_idx = min(4, max(0, int((y - 50.0 * scale) / (14.0 * scale))))
+                return f"dot_{dot_idx}"
+
+            # Pause tracking toggle: top pill header area
+            if y <= 40.0 * scale and abs(x - (cx + 65.0 * scale)) <= 35.0 * scale:
+                return "pause_tracking_toggle"
+
+        return None
+
+    def trigger_island_button(self, btn: str) -> bool:
+        """
+        Triggers an interactive island button action.
+        Buttons: 'prev', 'play_pause', 'next', page dots ('dot_0'..'dot_4'), 'pause_tracking_toggle'.
+        """
+        if not btn:
+            return False
+
+        # Post event to overlay
+        if self.overlay and hasattr(self.overlay, "post"):
+            try:
+                self.overlay.post("island_button_click", button=btn)
+            except Exception:
+                pass
+
+        # Direct execution on island or media adapter
+        if btn in ("prev", "previous"):
+            if self.overlay and hasattr(self.overlay, "island") and hasattr(self.overlay.island, "media_prev"):
+                try:
+                    self.overlay.island.media_prev()
+                except Exception:
+                    pass
+            else:
+                try:
+                    from media_adapter import get_media_adapter
+                    get_media_adapter().previous_track()
+                except Exception:
+                    pass
+            return True
+
+        elif btn in ("play_pause", "play/pause"):
+            if self.overlay and hasattr(self.overlay, "island") and hasattr(self.overlay.island, "media_toggle_play"):
+                try:
+                    self.overlay.island.media_toggle_play()
+                except Exception:
+                    pass
+            else:
+                try:
+                    from media_adapter import get_media_adapter
+                    get_media_adapter().play_pause()
+                except Exception:
+                    pass
+            return True
+
+        elif btn in ("next",):
+            if self.overlay and hasattr(self.overlay, "island") and hasattr(self.overlay.island, "media_next"):
+                try:
+                    self.overlay.island.media_next()
+                except Exception:
+                    pass
+            else:
+                try:
+                    from media_adapter import get_media_adapter
+                    get_media_adapter().next_track()
+                except Exception:
+                    pass
+            return True
+
+        elif btn.startswith("dot_") or btn in ("page_dots", "page_dot"):
+            dot_idx = 0
+            if btn.startswith("dot_"):
+                try:
+                    dot_idx = int(btn.split("_")[1])
+                except Exception:
+                    dot_idx = 0
+            if self.overlay and hasattr(self.overlay, "island"):
+                island = self.overlay.island
+                if hasattr(island, "expand_card") and hasattr(island, "card_pages"):
+                    pages = island.card_pages
+                    if 0 <= dot_idx < len(pages):
+                        island.expand_card(pages[dot_idx])
+            return True
+
+        elif btn in ("pause_tracking_toggle", "tracking_toggle", "pause tracking toggle"):
+            if hasattr(self, "engine") and hasattr(self.engine, "request_toggle"):
+                self.engine.request_toggle()
+            else:
+                self.active = not self.active
+            if self.overlay and hasattr(self.overlay, "post"):
+                try:
+                    self.overlay.post("toggle_tracking", active=self.active)
+                except Exception:
+                    pass
+            return True
+
+        return False
+
+    def island_page_step(self, direction: int = 1):
+        """Triggers island page step (1 = next, -1 = prev) via overlay."""
+        if self.overlay and hasattr(self.overlay, "post"):
+            try:
+                self.overlay.post("island_page_step", direction=direction)
+            except Exception:
+                pass
+        if self.overlay and hasattr(self.overlay, "island"):
+            island = self.overlay.island
+            if hasattr(island, "expand_card") and hasattr(island, "card_pages"):
+                try:
+                    curr = getattr(island, "expanded_card", "weather") or "weather"
+                    pages = getattr(island, "card_pages", ["media", "time", "weather", "hardware", "jarvis"])
+                    idx = pages.index(curr) if curr in pages else 0
+                    island.expand_card(pages[(idx + direction) % len(pages)])
+                except Exception:
+                    pass
 
     def _get_lookback_position(self, lookback_ms):
         """Returns the cursor position from lookback_ms before now."""
@@ -431,9 +620,15 @@ class Controller:
             lookback_ms = getattr(self.cfg, "cursor_lookback_ms", 200.0)
             lb_x, lb_y = self._get_lookback_position(lookback_ms)
 
+            # Snap cursor to exact pre-click lookback position (0 px pre-click drift invariant)
             self.target_x, self.target_y = lb_x, lb_y
             self.cur_x, self.cur_y = lb_x, lb_y
             self._move(round(lb_x), round(lb_y))
+
+            # Fist-click gesture over interactive island buttons triggers immediate click
+            btn = self.get_island_button_at(lb_x, lb_y)
+            if btn:
+                self.trigger_island_button(btn)
 
             if a.double:
                 pyautogui.doubleClick(_pause=False)
@@ -441,6 +636,9 @@ class Controller:
                 pyautogui.click(_pause=False)
 
             self.pinching = False
+
+        elif k == "island_page_step":
+            self.island_page_step(a.n)
 
         elif k == "right_click":
             pyautogui.rightClick(_pause=False)

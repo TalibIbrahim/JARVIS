@@ -81,6 +81,14 @@ def is_fahrenheit_locale() -> bool:
     return False
 
 
+def degrees_to_wind_arrow(degrees: float) -> str:
+    """Converts wind direction in degrees [0, 360) to a directional compass arrow string."""
+    deg = float(degrees) % 360.0
+    arrows = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"]
+    idx = int((deg + 22.5) // 45) % 8
+    return arrows[idx]
+
+
 @dataclass
 class HourlyForecast:
     time: str
@@ -91,24 +99,53 @@ class HourlyForecast:
 
 @dataclass
 class WeatherData:
-    temperature: float
-    apparent_temperature: float
-    relative_humidity: int
-    precipitation: float
-    wind_speed: float
-    weather_code: int
-    condition: str
-    description: str
-    city: str
-    latitude: float
-    longitude: float
-    is_day: bool
-    unit_symbol: str
-    timestamp: float
+    city: str = "Ahmedabad"
+    temperature: float = 0.0
+    apparent_temperature: float = 0.0
+    relative_humidity: int = 0
+    wind_speed: float = 0.0
+    wind_direction: float = 0.0
+    wind_direction_arrow: str = "↑"
+    condition: str = "sunny"
+    description: str = "Clear"
+    unit_symbol: str = "°C"
+    speed_unit: str = "km/h"
     stale: bool = False
+    attribution: str = "Weather data by Open-Meteo.com"
+    precipitation: float = 0.0
+    weather_code: int = 0
+    latitude: float = 0.0
+    longitude: float = 0.0
+    is_day: bool = True
+    timestamp: float = 0.0
     hourly: List[HourlyForecast] = field(default_factory=list)
     high: float = 0.0
     low: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "city": self.city,
+            "temperature": self.temperature,
+            "apparent_temperature": self.apparent_temperature,
+            "relative_humidity": self.relative_humidity,
+            "wind_speed": self.wind_speed,
+            "wind_direction": self.wind_direction,
+            "wind_direction_arrow": self.wind_direction_arrow,
+            "condition": self.condition,
+            "description": self.description,
+            "unit_symbol": self.unit_symbol,
+            "speed_unit": self.speed_unit,
+            "stale": self.stale,
+            "attribution": self.attribution,
+            "precipitation": self.precipitation,
+            "weather_code": self.weather_code,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "is_day": self.is_day,
+            "timestamp": self.timestamp,
+            "high": self.high,
+            "low": self.low,
+        }
 
 
 def default_http_fetcher(url: str, timeout: float = 6.0) -> Dict[str, Any]:
@@ -275,7 +312,7 @@ class WeatherClient:
         params = {
             "latitude": f"{latitude:.4f}",
             "longitude": f"{longitude:.4f}",
-            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m",
+            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m,wind_direction_10m",
             "hourly": "temperature_2m,weather_code",
             "forecast_hours": 6,
         }
@@ -312,8 +349,27 @@ class WeatherClient:
             precip = float(current.get("precipitation", 0.0))
             w_code = int(current.get("weather_code", 0))
             wind = float(current.get("wind_speed_10m", 0.0))
+            wind_dir = float(current.get("wind_direction_10m", 0.0))
+            wind_arrow = degrees_to_wind_arrow(wind_dir)
+            speed_unit = "mph" if is_f else "km/h"
 
             canonical_cond, desc = canonicalize_condition(w_code, is_day)
+
+            # Resolve city name (user-chosen city from config or "Ahmedabad")
+            resolved_city = city
+            if not resolved_city or str(resolved_city).lower() in ("auto", "my location", "here", "current location"):
+                try:
+                    from config import load_config
+                    cfg = load_config()
+                    cfg_city = getattr(cfg, "weather_city", "") or getattr(cfg, "island_weather_city", "")
+                    if cfg_city and str(cfg_city).lower() not in ("auto", "my location", "here", "current location"):
+                        resolved_city = str(cfg_city)
+                    else:
+                        resolved_city = "Ahmedabad"
+                except Exception:
+                    resolved_city = "Ahmedabad"
+            if not resolved_city or str(resolved_city).lower() in ("auto", "my location", "here", "current location"):
+                resolved_city = "Ahmedabad"
 
             # Hourly trend (6 hours)
             hourly_list: List[HourlyForecast] = []
@@ -335,21 +391,25 @@ class WeatherClient:
             low_temp = min(h_temps_f + [temp]) if h_temps_f else temp
 
             weather_res = WeatherData(
+                city=resolved_city,
                 temperature=temp,
                 apparent_temperature=apparent_temp,
                 relative_humidity=humidity,
-                precipitation=precip,
                 wind_speed=wind,
-                weather_code=w_code,
+                wind_direction=wind_dir,
+                wind_direction_arrow=wind_arrow,
                 condition=canonical_cond,
                 description=desc,
-                city=city or f"{latitude:.2f}, {longitude:.2f}",
+                unit_symbol=unit_sym,
+                speed_unit=speed_unit,
+                stale=False,
+                attribution="Weather data by Open-Meteo.com",
+                precipitation=precip,
+                weather_code=w_code,
                 latitude=latitude,
                 longitude=longitude,
                 is_day=is_day,
-                unit_symbol=unit_sym,
                 timestamp=now,
-                stale=False,
                 hourly=hourly_list,
                 high=high_temp,
                 low=low_temp,

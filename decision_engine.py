@@ -154,13 +154,41 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "who is singing this", "now playing", "tell me the song name", "current track info"
     ],
     "show_widget": [
-        "show media", "show weather", "expand media widget", "expand weather widget",
-        "show the media card", "show the weather card", "display weather on island",
+        "show media", "expand media widget", "expand weather widget",
+        "display weather on island",
         "open media widget", "expand island widget"
     ],
     "toggle_widgets": [
         "hide the island widgets", "hide island widgets", "hide island", "hide widgets",
         "toggle island widgets", "dismiss widgets", "hide island capsule widgets", "hide widgets on island"
+    ],
+    # Dynamic Island Actions (Phase 4)
+    "island_next_page": [
+        "next page", "next card", "island next page", "next island page",
+        "flip card", "cycle card forward", "next island card", "next dashboard page"
+    ],
+    "island_prev_page": [
+        "previous page", "prev page", "last page", "island previous page",
+        "island prev page", "previous card", "prev card", "cycle card backward", "previous island card"
+    ],
+    "island_show_page": [
+        "show hardware", "show calendar", "show jarvis",
+        "show weather card", "show hardware card", "show media card", "show calendar card", "show jarvis card",
+        "open weather card", "open hardware card", "open media card", "open calendar card", "open jarvis card",
+        "show weather page", "show hardware page", "show media page", "show calendar page", "show jarvis page",
+        "switch to weather", "switch to hardware", "switch to media", "switch to calendar", "switch to jarvis"
+    ],
+    "island_toggle_expand": [
+        "expand island", "open island", "collapse island", "close island",
+        "toggle island", "expand card", "collapse card", "toggle expand", "toggle island expand"
+    ],
+    "island_toggle_tracking": [
+        "toggle tracking", "pause tracking", "resume tracking", "toggle hand tracking",
+        "stop tracking", "start tracking", "toggle gesture tracking", "switch tracking"
+    ],
+    "island_set_pin": [
+        "pin island", "unpin island", "pin card", "keep island open",
+        "pin open", "unpin card", "unpin the island", "pin the island"
     ],
     "open_folder": [
         "open folder", "open downloads folder", "open documents folder", "open my documents",
@@ -615,6 +643,17 @@ class SemanticDecisionEngine:
             m = _RE_REMEMBER_FOLDER.search(clean)
             if m:
                 args["alias"] = m.group(1).strip()
+        elif action == "show_widget":
+            args["widget"] = "media" if ("media" in clean or "music" in clean) else "weather"
+        elif action == "island_show_page":
+            page = "jarvis"
+            for p in ("weather", "hardware", "media", "calendar", "jarvis"):
+                if p in clean:
+                    page = p
+                    break
+            args["page"] = page
+        elif action == "island_set_pin":
+            args["pinned"] = not ("unpin" in clean or "don't pin" in clean or "do not pin" in clean)
         return DecisionMatch(intent=action, confidence=conf, args=args)
 
     def get_top_candidates(self, user_text: str, top_k: int = 3, min_score: float = 0.18) -> List[Tuple[str, float]]:
@@ -709,6 +748,15 @@ def _extract_args_for_action(action: str, clean: str) -> Dict[str, Any]:
         args["confirmed"] = "confirm" in clean
     elif action == "close_window":
         args["confirm"] = "confirm" in clean or "force" in clean
+    elif action == "island_show_page":
+        page = "jarvis"
+        for p in ("weather", "hardware", "media", "calendar", "jarvis"):
+            if p in clean:
+                page = p
+                break
+        args["page"] = page
+    elif action == "island_set_pin":
+        args["pinned"] = not ("unpin" in clean or "don't pin" in clean or "do not pin" in clean)
     return args
 
 
@@ -770,7 +818,15 @@ def _get_action_label(action: str, args: Dict[str, Any]) -> str:
         "analyze_screen": "Analyzing Screen",
         "world_time": "World Time",
         "quick_answer": "Quick Answer",
+        "island_next_page": "Next Island Page",
+        "island_prev_page": "Previous Island Page",
+        "island_show_page": "Show Island Page",
+        "island_toggle_expand": "Toggle Island Expand",
+        "island_toggle_tracking": "Toggle Hand Tracking",
+        "island_set_pin": "Pin Dynamic Island",
     }
+    if action == "island_show_page" and "page" in args:
+        return f"Show {args['page'].title()} Page"
     if action == "start_routine" and "routine" in args:
         return f"Start {args['routine'].title()}"
     if action == "quick_note" and "text" in args:
@@ -1025,6 +1081,13 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
             reply = "No media is currently active or playing, sir."
     elif action == "show_widget":
         widget = "media" if ("media" in clean or "music" in clean) else "weather"
+        try:
+            from island_manager import get_island_page_manager
+            mgr = get_island_page_manager()
+            mgr.set_active_page(widget)
+            mgr.expand()
+        except Exception:
+            pass
         if ctx and hasattr(ctx, "overlay") and ctx.overlay:
             try:
                 ctx.overlay.post("expand_widget", widget=widget)
@@ -1039,6 +1102,26 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
             except Exception:
                 pass
         reply = "Toggling Dynamic Island widgets, sir."
+    elif action == "island_next_page":
+        reply = "Navigating to the next page, sir."
+    elif action == "island_prev_page":
+        reply = "Navigating to the previous page, sir."
+    elif action == "island_show_page":
+        page = "jarvis"
+        for p in ("weather", "hardware", "media", "calendar", "jarvis"):
+            if p in clean:
+                page = p
+                break
+        args = {"page": page}
+        reply = f"Displaying {page.title()} page on the Dynamic Island, sir."
+    elif action == "island_toggle_expand":
+        reply = "Toggling Dynamic Island expansion, sir."
+    elif action == "island_toggle_tracking":
+        reply = "Toggling hand tracking, sir."
+    elif action == "island_set_pin":
+        pinned = not ("unpin" in clean or "don't pin" in clean or "do not pin" in clean)
+        args = {"pinned": pinned}
+        reply = f"Dynamic Island {'pinned open' if pinned else 'unpinned'}, sir."
     elif action == "show_desktop":
         reply = "Displaying the desktop, sir."
     elif action == "lock_workstation":

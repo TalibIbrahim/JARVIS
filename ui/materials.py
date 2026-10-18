@@ -193,13 +193,20 @@ def apply_mica(hwnd: int, dark: bool = True) -> bool:
     return ok
 
 
-def apply_acrylic(hwnd: int, dark: bool = True) -> bool:
+def is_transparency_available() -> bool:
+    """Check if Windows transparency effects are enabled and platform supports it."""
+    return _transparency_enabled() if sys.platform == "win32" else False
+
+
+def apply_acrylic(hwnd: int, dark: bool = True, opacity: float = 1.0) -> bool:
     """
     Apply Windows 11 Acrylic material (DWMWA_SYSTEMBACKDROP_TYPE = 3).
     Falls back to Windows 10 SetWindowCompositionAttribute approach.
+    Supports opacity slider scaling (0.0 - 1.0).
     Returns True if native backdrop was applied.
     """
     build = _build_number()
+    clamped_op = max(0.0, min(1.0, float(opacity)))
 
     if build >= 22621 and _transparency_enabled():
         set_dark_titlebar(hwnd, dark)
@@ -227,7 +234,9 @@ def apply_acrylic(hwnd: int, dark: bool = True) -> bool:
         user32 = ctypes.windll.user32
         fn = getattr(user32, "SetWindowCompositionAttribute", None)
         if fn:
-            tint = 0x88202022 if dark else 0x88F2F2F2
+            alpha = int(clamped_op * (0x88 if dark else 0x99))
+            rgb = 0x202022 if dark else 0xF2F2F2
+            tint = (alpha << 24) | rgb
             accent = AccentPolicy(4, 2, tint, 0)
             data = WCA_DATA(
                 19,
@@ -246,6 +255,7 @@ def apply_best_backdrop(
     hwnd: int,
     dark: bool = True,
     prefer_mica: bool = False,
+    opacity: float = 1.0,
 ) -> str:
     """
     Apply the best available backdrop for the given HWND.
@@ -253,11 +263,39 @@ def apply_best_backdrop(
     """
     if prefer_mica and apply_mica(hwnd, dark):
         return "mica"
-    if apply_acrylic(hwnd, dark):
+    if apply_acrylic(hwnd, dark, opacity=opacity):
         return "acrylic"
     # Solid tinted fallback
     set_dark_titlebar(hwnd, dark)
     return "solid"
+
+
+def set_interactive(hwnd: int, interactive: bool) -> None:
+    """
+    Focus-safe extended window style manager.
+    Dynamically toggles WS_EX_TRANSPARENT while strictly preserving
+    WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOOLWINDOW.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        GWL_EXSTYLE       = -20
+        WS_EX_LAYERED     = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        WS_EX_NOACTIVATE  = 0x08000000
+        WS_EX_TOOLWINDOW  = 0x00000080
+
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if interactive:
+            new_style = (style & ~WS_EX_TRANSPARENT) | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        else:
+            new_style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+
+        if new_style != style:
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+    except Exception as exc:
+        print(f"[materials] set_interactive error: {exc}")
 
 
 def make_click_through(hwnd: int) -> None:
@@ -266,21 +304,7 @@ def make_click_through(hwnd: int) -> None:
     WS_EX_TOOLWINDOW on an overlay window so clicks pass through.
     Preserves existing extended styles.
     """
-    if sys.platform != "win32":
-        return
-    try:
-        user32 = ctypes.windll.user32
-        GWL_EXSTYLE = -20
-        WS_EX_LAYERED     = 0x00080000
-        WS_EX_TRANSPARENT = 0x00000020
-        WS_EX_NOACTIVATE  = 0x08000000
-        WS_EX_TOOLWINDOW  = 0x00000080
-
-        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-    except Exception as exc:
-        print(f"[materials] click-through error: {exc}")
+    set_interactive(hwnd, False)
 
 
 def make_snap_layouts_compatible(hwnd: int) -> None:
@@ -301,12 +325,13 @@ def make_snap_layouts_compatible(hwnd: int) -> None:
         pass
 
 
-def solid_tint_stylesheet(dark: bool) -> str:
+def solid_tint_stylesheet(dark: bool, opacity: float = 1.0) -> str:
     """
     Return a QWidget stylesheet for a solid tinted fallback background
     (used when transparency is off or on Windows 10 without blur support).
     """
     if dark:
-        return "background-color: #1A1A1E;"
+        alpha = int(max(0.0, min(1.0, float(opacity))) * 255)
+        return f"background-color: rgba(19, 22, 23, {alpha / 255.0:.2f});"
     else:
         return "background-color: #F2F2F7;"

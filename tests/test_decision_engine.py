@@ -144,6 +144,50 @@ class TestDecisionEngineCore(unittest.TestCase):
             reply = evaluate_decision(q, ctx)
             self.assertIsNone(reply, f"Knowledge query '{q}' incorrectly intercepted by local reflex: {reply}")
 
+    def test_dynamic_island_intents(self):
+        """Verifies Dynamic Island voice commands and parameter extraction."""
+        # Next / Prev
+        res_next = self.engine.classify("next page")
+        self.assertEqual(res_next.intent, "island_next_page")
+
+        res_prev = self.engine.classify("previous page")
+        self.assertEqual(res_prev.intent, "island_prev_page")
+
+        # Show page
+        res_hw = self.engine.classify("show hardware")
+        self.assertEqual(res_hw.intent, "island_show_page")
+        self.assertEqual(res_hw.args.get("page"), "hardware")
+
+        res_cal = self.engine.classify("show calendar")
+        self.assertEqual(res_cal.intent, "island_show_page")
+        self.assertEqual(res_cal.args.get("page"), "calendar")
+
+        res_media_card = self.engine.classify("show media card")
+        self.assertEqual(res_media_card.intent, "island_show_page")
+        self.assertEqual(res_media_card.args.get("page"), "media")
+
+        # Show widget retains 'show media'
+        res_media = self.engine.classify("show media")
+        self.assertEqual(res_media.intent, "show_widget")
+        self.assertEqual(res_media.args.get("widget"), "media")
+
+        # Expand / Collapse toggle
+        res_exp = self.engine.classify("expand island")
+        self.assertEqual(res_exp.intent, "island_toggle_expand")
+
+        # Tracking toggle
+        res_track = self.engine.classify("toggle tracking")
+        self.assertEqual(res_track.intent, "island_toggle_tracking")
+
+        # Pin / Unpin
+        res_pin = self.engine.classify("pin island")
+        self.assertEqual(res_pin.intent, "island_set_pin")
+        self.assertTrue(res_pin.args.get("pinned"))
+
+        res_unpin = self.engine.classify("unpin island")
+        self.assertEqual(res_unpin.intent, "island_set_pin")
+        self.assertFalse(res_unpin.args.get("pinned"))
+
 
 class TestDecisionEngineExecution(unittest.TestCase):
     """Tests executing actions through evaluate_decision and run_command."""
@@ -183,6 +227,91 @@ class TestDecisionEngineExecution(unittest.TestCase):
             reply = run_command("crank up the audio", self.ctx)
             # Without API key and with decision engine disabled, returns standard unhandled reply
             self.assertEqual(reply, "I didn't catch a command for that, sir.")
+
+    def test_dynamic_island_execution(self):
+        """Tests executing Dynamic Island actions through evaluate_decision."""
+        from island_manager import IslandPageManager, IslandPage, set_island_page_manager
+        mock_mgr = IslandPageManager()
+        set_island_page_manager(mock_mgr)
+
+        # Island next page
+        reply = evaluate_decision("next page", self.ctx)
+        self.assertIsNotNone(reply)
+        self.assertIn("Navigating to the next page", reply)
+        self.assertEqual(mock_mgr.active_page, IslandPage.CALENDAR)
+
+        # Island prev page
+        reply = evaluate_decision("previous page", self.ctx)
+        self.assertIsNotNone(reply)
+        self.assertIn("Navigating to the previous page", reply)
+        self.assertEqual(mock_mgr.active_page, IslandPage.MEDIA)
+
+        # Island show page
+        reply = evaluate_decision("show calendar", self.ctx)
+        self.assertIsNotNone(reply)
+        self.assertIn("Displaying Calendar page", reply)
+        self.assertEqual(mock_mgr.active_page, IslandPage.CALENDAR)
+
+        # Show widget also synchronizes active island page
+        reply_sw = evaluate_decision("show media", self.ctx)
+        self.assertIsNotNone(reply_sw)
+        self.assertIn("Displaying media widget", reply_sw)
+        self.assertEqual(mock_mgr.active_page, IslandPage.MEDIA)
+
+        # Island toggle expand
+        mock_mgr.collapse()
+        self.assertFalse(mock_mgr.is_expanded)
+        reply = evaluate_decision("expand island", self.ctx)
+        self.assertIsNotNone(reply)
+        self.assertTrue(mock_mgr.is_expanded)
+
+        # Island toggle tracking
+        self.assertTrue(mock_mgr.tracking_enabled)
+        reply = evaluate_decision("toggle tracking", self.ctx)
+        self.assertIsNotNone(reply)
+        self.assertFalse(mock_mgr.tracking_enabled)
+
+        # Island pin / unpin
+        self.assertFalse(mock_mgr.pin_open)
+        reply = evaluate_decision("pin island", self.ctx)
+        self.assertIsNotNone(reply)
+        self.assertTrue(mock_mgr.pin_open)
+
+        reply = evaluate_decision("unpin island", self.ctx)
+        self.assertIsNotNone(reply)
+        self.assertFalse(mock_mgr.pin_open)
+
+    def test_dynamic_island_whitelisted_actions(self):
+        """Tests direct execute_whitelisted_action for Dynamic Island actions."""
+        from ai import execute_whitelisted_action
+        from island_manager import IslandPageManager, IslandPage, set_island_page_manager
+        mock_mgr = IslandPageManager()
+        set_island_page_manager(mock_mgr)
+
+        ok, msg = execute_whitelisted_action("island_next_page", {}, self.ctx)
+        self.assertTrue(ok)
+        self.assertIn("calendar", msg)
+
+        ok, msg = execute_whitelisted_action("island_prev_page", {}, self.ctx)
+        self.assertTrue(ok)
+        self.assertIn("media", msg)
+
+        ok, msg = execute_whitelisted_action("island_show_page", {"page": "calendar"}, self.ctx)
+        self.assertTrue(ok)
+        self.assertIn("calendar", msg)
+        self.assertEqual(mock_mgr.active_page, IslandPage.CALENDAR)
+
+        ok, msg = execute_whitelisted_action("island_toggle_expand", {}, self.ctx)
+        self.assertTrue(ok)
+        self.assertTrue(mock_mgr.is_expanded)
+
+        ok, msg = execute_whitelisted_action("island_toggle_tracking", {}, self.ctx)
+        self.assertTrue(ok)
+        self.assertFalse(mock_mgr.tracking_enabled)
+
+        ok, msg = execute_whitelisted_action("island_set_pin", {"pinned": True}, self.ctx)
+        self.assertTrue(ok)
+        self.assertTrue(mock_mgr.pin_open)
 
 
 class TestVoiceProfileVerification(unittest.TestCase):

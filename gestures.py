@@ -150,6 +150,15 @@ class GestureEngine:
         """Thread-safe toggle of active state."""
         self._req = "toggle"
 
+    def island_page_step(self, direction: int = 1) -> Action:
+        """Triggers island page step (1 = next, -1 = prev) via overlay and returns Action."""
+        if self.overlay and hasattr(self.overlay, "post"):
+            try:
+                self.overlay.post("island_page_step", direction=direction)
+            except Exception:
+                pass
+        return Action("island_page_step", n=direction)
+
     def status(self, now):
         if now < self._flash_until:
             label = self._flash
@@ -555,41 +564,66 @@ class GestureEngine:
             self._flash_label("SWITCH WINDOW", now)
             return True
 
-        # 2. Vertical slide: slide up (volume +5%), slide down (volume -5%)
+        # 2. Vertical slide / swipe:
+        # - Top-screen/island area: swipe down -> next page (1), swipe up -> prev page (-1)
+        # - General area: slide up -> volume +5%, slide down -> volume -5%
         # In screen coordinates, moving hand UP means hy decreases (dy < 0), DOWN means hy increases (dy > 0)
         slide_thresh = getattr(cfg, "slide_threshold", 0.06)
         if (
-            getattr(cfg, "gesture_slide_volume", True)
-            and abs(dy) >= slide_thresh
+            abs(dy) >= slide_thresh
             and abs(dy) > 1.35 * max(abs(dx), 1e-4)
             and now >= getattr(self, "_slide_cooldown_until", 0.0)
         ):
-            self._slide_cooldown_until = now + 0.28
-            self._stroke_start = (hx, hy, now)
+            # Check if hand/cursor is in top-screen / island area
+            is_top_area = (
+                hy <= 0.38
+                or sy <= 0.38
+                or getattr(self, "in_island_area", False)
+                or (hasattr(self, "cursor_y") and self.cursor_y is not None and self.cursor_y < 250)
+            )
 
-            delta = 5 if dy < 0 else -5
-            level = 50
+            if is_top_area:
+                self._slide_cooldown_until = now + 0.35
+                self._stroke_start = (hx, hy, now)
+                direction = 1 if dy > 0 else -1  # Swipe down (dy > 0) -> next page (1), Swipe up (dy < 0) -> prev page (-1)
 
-            try:
-                import system_control
-                if delta > 0:
-                    level = system_control.volume_up(steps=abs(delta))
-                else:
-                    level = system_control.volume_down(steps=abs(delta))
-            except Exception:
-                level = max(0, min(100, 50 + delta))
+                if self.overlay and hasattr(self.overlay, "post"):
+                    try:
+                        self.overlay.post("island_page_step", direction=direction)
+                    except Exception:
+                        pass
+                actions.append(Action("island_page_step", n=direction, dy=dy))
+                lbl = "ISLAND NEXT" if direction > 0 else "ISLAND PREV"
+                self._flash_label(lbl, now)
+                return True
 
-            if self.overlay and hasattr(self.overlay, "post"):
+            if getattr(cfg, "gesture_slide_volume", True):
+                self._slide_cooldown_until = now + 0.28
+                self._stroke_start = (hx, hy, now)
+
+                delta = 5 if dy < 0 else -5
+                level = 50
+
                 try:
-                    self.overlay.post("hud_volume", level=level, delta=delta)
+                    import system_control
+                    if delta > 0:
+                        level = system_control.volume_up(steps=abs(delta))
+                    else:
+                        level = system_control.volume_down(steps=abs(delta))
                 except Exception:
-                    pass
+                    level = max(0, min(100, 50 + delta))
 
-            act_kind = "volume_up" if delta > 0 else "volume_down"
-            actions.append(Action(act_kind, dy=dy, n=delta))
-            lbl = "VOLUME +5%" if delta > 0 else "VOLUME -5%"
-            self._flash_label(lbl, now)
-            return True
+                if self.overlay and hasattr(self.overlay, "post"):
+                    try:
+                        self.overlay.post("hud_volume", level=level, delta=delta)
+                    except Exception:
+                        pass
+
+                act_kind = "volume_up" if delta > 0 else "volume_down"
+                actions.append(Action(act_kind, dy=dy, n=delta))
+                lbl = "VOLUME +5%" if delta > 0 else "VOLUME -5%"
+                self._flash_label(lbl, now)
+                return True
 
         return False
 

@@ -53,6 +53,7 @@ class MockFetcher:
                 "precipitation": 0.0,
                 "weather_code": 2,
                 "wind_speed_10m": 12.5,
+                "wind_direction_10m": 180.0,
             },
             "hourly": {
                 "time": ["2026-10-17T12:00", "2026-10-17T13:00"],
@@ -122,23 +123,30 @@ class TestWeatherClient(unittest.TestCase):
         self.assertEqual(len(self.fetcher.calls), 1)
 
     def test_03_forecast_parsing_celsius(self):
-        """Fetches and parses current conditions in Celsius."""
+        """Fetches and parses current conditions in Celsius with extended fields."""
         data = self.client.get_weather(51.5085, -0.1257, city="London", units="celsius")
         self.assertIsNotNone(data)
         self.assertAlmostEqual(data.temperature, 15.2)
         self.assertAlmostEqual(data.apparent_temperature, 14.1)
         self.assertEqual(data.relative_humidity, 72)
+        self.assertAlmostEqual(data.wind_speed, 12.5)
+        self.assertAlmostEqual(data.wind_direction, 180.0)
+        self.assertEqual(data.wind_direction_arrow, "↓")
+        self.assertEqual(data.speed_unit, "km/h")
+        self.assertEqual(data.attribution, "Weather data by Open-Meteo.com")
         self.assertEqual(data.condition, "cloudy")
         self.assertEqual(data.unit_symbol, "°C")
         self.assertFalse(data.stale)
         self.assertEqual(len(data.hourly), 2)
 
     def test_04_forecast_parsing_fahrenheit(self):
-        """Units fahrenheit requests imperial parameters and uses °F symbol."""
+        """Units fahrenheit requests imperial parameters and uses °F symbol and mph."""
         data = self.client.get_weather(40.7128, -74.0060, city="New York", units="fahrenheit")
         self.assertIsNotNone(data)
         self.assertEqual(data.unit_symbol, "°F")
+        self.assertEqual(data.speed_unit, "mph")
         self.assertIn("temperature_unit=fahrenheit", self.fetcher.calls[-1])
+        self.assertIn("wind_direction_10m", self.fetcher.calls[-1])
 
     def test_05_cache_hit_within_20_minutes(self):
         """Requests within 20 minutes reuse cached forecast."""
@@ -208,6 +216,45 @@ class TestWeatherClient(unittest.TestCase):
         w = self.client.get_weather_for_city("auto")
         self.assertIsNotNone(w)
         self.assertIn("Lahore", w.city)
+
+    def test_09_default_city_ahmedabad_and_wind_arrows(self):
+        """When city is unspecified or empty, defaults to Ahmedabad, and arrows map correctly."""
+        from weather_client import degrees_to_wind_arrow
+
+        # Direction test
+        self.assertEqual(degrees_to_wind_arrow(0.0), "↑")
+        self.assertEqual(degrees_to_wind_arrow(90.0), "→")
+        self.assertEqual(degrees_to_wind_arrow(180.0), "↓")
+        self.assertEqual(degrees_to_wind_arrow(270.0), "←")
+
+        # Unspecified city defaults to Ahmedabad (or config city)
+        self.clock_val = 5000.0
+        data = self.client.get_weather(23.0225, 72.5714, city="")
+        self.assertIsNotNone(data)
+        self.assertIn(data.city, ("Ahmedabad", "New York"))
+        self.assertEqual(data.attribution, "Weather data by Open-Meteo.com")
+
+    def test_10_weather_data_to_dict(self):
+        """WeatherData.to_dict() provides serializable dictionary."""
+        w = WeatherData(
+            city="Ahmedabad",
+            temperature=32.5,
+            apparent_temperature=34.0,
+            relative_humidity=55,
+            wind_speed=8.5,
+            wind_direction=90.0,
+            wind_direction_arrow="→",
+            condition="sunny",
+            description="Clear sky",
+            unit_symbol="°C",
+            speed_unit="km/h",
+        )
+        d = w.to_dict()
+        self.assertIsInstance(d, dict)
+        self.assertEqual(d["city"], "Ahmedabad")
+        self.assertEqual(d["apparent_temperature"], 34.0)
+        self.assertEqual(d["wind_direction_arrow"], "→")
+        self.assertEqual(d["attribution"], "Weather data by Open-Meteo.com")
 
 
 if __name__ == "__main__":

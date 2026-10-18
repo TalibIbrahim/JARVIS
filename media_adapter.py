@@ -5,12 +5,14 @@ Connects to Windows SMTC using winrt-Windows.Media.Control to track and control
 active media sessions (Spotify, YouTube in Chrome/Edge, Apple Music, VLC, etc.).
 
 Features:
-  - Thread-safe background polling and listener.
+  - Multi-session handling (prioritizes active playing session, handles switching).
   - Retrieves rich metadata: Title, Artist, Album, Position, Duration, Playback Status,
     Source App ID, and Thumbnail stream bytes.
-  - Playback commands with debouncing: play_pause(), next_track(), previous_track().
-  - Graceful fallback to hardware media key events (pyautogui) when SMTC commands
-    are unsupported or unavailable.
+  - Dominant vibrant color extraction from album artwork using Pillow.
+  - Missing artwork fallback generator.
+  - Seeking with app-without-seek fallback.
+  - Playback commands with debouncing: play_pause(), next_track(), previous_track(), seek().
+  - Media-key fallback (pyautogui & Win32 keybd_event) when SMTC commands fail.
   - 100% unit-testable with mock backends; strictly NO Qt imports.
 """
 
@@ -18,10 +20,18 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import io
 import sys
 import threading
 import time
-from typing import Any, Callable, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+
+# Try to import PIL for dominant color extraction and artwork generation
+try:
+    from PIL import Image, ImageDraw
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 
 # SMTC Playback Status constants (from Windows.Media.Control.GlobalSystemMediaTransportControlsSessionPlaybackStatus)
@@ -34,6 +44,120 @@ STATUS_PAUSED = 5
 
 DEFAULT_DEBOUNCE_SEC = 0.25
 DEFAULT_POLL_INTERVAL_SEC = 1.0
+DEFAULT_ACCENT_COLOR = "#45C1EE"
+
+# Minimal 1x1 PNG fallback byte string
+_MINIMAL_FALLBACK_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00"
+    b"\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q"
+    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def extract_dominant_color(
+    thumbnail_bytes: Optional[bytes],
+    default_hex: str = DEFAULT_ACCENT_COLOR,
+) -> str:
+    """
+    Pure Python / Pillow dominant vibrant color extractor returning a hex string.
+    Filters out near-black (lum < 28) and near-white (lum > 235 or max rgb > 230).
+    Favors vibrant, saturated colors; falls back to default_hex if no candidates exist.
+    """
+    if not thumbnail_bytes or not _PIL_AVAILABLE:
+        return default_hex
+
+    try:
+        im = Image.open(io.BytesIO(thumbnail_bytes)).convert("RGB")
+        im.thumbnail((48, 48))
+        colors = im.getcolors(maxcolors=48 * 48)
+        if not colors:
+            return default_hex
+
+        best_color: Optional[Tuple[int, int, int]] = None
+        best_score = -1.0
+
+        for count, (r, g, b) in colors:
+            # Luminance calculation (ITU-R BT.601)
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+
+            # Exclude near-black
+            if lum < 28.0:
+                continue
+
+            # Exclude near-white
+            if lum > 235.0 or (r > 230 and g > 230 and b > 230):
+                continue
+
+            max_c = max(r, g, b)
+            min_c = min(r, g, b)
+            if max_c == 0:
+                continue
+
+            # Saturation in [0.0, 1.0]
+            sat = (max_c - min_c) / max_c
+
+            # Favor saturated colors with balanced luminance
+            lum_weight = 1.0 - abs(lum - 128.0) / 128.0
+            score = count * (sat ** 1.3) * lum_weight
+
+            if score > best_score:
+                best_score = score
+                best_color = (r, g, b)
+
+        if best_color is None:
+            # Fallback to most frequent non-extreme color
+            sorted_colors = sorted(colors, key=lambda c: c[0], reverse=True)
+            for count, (r, g, b) in sorted_colors:
+                lum = 0.299 * r + 0.587 * g + 0.114 * b
+                if 25.0 <= lum <= 235.0:
+                    best_color = (r, g, b)
+                    break
+
+        if best_color is not None:
+            return f"#{best_color[0]:02X}{best_color[1]:02X}{best_color[2]:02X}"
+
+    except Exception:
+        pass
+
+    return default_hex
+
+
+def generate_fallback_artwork(
+    title: str = "",
+    artist: str = "",
+    size: int = 128,
+) -> bytes:
+    """
+    Generates a minimalist placeholder album art PNG bytes when official thumbnail is missing.
+    """
+    if not _PIL_AVAILABLE:
+        return _MINIMAL_FALLBACK_PNG
+
+    try:
+        im = Image.new("RGBA", (size, size), (26, 28, 34, 255))
+        draw = ImageDraw.Draw(im)
+
+        # Subtle disc
+        margin = size // 6
+        draw.ellipse([margin, margin, size - margin, size - margin], fill=(45, 50, 62, 255))
+
+        # Musical note glyph
+        center_x = size // 2
+        center_y = size // 2
+        r = size // 9
+
+        # Note heads and stems
+        draw.ellipse([center_x - r * 2, center_y + r // 2, center_x - r, center_y + r * 2], fill=(120, 135, 165, 255))
+        draw.ellipse([center_x, center_y + r // 2, center_x + r, center_y + r * 2], fill=(120, 135, 165, 255))
+        draw.rectangle([center_x - r, center_y - r * 2, center_x - r + 3, center_y + r], fill=(120, 135, 165, 255))
+        draw.rectangle([center_x + r, center_y - r * 2, center_x + r + 3, center_y + r], fill=(120, 135, 165, 255))
+        draw.rectangle([center_x - r, center_y - r * 2, center_x + r + 3, center_y - r * 2 + 5], fill=(120, 135, 165, 255))
+
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return _MINIMAL_FALLBACK_PNG
 
 
 @dataclass
@@ -47,12 +171,33 @@ class MediaMetadata:
     is_playing: bool = False
     source_app_id: str = ""
     thumbnail_bytes: Optional[bytes] = None
+    dominant_color: Optional[str] = None
     last_updated: float = 0.0
     last_playback_change: float = 0.0
 
     @property
     def has_media(self) -> bool:
         return bool(self.title or self.artist)
+
+    @property
+    def has_thumbnail(self) -> bool:
+        return bool(self.thumbnail_bytes)
+
+    def get_dominant_color(self, default_hex: str = DEFAULT_ACCENT_COLOR) -> str:
+        """Returns cached or extracted vibrant dominant color hex string."""
+        if self.dominant_color:
+            return self.dominant_color
+        color = extract_dominant_color(self.thumbnail_bytes, default_hex)
+        self.dominant_color = color
+        return color
+
+    def get_artwork_bytes(self, fallback: bool = True) -> Optional[bytes]:
+        """Returns album artwork thumbnail bytes, or generated fallback if missing."""
+        if self.thumbnail_bytes:
+            return self.thumbnail_bytes
+        if fallback:
+            return generate_fallback_artwork(self.title, self.artist)
+        return None
 
 
 class SMTCBackendProtocol(Protocol):
@@ -76,6 +221,9 @@ class SMTCBackendProtocol(Protocol):
     async def pause(self) -> bool:
         ...
 
+    async def seek(self, position_seconds: float) -> bool:
+        ...
+
     def is_available(self) -> bool:
         ...
 
@@ -86,11 +234,13 @@ class SMTCBackendProtocol(Protocol):
 class WinRTSMTCBackend:
     """
     Native Windows SMTC implementation using WinRT.
+    Supports multi-session arbitration (prioritizes active playing sessions).
     """
 
     def __init__(self):
         self._manager = None
         self._available = False
+        self._active_session = None
         self._check_availability()
 
     def _check_availability(self):
@@ -119,13 +269,78 @@ class WinRTSMTCBackend:
                 return None
         return self._manager
 
+    def _select_active_session(self, mgr) -> Any:
+        """
+        Multi-session arbitration:
+        1. Query all active media sessions from the manager.
+        2. Prioritize sessions that are actively PLAYING.
+        3. If none playing, prioritize PAUSED sessions.
+        4. Fall back to mgr.get_current_session().
+        """
+        if not mgr:
+            return None
+
+        current_session = None
+        try:
+            current_session = mgr.get_current_session()
+        except Exception:
+            pass
+
+        sessions: List[Any] = []
+        try:
+            raw_sessions = mgr.get_sessions()
+            if raw_sessions:
+                sessions = list(raw_sessions)
+        except Exception:
+            sessions = []
+
+        if not sessions:
+            self._active_session = current_session
+            return current_session
+
+        playing_sessions: List[Any] = []
+        paused_sessions: List[Any] = []
+
+        for s in sessions:
+            try:
+                info = s.get_playback_info()
+                if info:
+                    st = int(getattr(info, "playback_status", STATUS_STOPPED))
+                    if st == STATUS_PLAYING:
+                        playing_sessions.append(s)
+                    elif st == STATUS_PAUSED:
+                        paused_sessions.append(s)
+            except Exception:
+                continue
+
+        # 1. Prioritize actively playing session
+        if playing_sessions:
+            if current_session in playing_sessions:
+                chosen = current_session
+            else:
+                chosen = playing_sessions[0]
+            self._active_session = chosen
+            return chosen
+
+        # 2. Prioritize paused session
+        if paused_sessions:
+            if current_session in paused_sessions:
+                chosen = current_session
+            else:
+                chosen = paused_sessions[0]
+            self._active_session = chosen
+            return chosen
+
+        self._active_session = current_session
+        return current_session
+
     async def get_current_metadata(self) -> Optional[MediaMetadata]:
         mgr = await self._ensure_manager()
         if not mgr:
             return None
 
         try:
-            session = mgr.get_current_session()
+            session = self._select_active_session(mgr)
             if not session:
                 return None
 
@@ -193,7 +408,7 @@ class WinRTSMTCBackend:
                 pass
 
             now = time.time()
-            return MediaMetadata(
+            meta = MediaMetadata(
                 title=title,
                 artist=artist,
                 album=album,
@@ -206,6 +421,11 @@ class WinRTSMTCBackend:
                 last_updated=now,
                 last_playback_change=now,
             )
+            # Pre-extract dominant color if thumbnail is present
+            if thumbnail_bytes:
+                meta.get_dominant_color()
+
+            return meta
 
         except Exception as exc:
             print(f"[media_adapter] SMTC fetch error: {exc}")
@@ -216,7 +436,7 @@ class WinRTSMTCBackend:
         if not mgr:
             return False
         try:
-            session = mgr.get_current_session()
+            session = self._active_session or self._select_active_session(mgr)
             if session:
                 res = await session.try_toggle_play_pause_async()
                 return bool(res)
@@ -229,7 +449,7 @@ class WinRTSMTCBackend:
         if not mgr:
             return False
         try:
-            session = mgr.get_current_session()
+            session = self._active_session or self._select_active_session(mgr)
             if session:
                 res = await session.try_skip_next_async()
                 return bool(res)
@@ -242,7 +462,7 @@ class WinRTSMTCBackend:
         if not mgr:
             return False
         try:
-            session = mgr.get_current_session()
+            session = self._active_session or self._select_active_session(mgr)
             if session:
                 res = await session.try_skip_previous_async()
                 return bool(res)
@@ -255,7 +475,7 @@ class WinRTSMTCBackend:
         if not mgr:
             return False
         try:
-            session = mgr.get_current_session()
+            session = self._active_session or self._select_active_session(mgr)
             if session:
                 res = await session.try_play_async()
                 return bool(res)
@@ -268,7 +488,7 @@ class WinRTSMTCBackend:
         if not mgr:
             return False
         try:
-            session = mgr.get_current_session()
+            session = self._active_session or self._select_active_session(mgr)
             if session:
                 res = await session.try_pause_async()
                 return bool(res)
@@ -276,8 +496,29 @@ class WinRTSMTCBackend:
             pass
         return False
 
+    async def seek(self, position_seconds: float) -> bool:
+        mgr = await self._ensure_manager()
+        if not mgr:
+            return False
+        try:
+            session = self._active_session or self._select_active_session(mgr)
+            if session:
+                # Check if position change is supported
+                info = session.get_playback_info()
+                if info and hasattr(info, "controls") and info.controls:
+                    if not getattr(info.controls, "is_playback_position_enabled", True):
+                        return False
+                # Convert seconds to 100-nanosecond units (1s = 10,000,000 hns)
+                hns = int(max(0.0, position_seconds) * 10_000_000)
+                res = await session.try_change_playback_position_async(hns)
+                return bool(res)
+        except Exception as exc:
+            print(f"[media_adapter] SMTC seek error: {exc}")
+        return False
+
     def close(self):
         self._manager = None
+        self._active_session = None
 
 
 class MediaAdapter:
@@ -343,7 +584,6 @@ class MediaAdapter:
         """Synchronously queries metadata from the backend."""
         try:
             coro = self._backend.get_current_metadata()
-            # If called from a thread without loop, run directly
             meta = asyncio.run(coro)
             self._update_metadata(meta)
             return meta
@@ -397,17 +637,45 @@ class MediaAdapter:
         self._last_command_time = now
         return True
 
-    def _fallback_key(self, key_name: str):
+    def _fallback_key(self, key_name: str) -> bool:
+        """
+        Sends simulated hardware media key when SMTC command fails.
+        Tries pyautogui first, then Win32 user32 keybd_event.
+        """
         if not self._use_fallback:
-            return
+            return False
+
+        sent = False
         try:
             import pyautogui
             pyautogui.press(key_name, _pause=False)
+            sent = True
         except Exception as exc:
             print(f"[media_adapter] PyAutoGUI fallback '{key_name}' failed: {exc}")
 
+        if not sent and sys.platform == "win32":
+            try:
+                import ctypes
+                VK_MAP = {
+                    "playpause": 0xB3,  # VK_MEDIA_PLAY_PAUSE
+                    "nexttrack": 0xB0,  # VK_MEDIA_NEXT_TRACK
+                    "prevtrack": 0xB1,  # VK_MEDIA_PREV_TRACK
+                    "stop": 0xB2,       # VK_MEDIA_STOP
+                }
+                vk = VK_MAP.get(key_name)
+                if vk:
+                    KEYEVENTF_EXTENDEDKEY = 0x0001
+                    KEYEVENTF_KEYUP = 0x0002
+                    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
+                    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+                    sent = True
+            except Exception as exc:
+                print(f"[media_adapter] Win32 keybd_event fallback failed: {exc}")
+
+        return sent
+
     def play_pause(self) -> bool:
-        """Toggles play/pause with debouncing and pyautogui fallback."""
+        """Toggles play/pause with debouncing and media-key fallback."""
         if not self._debounce_check():
             return False
 
@@ -435,7 +703,7 @@ class MediaAdapter:
         return success
 
     def next_track(self) -> bool:
-        """Skips to next track with debouncing and pyautogui fallback."""
+        """Skips to next track with debouncing and media-key fallback."""
         if not self._debounce_check():
             return False
 
@@ -457,7 +725,7 @@ class MediaAdapter:
         return success
 
     def previous_track(self) -> bool:
-        """Returns to previous track with debouncing and pyautogui fallback."""
+        """Returns to previous track with debouncing and media-key fallback."""
         if not self._debounce_check():
             return False
 
@@ -475,6 +743,40 @@ class MediaAdapter:
         if not success:
             self._fallback_key("prevtrack")
             return True
+
+        return success
+
+    def seek(self, position_seconds: float) -> bool:
+        """
+        Seeks to position_seconds in the active track.
+        If SMTC backend does not support seeking or fails, applies optimistic
+        local position update as app-without-seek fallback.
+        """
+        if position_seconds < 0:
+            position_seconds = 0.0
+
+        with self._lock:
+            if self._metadata and self._metadata.duration > 0:
+                position_seconds = min(position_seconds, self._metadata.duration)
+
+        success = False
+        if self._backend.is_available():
+            try:
+                if self._loop and self._loop.is_running():
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._backend.seek(position_seconds), self._loop
+                    )
+                    success = fut.result(timeout=0.8)
+                else:
+                    success = asyncio.run(self._backend.seek(position_seconds))
+            except Exception:
+                success = False
+
+        # App-without-seek fallback: Always maintain local timeline continuity
+        with self._lock:
+            if self._metadata:
+                self._metadata.position = position_seconds
+                self._metadata.last_updated = time.time()
 
         return success
 

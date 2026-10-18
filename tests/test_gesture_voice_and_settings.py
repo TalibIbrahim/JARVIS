@@ -535,5 +535,240 @@ class TestVoiceAndDecisionIntegration(unittest.TestCase):
             m_close.assert_called_with(confirm=True)
 
 
+class TestDynamicIslandVoiceIntents(unittest.TestCase):
+    """Phase 4: Unit tests for Dynamic Island voice intents in commands.py and voice.py."""
+
+    def setUp(self):
+        self.ctx = MagicMock()
+        self.cfg = Config()
+        self.ctx.cfg = self.cfg
+        self.ctx.engine.cfg = self.cfg
+
+    def test_next_page_and_next_card(self):
+        """'next page' and 'next card' trigger next island page (direction=1)."""
+        import commands
+        r1 = commands.run_command("next page", self.ctx)
+        self.assertIn("Next", r1)
+        self.ctx.overlay.post.assert_any_call("island_page_step", direction=1)
+
+        self.ctx.overlay.reset_mock()
+        r2 = commands.run_command("next card", self.ctx)
+        self.assertIn("Next", r2)
+        self.ctx.overlay.post.assert_any_call("island_page_step", direction=1)
+
+    def test_prev_page_variants(self):
+        """'previous page', 'prev page', and 'last page' trigger previous island page (direction=-1)."""
+        import commands
+        for phrase in ("previous page", "prev page", "last page", "previous card", "prev card"):
+            self.ctx.overlay.reset_mock()
+            reply = commands.run_command(phrase, self.ctx)
+            self.assertIn("Previous", reply)
+            self.ctx.overlay.post.assert_any_call("island_page_step", direction=-1)
+
+    def test_show_weather_page(self):
+        """'show weather' and 'weather page' trigger island_show_page(page='weather')."""
+        import commands
+        for phrase in ("show weather", "weather page", "weather card"):
+            self.ctx.overlay.reset_mock()
+            reply = commands.run_command(phrase, self.ctx)
+            self.assertIn("weather", reply.lower())
+            self.ctx.overlay.post.assert_any_call("island_show_page", page="weather")
+
+    def test_show_hardware_page(self):
+        """'show hardware', 'hardware page', and 'show specs' trigger island_show_page(page='hardware')."""
+        import commands
+        for phrase in ("show hardware", "hardware page", "show specs"):
+            self.ctx.overlay.reset_mock()
+            reply = commands.run_command(phrase, self.ctx)
+            self.assertIn("hardware", reply.lower())
+            self.ctx.overlay.post.assert_any_call("island_show_page", page="hardware")
+
+    def test_show_media_page(self):
+        """'show media' and 'media page' trigger island_show_page(page='media')."""
+        import commands
+        for phrase in ("show media", "media page"):
+            self.ctx.overlay.reset_mock()
+            reply = commands.run_command(phrase, self.ctx)
+            self.assertIn("media", reply.lower())
+            self.ctx.overlay.post.assert_any_call("island_show_page", page="media")
+
+    def test_show_calendar_page(self):
+        """'show calendar' and 'calendar page' trigger island_show_page(page='calendar')."""
+        import commands
+        for phrase in ("show calendar", "calendar page"):
+            self.ctx.overlay.reset_mock()
+            reply = commands.run_command(phrase, self.ctx)
+            self.assertIn("calendar", reply.lower())
+            self.ctx.overlay.post.assert_any_call("island_show_page", page="calendar")
+
+    def test_show_jarvis_page(self):
+        """'show jarvis' and 'jarvis page' trigger island_show_page(page='jarvis')."""
+        import commands
+        for phrase in ("show jarvis", "jarvis page"):
+            self.ctx.overlay.reset_mock()
+            reply = commands.run_command(phrase, self.ctx)
+            self.assertIn("jarvis", reply.lower())
+            self.ctx.overlay.post.assert_any_call("island_show_page", page="jarvis")
+
+    def test_expand_and_collapse_island(self):
+        """'expand island' / 'open island' expands; 'collapse island' / 'close island' collapses."""
+        import commands
+        # Expand
+        for phrase in ("expand island", "open island"):
+            self.ctx.overlay.reset_mock()
+            reply = commands.run_command(phrase, self.ctx)
+            self.assertIn("Expanding", reply)
+            self.ctx.overlay.post.assert_any_call("island_expand")
+
+        # Collapse
+        for phrase in ("collapse island", "close island"):
+            self.ctx.overlay.reset_mock()
+            reply = commands.run_command(phrase, self.ctx)
+            self.assertIn("Collapsing", reply)
+            self.ctx.overlay.post.assert_any_call("island_collapse")
+
+    def test_voice_process_direct_intercept(self):
+        """Voice._process direct intercept for Dynamic Island voice navigation."""
+        from voice import Voice, intercept_island_voice
+        stop_evt = threading.Event()
+        v = Voice(self.cfg, self.ctx, stop_evt)
+        v.listening_until = time.time() + 10.0
+
+        v._process("next page")
+        self.ctx.overlay.post.assert_any_call("island_page_step", direction=1)
+        self.ctx.say.assert_called_with("Next card, sir.")
+
+        self.ctx.overlay.reset_mock()
+        self.ctx.say.reset_mock()
+        v.listening_until = time.time() + 10.0
+        v._process("show calendar")
+        self.ctx.overlay.post.assert_any_call("island_show_page", page="calendar")
+        self.ctx.say.assert_called_with("Displaying calendar schedule, sir.")
+
+
+class TestDynamicIslandGestureHooks(unittest.TestCase):
+    """Phase 4: Unit tests for Dynamic Island gesture hooks in gestures.py and controller.py."""
+
+    def test_vertical_swipe_down_in_island_area_steps_next_page(self):
+        """Swipe down while hand is in top-screen area (hy <= 0.38) triggers island_page_step(1)."""
+        cfg = Config(gesture_shortcuts_enabled=True)
+        mock_overlay = MagicMock()
+        engine = GestureEngine(cfg, overlay=mock_overlay)
+        t = wake_engine(engine, 0.0)
+
+        # Baseline frame at top of screen (hy = 0.25 <= 0.38)
+        _, t = feed_engine(engine, [[make_hand("palm", dy=-0.45)]], t + 1.0)
+        # Swipe downward (dy increases: +0.04 per frame over 3 frames -> dy = +0.08 >= 0.06)
+        frames = [[make_hand("palm", dy=-0.45 + 0.04 * i)] for i in range(1, 4)]
+        acts, t = feed_engine(engine, frames, t)
+
+        mock_overlay.post.assert_any_call("island_page_step", direction=1)
+        kinds = [a.kind for a in acts]
+        self.assertIn("island_page_step", kinds)
+        step_act = next(a for a in acts if a.kind == "island_page_step")
+        self.assertEqual(step_act.n, 1)
+
+    def test_vertical_swipe_up_in_island_area_steps_prev_page(self):
+        """Swipe up while hand is in top-screen area (hy <= 0.38) triggers island_page_step(-1)."""
+        cfg = Config(gesture_shortcuts_enabled=True)
+        mock_overlay = MagicMock()
+        engine = GestureEngine(cfg, overlay=mock_overlay)
+        t = wake_engine(engine, 0.0)
+
+        # Baseline frame at top of screen
+        _, t = feed_engine(engine, [[make_hand("palm", dy=-0.35)]], t + 1.0)
+        # Swipe upward (dy decreases: -0.04 per frame over 3 frames -> dy = -0.08 <= -0.06)
+        frames = [[make_hand("palm", dy=-0.35 - 0.04 * i)] for i in range(1, 4)]
+        acts, t = feed_engine(engine, frames, t)
+
+        mock_overlay.post.assert_any_call("island_page_step", direction=-1)
+        kinds = [a.kind for a in acts]
+        self.assertIn("island_page_step", kinds)
+        step_act = next(a for a in acts if a.kind == "island_page_step")
+        self.assertEqual(step_act.n, -1)
+
+    def test_controller_island_page_step_handling(self):
+        """Controller routes island_page_step action to overlay and expands next card."""
+        from controller import Controller
+        cfg = Config()
+        mock_overlay = MagicMock()
+        island_mock = MagicMock()
+        island_mock.expanded_card = "media"
+        island_mock.card_pages = ["media", "time", "weather", "hardware", "jarvis"]
+        mock_overlay.island = island_mock
+
+        ctrl = Controller(cfg, overlay=mock_overlay)
+        try:
+            ctrl.handle(Action("island_page_step", n=1))
+            mock_overlay.post.assert_any_call("island_page_step", direction=1)
+            island_mock.expand_card.assert_called_with("time")
+
+            ctrl.handle(Action("island_page_step", n=-1))
+            mock_overlay.post.assert_any_call("island_page_step", direction=-1)
+        finally:
+            ctrl.shutdown()
+
+    def test_dwell_over_island_buttons_triggers_click(self):
+        """Dwell over interactive island buttons (prev, play_pause, next, page dots, pause tracking) triggers click."""
+        from controller import Controller
+        cfg = Config()
+        mock_overlay = MagicMock()
+        ctrl = Controller(cfg, overlay=mock_overlay)
+        try:
+            # Register island button hit zones
+            ctrl.island_buttons["prev"] = (100, 100, 140, 140)
+            ctrl.island_buttons["play_pause"] = (150, 100, 190, 140)
+            ctrl.island_buttons["next"] = (200, 100, 240, 140)
+            ctrl.island_buttons["dot_2"] = (300, 100, 320, 120)
+            ctrl.island_buttons["pause_tracking_toggle"] = (50, 20, 90, 40)
+
+            buttons_tested = [
+                ((120, 120), "prev"),
+                ((170, 120), "play_pause"),
+                ((220, 120), "next"),
+                ((310, 110), "dot_2"),
+                ((70, 30), "pause_tracking_toggle"),
+            ]
+
+            for (bx, by), btn_name in buttons_tested:
+                ctrl.cur_x, ctrl.cur_y = float(bx), float(by)
+                mock_overlay.post.reset_mock()
+                with patch("pyautogui.click") as mock_click:
+                    ctrl._handle_dwell_action("click")
+                    mock_click.assert_called_once()
+                    mock_overlay.post.assert_any_call("island_button_click", button=btn_name)
+        finally:
+            ctrl.shutdown()
+
+    def test_fist_click_lookback_buffer_and_0px_drift_invariant(self):
+        """Fist-click over island button snaps to 200ms lookback buffer position with 0 px drift."""
+        from controller import Controller
+        cfg = Config()
+        cfg.cursor_lookback_ms = 200.0
+        mock_overlay = MagicMock()
+        ctrl = Controller(cfg, overlay=mock_overlay)
+        try:
+            ctrl.island_buttons["play_pause"] = (200, 200, 260, 260)
+
+            # 200 ms ago, cursor was steadily aiming at (230, 230)
+            t0 = time.perf_counter()
+            ctrl.history.append(t0 - 0.20, 230.0, 230.0)
+            # Drift occurs during fist curling -> moves off-button to (290, 290)
+            ctrl.cur_x, ctrl.cur_y = 290.0, 290.0
+            ctrl.target_x, ctrl.target_y = 290.0, 290.0
+            ctrl.history.append(t0, 290.0, 290.0)
+
+            with patch("pyautogui.click") as mock_click, patch.object(ctrl, "_move") as mock_move:
+                ctrl.handle(Action("click"))
+                # Precision invariant verification: exactly 0 px pre-click drift
+                self.assertEqual(ctrl.cur_x, 230.0)
+                self.assertEqual(ctrl.cur_y, 230.0)
+                mock_move.assert_called_with(230, 230)
+                mock_click.assert_called_once()
+                mock_overlay.post.assert_any_call("island_button_click", button="play_pause")
+        finally:
+            ctrl.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

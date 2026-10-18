@@ -1835,95 +1835,165 @@ class SettingsWindow(QDialog):
         island_card = GroupedCard()
         self.island_card = island_card
 
-        # 1. Idle Display dropdown (Off / Time / Time + Weather)
-        self.idle_combo = AppleComboBox()
-        self.idle_combo.setMinimumWidth(160)
-        idle_options = [
+        # 1. Shape Style (Pill vs Notch)
+        self.shape_style_control = SegmentedControl([
+            ("pill",  "Pill (Floating)"),
+            ("notch", "Notch (Attached)"),
+        ], current=getattr(self.cfg, "island_shape_style", "pill"))
+        self.shape_seg = self.shape_style_control
+        self.shape_style_control.valueChanged.connect(lambda v: self._save("island_shape_style", v))
+        island_card.add_row("Shape Style",
+                            "Select floating island stadium capsule or bezel-attached notch style",
+                            self.shape_style_control)
+
+        # 2. Size Scale (Small / Medium / Large)
+        self.island_size_control = SegmentedControl([
+            ("small",  "Small (0.85x)"),
+            ("medium", "Medium (1.0x)"),
+            ("large",  "Large (1.15x)"),
+        ], current=getattr(self.cfg, "island_size_scale", getattr(self.cfg, "island_size", "medium")))
+        self.size_seg = self.island_size_control
+        def _on_size_changed(v):
+            self._save("island_size_scale", v)
+            self._save("island_size", v)
+        self.island_size_control.valueChanged.connect(_on_size_changed)
+        island_card.add_row("Size Scale",
+                            "Overall scale factor for Dynamic Island capsule and expanded cards",
+                            self.island_size_control)
+
+        # 3. Compact Content (Time + Weather vs Media-Aware vs Time)
+        self.compact_content_control = SegmentedControl([
             ("time_weather", "Time + Weather"),
-            ("time",         "Time"),
-            ("off",          "Off"),
-        ]
-        cur_idle = getattr(self.cfg, "island_idle_display", "time_weather")
-        sel_idle = 0
-        for i, (code, lbl) in enumerate(idle_options):
-            self.idle_combo.addItem(lbl, code)
-            if cur_idle == code:
-                sel_idle = i
-        self.idle_combo.setCurrentIndex(sel_idle)
-        self.idle_combo.currentIndexChanged.connect(
-            lambda i: self._save("island_idle_display", self.idle_combo.itemData(i))
-        )
-        island_card.add_row("Idle Display",
-                            "Standby appearance when no assistant or media activity is present",
-                            self.idle_combo)
+            ("media_aware",  "Media-Aware"),
+            ("time",         "Time Only"),
+        ], current=getattr(self.cfg, "island_compact_mode", getattr(self.cfg, "island_idle_display", "time_weather")))
+        self.compact_seg = self.compact_content_control
+        def _on_compact_changed(v):
+            self._save("island_compact_mode", v)
+            self._save("island_idle_display", v)
+        self.compact_content_control.valueChanged.connect(_on_compact_changed)
+        island_card.add_row("Compact Content",
+                            "Standby resting presentation when no assistant interaction is active",
+                            self.compact_content_control)
 
-        # 2. Show Now Playing (toggle)
-        self.show_now_playing_switch = AppleSwitch(getattr(self.cfg, "island_show_now_playing", True))
-        self.sw_media = self.show_now_playing_switch
-        self.show_now_playing_switch.toggled.connect(lambda v: self._save("island_show_now_playing", v))
-        island_card.add_row("Show Now Playing",
-                            "Display compact album art and audio visualizer during media playback",
-                            self.show_now_playing_switch)
+        # 4. 12/24 h Format
+        self.clock_format_control = SegmentedControl([
+            ("auto", "Auto"),
+            ("12h",  "12-Hour"),
+            ("24h",  "24-Hour"),
+        ], current=getattr(self.cfg, "island_time_format", getattr(self.cfg, "island_clock_format", "12h")))
+        self.fmt_seg = self.clock_format_control
+        def _on_clock_changed(v):
+            self._save("island_time_format", v)
+            self._save("island_clock_format", v)
+        self.clock_format_control.valueChanged.connect(_on_clock_changed)
+        island_card.add_row("12/24 h Format",
+                            "Clock display format for compact time and expanded card",
+                            self.clock_format_control)
 
-        # 3. Show Weather (toggle)
-        self.show_weather_switch = AppleSwitch(getattr(self.cfg, "island_show_weather", True))
-        self.sw_weather = self.show_weather_switch
-        self.show_weather_switch.toggled.connect(lambda v: self._save("island_show_weather", v))
-        island_card.add_row("Show Weather",
-                            "Display current weather condition glyph and live temperature",
-                            self.show_weather_switch)
+        # 5. First Weekday (Locale / Sunday / Monday)
+        self.first_weekday_control = SegmentedControl([
+            ("locale", "Locale"),
+            ("sunday", "Sunday"),
+            ("monday", "Monday"),
+        ], current=getattr(self.cfg, "island_first_weekday", "locale"))
+        self.weekday_seg = self.first_weekday_control
+        self.first_weekday_control.valueChanged.connect(lambda v: self._save("island_first_weekday", v))
+        island_card.add_row("First Weekday",
+                            "Starting day of the week in the expanded Calendar month grid",
+                            self.first_weekday_control)
 
-        # 4. City Search Field
-        self.city_search_edit = QLineEdit(getattr(self.cfg, "island_weather_city", "Cupertino"))
+        # 6. City Input Field
+        city_default = getattr(self.cfg, "island_weather_city", getattr(self.cfg, "weather_city", "Ahmedabad"))
+        self.city_search_edit = QLineEdit(city_default)
         self.city_edit = self.city_search_edit
-        self.city_search_edit.setPlaceholderText("Enter city (e.g. Cupertino, London)")
+        self.city_search_edit.setPlaceholderText("Enter city (e.g. Ahmedabad, London)")
         self.city_search_edit.setFixedWidth(200)
         self.city_search_edit.setStyleSheet(
             f"background: {'rgba(255,255,255,0.08)' if self._dark else 'rgba(0,0,0,0.05)'}; "
             f"border: 1px solid {'rgba(255,255,255,0.12)' if self._dark else 'rgba(0,0,0,0.12)'}; "
             f"border-radius: 6px; padding: 4px 8px; color: {T.color.label.resolve(self._dark).name()};"
         )
-        self.city_search_edit.textChanged.connect(lambda v: self._save("island_weather_city", v.strip()))
-        island_card.add_row("City Search Field",
-                            "Location used for weather forecast and hourly conditions",
+        def _on_city_changed(v):
+            cleaned = v.strip() or "Ahmedabad"
+            self._save("island_weather_city", cleaned)
+            self._save("weather_city", cleaned)
+        self.city_search_edit.textChanged.connect(_on_city_changed)
+        island_card.add_row("City Location",
+                            "Location used for live weather forecasts and modular metrics",
                             self.city_search_edit)
 
-        # 5. Units (Auto / Celsius / Fahrenheit)
+        # 7. Weather / Speed Units
         self.units_control = SegmentedControl([
             ("auto",       "Auto"),
-            ("celsius",    "Celsius"),
-            ("fahrenheit", "Fahrenheit"),
-        ], current=getattr(self.cfg, "island_weather_units", "auto"))
+            ("celsius",    "Celsius (°C, km/h)"),
+            ("fahrenheit", "Fahrenheit (°F, mph)"),
+        ], current=getattr(self.cfg, "island_weather_units", getattr(self.cfg, "weather_units", "auto")))
         self.units_seg = self.units_control
-        self.units_control.valueChanged.connect(lambda v: self._save("island_weather_units", v))
-        island_card.add_row("Units",
-                            "Temperature scale for weather displays",
+        def _on_units_changed(v):
+            self._save("island_weather_units", v)
+            self._save("weather_units", v)
+        self.units_control.valueChanged.connect(_on_units_changed)
+        island_card.add_row("Weather Units",
+                            "Temperature and wind speed units for weather metrics",
                             self.units_control)
 
-        # 6. 12/24 h format
-        self.clock_format_control = SegmentedControl([
-            ("12h", "12-Hour"),
-            ("24h", "24-Hour"),
-        ], current=getattr(self.cfg, "island_clock_format", "12h"))
-        self.fmt_seg = self.clock_format_control
-        self.clock_format_control.valueChanged.connect(lambda v: self._save("island_clock_format", v))
-        island_card.add_row("12/24 h Format",
-                            "Clock display format for compact time and expanded card",
-                            self.clock_format_control)
+        # 8. Hardware Layout (Grid vs Strip)
+        self.hw_layout_control = SegmentedControl([
+            ("grid",  "2x3 Grid"),
+            ("strip", "5-Item Strip"),
+        ], current=getattr(self.cfg, "island_hardware_layout", "grid"))
+        self.hw_layout_seg = self.hw_layout_control
+        self.hw_layout_control.valueChanged.connect(lambda v: self._save("island_hardware_layout", v))
+        island_card.add_row("Hardware Layout",
+                            "Display style: 2x3 modular tile grid or compact widescreen strip",
+                            self.hw_layout_control)
 
-        # 7. Expand Trigger (Hover / Dwell / Click)
+        # 9. Backdrop Glass Blur (toggle)
+        self.backdrop_blur_switch = AppleSwitch(getattr(self.cfg, "island_backdrop_blur", getattr(self.cfg, "glass_blur", True)))
+        self.sw_island_blur = self.backdrop_blur_switch
+        self.backdrop_blur_switch.toggled.connect(lambda v: self._save("island_backdrop_blur", v))
+        island_card.add_row("Backdrop Blur",
+                            "Enable hardware-accelerated Mica or Acrylic blur behind the island surface",
+                            self.backdrop_blur_switch)
+
+        # 10. Backdrop Opacity Slider
+        cur_op = float(getattr(self.cfg, "island_backdrop_opacity", 0.95))
+        self.slider_backdrop_opacity = slider_card_row(
+            island_card,
+            "Backdrop Opacity",
+            "Surface glass tint opacity from translucent to deep obsidian",
+            cur_op,
+            0.20,
+            1.00,
+            "",
+            lambda v: self._save("island_backdrop_opacity", round(v, 2)),
+        )
+        self.slider_island_opacity = self.slider_backdrop_opacity
+
+        # 11. Pin Open Toggle
+        self.pin_open_switch = AppleSwitch(getattr(self.cfg, "island_pin_open", False))
+        self.sw_pin_open = self.pin_open_switch
+        self.pin_open_switch.toggled.connect(lambda v: self._save("island_pin_open", v))
+        island_card.add_row("Pin Open",
+                            "Keep expanded card open permanently and suppress 4-second auto-collapse timer",
+                            self.pin_open_switch)
+
+        # 12. Expand Trigger (Hover / Click / Dwell / Fist / Voice)
         self.expand_trigger_control = SegmentedControl([
             ("hover", "Hover"),
-            ("dwell", "Dwell"),
             ("click", "Click"),
+            ("dwell", "Dwell"),
+            ("fist",  "Fist"),
+            ("voice", "Voice"),
         ], current=getattr(self.cfg, "island_expand_trigger", "hover"))
         self.trig_seg = self.expand_trigger_control
         self.expand_trigger_control.valueChanged.connect(lambda v: self._save("island_expand_trigger", v))
         island_card.add_row("Expand Trigger",
-                            "Interaction method to expand the island into full cards",
+                            "Primary interaction method to expand the island into full cards",
                             self.expand_trigger_control)
 
-        # 8. Hide during Fullscreen Apps (toggle)
+        # 13. Hide during Fullscreen Apps
         self.hide_fullscreen_switch = AppleSwitch(getattr(self.cfg, "island_hide_fullscreen", getattr(self.cfg, "hide_fullscreen", True)))
         self.sw_fs = self.hide_fullscreen_switch
         def _on_fs_toggled(v):
@@ -1934,30 +2004,100 @@ class SettingsWindow(QDialog):
                             "Automatically hide the island when playing games or running full-screen apps",
                             self.hide_fullscreen_switch)
 
-        # 9. Island Size (Compact / Default / Large)
-        self.island_size_control = SegmentedControl([
-            ("compact", "Compact"),
-            ("default", "Default"),
-            ("large",   "Large"),
-        ], current=getattr(self.cfg, "island_size", "default"))
-        self.size_seg = self.island_size_control
-        self.island_size_control.valueChanged.connect(lambda v: self._save("island_size", v))
-        island_card.add_row("Island Size",
-                            "Overall scale factor for Dynamic Island capsule and cards",
-                            self.island_size_control)
+        island_card.set_footnote("Changes apply immediately to the Dynamic Island on your screen.")
+        layout.addWidget(island_card)
 
-        # Direct property aliases
-        self.media_switch = self.show_now_playing_switch
-        self.weather_switch = self.show_weather_switch
-        self.city_search_btn = getattr(self, "city_search_edit", None)
+        # ── Card Pages & Hardware Sensors Section ───────────────────────────
+        pages_card = GroupedCard()
+        self.pages_card = pages_card
+
+        pages_map = getattr(self.cfg, "island_pages_enabled", {
+            "media": True, "calendar": True, "weather": True, "hardware": True, "jarvis": True
+        })
+
+        def _on_page_toggle(page_name: str, enabled: bool):
+            cur = dict(getattr(self.cfg, "island_pages_enabled", {}))
+            cur[page_name] = enabled
+            self._save("island_pages_enabled", cur)
+
+        # Page Toggles
+        self.sw_page_media = AppleSwitch(pages_map.get("media", True))
+        self.sw_page_media.toggled.connect(lambda v: _on_page_toggle("media", v))
+        pages_card.add_row("Media Player Page",
+                           "Include Now Playing artwork and audio controls in card carousel",
+                           self.sw_page_media)
+
+        self.sw_page_cal = AppleSwitch(pages_map.get("calendar", True))
+        self.sw_page_cal.toggled.connect(lambda v: _on_page_toggle("calendar", v))
+        pages_card.add_row("Calendar & Clock Page",
+                           "Include monthly calendar grid and date tile in card carousel",
+                           self.sw_page_cal)
+
+        self.sw_page_weather = AppleSwitch(pages_map.get("weather", True))
+        self.sw_page_weather.toggled.connect(lambda v: _on_page_toggle("weather", v))
+        pages_card.add_row("Weather Forecast Page",
+                           "Include current conditions, temperature, and modular weather metrics",
+                           self.sw_page_weather)
+
+        self.sw_page_hw = AppleSwitch(pages_map.get("hardware", True))
+        self.sw_page_hw.toggled.connect(lambda v: _on_page_toggle("hardware", v))
+        pages_card.add_row("Hardware Monitor Page",
+                           "Include system resource and network performance telemetry",
+                           self.sw_page_hw)
+
+        self.sw_page_jarvis = AppleSwitch(pages_map.get("jarvis", True))
+        self.sw_page_jarvis.toggled.connect(lambda v: _on_page_toggle("jarvis", v))
+        pages_card.add_row("JARVIS Assistant Page",
+                           "Include assistant status, tracking quick toggle, and last directive",
+                           self.sw_page_jarvis)
+
+        # Hardware Sensor Toggles
+        self.sw_hw_cpu = AppleSwitch(getattr(self.cfg, "island_hw_cpu", True))
+        self.sw_hw_cpu.toggled.connect(lambda v: self._save("island_hw_cpu", v))
+        pages_card.add_row("CPU Telemetry Sensor",
+                           "Sample processor utilization percentage and clock frequency",
+                           self.sw_hw_cpu)
+
+        self.sw_hw_ram = AppleSwitch(getattr(self.cfg, "island_hw_ram", True))
+        self.sw_hw_ram.toggled.connect(lambda v: self._save("island_hw_ram", v))
+        pages_card.add_row("RAM Telemetry Sensor",
+                           "Sample active memory usage, availability, and total capacity",
+                           self.sw_hw_ram)
+
+        self.sw_hw_gpu = AppleSwitch(getattr(self.cfg, "island_hw_gpu", True))
+        self.sw_hw_gpu.toggled.connect(lambda v: self._save("island_hw_gpu", v))
+        pages_card.add_row("GPU Telemetry Sensor",
+                           "Sample dedicated graphics processor load and temperature",
+                           self.sw_hw_gpu)
+
+        self.sw_hw_net = AppleSwitch(getattr(self.cfg, "island_hw_net", True))
+        self.sw_hw_net.toggled.connect(lambda v: self._save("island_hw_net", v))
+        pages_card.add_row("Network Telemetry Sensor",
+                           "Sample real-time upstream and downstream network bandwidth",
+                           self.sw_hw_net)
+
+        self.sw_hw_disk = AppleSwitch(getattr(self.cfg, "island_hw_disk", True))
+        self.sw_hw_disk.toggled.connect(lambda v: self._save("island_hw_disk", v))
+        pages_card.add_row("Disk Telemetry Sensor",
+                           "Sample primary drive utilization and storage capacity",
+                           self.sw_hw_disk)
+
+        pages_card.set_footnote("Disabled pages are skipped during mouse wheel and page dot navigation.")
+        layout.addWidget(pages_card)
+
+        # Direct property aliases for test compatibility
+        self.media_switch = self.sw_page_media
+        self.weather_switch = self.sw_page_weather
+        self.show_now_playing_switch = self.sw_page_media
+        self.show_weather_switch = self.sw_page_weather
+        self.city_search_btn = self.city_search_edit
         self.units_combo = self.units_control
         self.time_fmt_combo = self.clock_format_control
         self.expand_combo = self.expand_trigger_control
         self.fs_switch = self.hide_fullscreen_switch
         self.size_combo = self.island_size_control
+        self.idle_combo = self.compact_content_control
 
-        island_card.set_footnote("Changes apply immediately to the Dynamic Island on your screen.")
-        layout.addWidget(island_card)
         layout.addStretch()
         self._stack.addWidget(page)
 
@@ -2307,6 +2447,8 @@ class SettingsWindow(QDialog):
             for w in QApplication.topLevelWidgets():
                 if hasattr(w, "reload_config"):
                     w.reload_config()
+                if hasattr(w, "island") and hasattr(w.island, "reload_config"):
+                    w.island.reload_config()
         except Exception:
             pass
 

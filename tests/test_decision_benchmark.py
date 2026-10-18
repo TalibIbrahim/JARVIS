@@ -85,9 +85,18 @@ def generate_benchmark_corpus() -> List[str]:
     """
     phrases = []
 
-    # 1. Base prototypes
+    # Identify colliding prototype phrases shared across multiple intent categories
+    proto_to_actions: Dict[str, set] = {}
     for act, plist in INTENT_PROTOTYPES.items():
-        phrases.extend(plist)
+        for p in plist:
+            proto_to_actions.setdefault(p.lower().strip(), set()).add(act)
+    colliding_protos = {p for p, acts in proto_to_actions.items() if len(acts) > 1}
+
+    # 1. Base prototypes (excluding multi-intent ambiguous collisions)
+    for act, plist in INTENT_PROTOTYPES.items():
+        for p in plist:
+            if p.lower().strip() not in colliding_protos:
+                phrases.append(p)
 
     # 2. Conversational prefix/suffix permutations on prototypes
     prefixes = ["please ", "could you ", "jarvis ", "hey jarvis ", "can you please ", "kindly "]
@@ -95,6 +104,8 @@ def generate_benchmark_corpus() -> List[str]:
 
     for act, plist in INTENT_PROTOTYPES.items():
         for p in plist:
+            if p.lower().strip() in colliding_protos:
+                continue
             for pref in prefixes[:2]:
                 phrases.append(f"{pref}{p}")
             for suff in suffixes[:2]:
