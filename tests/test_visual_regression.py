@@ -29,6 +29,7 @@ import ctypes
 import os
 import sys
 import unittest
+from unittest.mock import patch
 import pytest
 
 from PySide6.QtCore import Qt
@@ -95,13 +96,17 @@ class TestSettingsWindowVisual(unittest.TestCase):
 
     def test_settings_tabs_visual(self):
         """Verify pixel-exact rendering for all 7 Settings tabs across themes and DPIs."""
-        for theme in THEMES:
-            for dpi in DPIS:
-                dpi_str = f"dpi{int(dpi * 100)}"
-                for tab in _CATEGORIES:
-                    fname = f"settings_{tab.lower()}_{theme}_{dpi_str}.png"
-                    img = render_settings_tab(tab, dpi, theme)
-                    _assert_image_matches_golden(self, img, fname)
+        # The camera list is populated asynchronously (SettingsBridge.cameras_result); pin the probe
+        # result and let render_settings_tab wait (bounded) for the placeholder to be replaced.
+        fixed = [{"index": 0, "name": "HP HD Camera"}]
+        with patch("ui.settings_window.list_cameras", return_value=fixed):
+            for theme in THEMES:
+                for dpi in DPIS:
+                    dpi_str = f"dpi{int(dpi * 100)}"
+                    for tab in _CATEGORIES:
+                        fname = f"settings_{tab.lower()}_{theme}_{dpi_str}.png"
+                        img = render_settings_tab(tab, dpi, theme)
+                        _assert_image_matches_golden(self, img, fname)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

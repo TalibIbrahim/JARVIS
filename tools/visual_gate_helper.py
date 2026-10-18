@@ -176,6 +176,23 @@ class DummyOverlayMgr:
 # 4. View Renderers
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _wait_for_cameras(dlg, max_iters: int = 200) -> bool:
+    """Process Qt events until no combo shows the async 'Detecting cameras...' placeholder.
+    Bounded (~2 s max, iteration-counted so it is immune to the injected clock)."""
+    from PySide6.QtCore import QThread
+    from PySide6.QtWidgets import QComboBox
+
+    def _pending():
+        return any(c.currentText().startswith("Detecting cameras") for c in dlg.findChildren(QComboBox))
+
+    for _ in range(max_iters):
+        get_app().processEvents()
+        if not _pending():
+            return True
+        QThread.msleep(10)
+    return not _pending()
+
+
 def render_settings_tab(category_id: str, dpi: float, theme: str) -> QImage:
     """Renders one of the 7 Settings Window tabs."""
     get_app()
@@ -187,6 +204,7 @@ def render_settings_tab(category_id: str, dpi: float, theme: str) -> QImage:
         dlg.resize(920, 640)
         dlg.select_tab(category_id)
         get_app().processEvents()
+        _wait_for_cameras(dlg)
 
         img = render_widget_to_image(dlg, dpi)
 
