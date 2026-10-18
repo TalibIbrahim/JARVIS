@@ -113,6 +113,8 @@ class SupervisedTask:
                     break
 
                 self.is_running = True
+                logger.info("task '%s' start (attempt #%d, instance=%s)",
+                            self.name, self.restart_count + 1, type(inst).__name__)
 
                 # If instance is a threading.Thread
                 if isinstance(inst, threading.Thread):
@@ -121,10 +123,12 @@ class SupervisedTask:
                     while not self.stop_event.is_set() and inst.is_alive():
                         inst.join(timeout=0.2)
                     if self.stop_event.is_set():
+                        logger.info("task '%s' stopping on stop_event", self.name)
                         break
                     # If thread finished without stop_event, check if it was clean or abnormal
                     if hasattr(inst, "error") and inst.error:
                         raise inst.error
+                    logger.warning("task '%s' worker thread ended without error and without stop_event", self.name)
                 elif callable(inst):
                     inst()
                 elif hasattr(inst, "run") and callable(inst.run):
@@ -133,9 +137,12 @@ class SupervisedTask:
                     break
 
                 # Clean exit without stop event
+                logger.info("task '%s' exit clean (no restart)", self.name)
                 break
 
             except Exception as exc:
+                logger.error("task '%s' crashed: %s: %s", self.name, type(exc).__name__, exc,
+                             exc_info=(type(exc), exc, exc.__traceback__))
                 self.last_error = exc
                 self.last_crash_time = time.time()
                 self.restart_count += 1
@@ -147,19 +154,13 @@ class SupervisedTask:
                     except Exception:
                         pass
 
-                print(
-                    f"[supervisor] Task '{self.name}' crashed with: {exc}. "
-                    f"Restart #{self.restart_count} in {self.get_backoff():.2f}s",
-                    file=sys.stderr,
-                )
+                logger.warning("task '%s' restart #%d in %.2fs (max_restarts=%d)",
+                               self.name, self.restart_count, self.get_backoff(), self.max_restarts)
 
                 if self.max_restarts >= 0 and self.restart_count > self.max_restarts:
                     self.is_terminal = True
-                    print(
-                        f"[supervisor] Task '{self.name}' reached maximum restart attempts ({self.max_restarts}). "
-                        f"Degrading gracefully to offline.",
-                        file=sys.stderr,
-                    )
+                    logger.error("task '%s' TERMINAL: reached maximum restart attempts (%d); degrading to offline",
+                                 self.name, self.max_restarts)
                     break
 
                 backoff = self.get_backoff()

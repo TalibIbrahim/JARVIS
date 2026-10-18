@@ -3,11 +3,13 @@ import datetime
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.parse
 import webbrowser
 from typing import Any, Dict, List, Optional, Tuple
 
+import jarvis_log as _jl
 from ai import (
     get_api_key,
     GroqClient,
@@ -166,6 +168,12 @@ def play_media(query: str, platform: str = "auto") -> Tuple[bool, str]:
 
 def _post_action(ctx, action: str, success: bool = True, args: Optional[dict] = None, text: str = ""):
     """Notifies overlay that a command or action has completed to trigger RESULT card."""
+    _caller = sys._getframe(1).f_code.co_name  # stage logging: which tier resolved this action
+    if _caller == "handle_island_voice_command":
+        _jl.utterance_event(_jl.DECISION, tier="island", intent=action + "".join(f":{v}" for v in (args or {}).values()))
+    elif _caller == "_run_single_command":
+        _jl.utterance_event(_jl.DECISION, tier="regex", intent=action)
+    _jl.utterance_event(_jl.RESULT, action=action, ok=success)
     if ctx and hasattr(ctx, "overlay") and ctx.overlay:
         try:
             ctx.overlay.post("action_executed", action=action, success=success)
@@ -1136,6 +1144,7 @@ def _run_single_command(text, ctx):
 
     # Visual queries immediately dispatch to camera vision
     if is_visual_query(text):
+        _jl.utterance_event(_jl.DECISION, tier="vision", intent="visual_query")
         return _handle_ai_query(text, ctx)
 
     # --- local decision engine (System 1 Reflex: ~1-15ms) ---
@@ -1151,6 +1160,7 @@ def _run_single_command(text, ctx):
             from decision_engine import evaluate_decision
             decision_reply = evaluate_decision(text, ctx)
             if decision_reply:
+                _jl.utterance_event(_jl.DECISION, tier="system1", intent="decision_engine")
                 return decision_reply
         except Exception as exc:
             print(f"[commands] decision engine note: {exc}")
@@ -1297,6 +1307,7 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
         )
         action, args, reply = parse_ai_response(raw_reply)
 
+        _jl.utterance_event(_jl.DECISION, tier="system2", action=action or "none")
         if action and action != "none":
             executed, act_msg = execute_whitelisted_action(action, args, ctx)
             if not executed:

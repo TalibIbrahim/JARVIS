@@ -1374,7 +1374,10 @@ def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> T
     Rejects unknown actions or arbitrary code execution.
     Returns (executed: bool, message: str) and notifies overlay on completion.
     """
+    import jarvis_log
+    jarvis_log.utterance_event(jarvis_log.DISPATCH, action=action)
     executed, msg = _execute_whitelisted_action_impl(action, args, ctx)
+    jarvis_log.utterance_event(jarvis_log.RESULT, action=action, ok=executed, msg=jarvis_log.redact(str(msg)[:60]))
     if action and action != "none" and ctx and hasattr(ctx, "overlay") and ctx.overlay:
         try:
             ctx.overlay.post("action_executed", action=action, success=executed)

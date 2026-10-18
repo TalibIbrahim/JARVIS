@@ -5,6 +5,8 @@ import datetime
 import sys
 import threading
 
+import jarvis_log as _jlog
+
 
 def _enable_dpi_awareness():
     # Per-Monitor V2 DPI awareness for modern Windows 10/11
@@ -118,6 +120,10 @@ def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstanc
     # Create session-local mutex to prevent multi-instance runs
     handle = kernel32.CreateMutexW(None, False, app_id)
     last_error = kernel32.GetLastError()
+    _jlog.get_logger("main").info(
+        "single-instance mutex: %s (GetLastError=%d) census=%s",
+        "already-exists" if last_error == ERROR_ALREADY_EXISTS else "acquired",
+        last_error, _jlog.process_census())
 
     if last_error == ERROR_ALREADY_EXISTS:
         if handle:
@@ -141,6 +147,7 @@ def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstanc
 
 
 def main():
+    _jlog.setup()
     if any(arg in sys.argv for arg in ("-h", "--help", "--island-demo", "--perf-report", "--self-test")):
         pass
     elif not acquire_single_instance_lock():
@@ -157,6 +164,7 @@ def main():
     parser.add_argument("--perf-report", action="store_true", help="print latency budget performance report and exit")
     parser.add_argument("--self-test", action="store_true", help="run hardware, models, and network self-test diagnostic")
     args = parser.parse_args()
+    _jlog.get_logger("main").info("args: %s", vars(args))
 
     if args.perf_report:
         from perf import print_perf_report
@@ -214,6 +222,7 @@ def main():
     from voice import Speaker, Voice
 
     cfg = load_config()
+    _jlog.set_debug_transcripts(getattr(cfg, "debug_log_transcripts", False))
     if args.preview:
         cfg.show_preview = True
     if args.no_voice:
@@ -399,6 +408,7 @@ def main():
         backoff_base=5.0,
     )
     supervisor.start("WeatherPoller")
+    _jlog.start_heartbeat_monitor()
 
     # Global hotkeys: Ctrl+Alt+J toggles wake/standby, Ctrl+Alt+Q quits.
     try:

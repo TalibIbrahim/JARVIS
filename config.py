@@ -111,6 +111,7 @@ class Config:
     mic_phrase_time_limit: float = 10.0 # maximum seconds per voice command phrase
     voice_profile_enabled: bool = True  # enable speaker recognition and voice profile
     voice_speaker_verification: bool = False # strict speaker verification (filters out other voices when trained)
+    debug_log_transcripts: bool = False  # write full transcripts to the diagnostic log (default: only lengths)
 
     # --- ui / apple hig appearance ---
     theme_mode: str = "auto"            # "auto" (follows Windows), "dark", "light"
