@@ -155,6 +155,7 @@ class FrameGrabber(threading.Thread):
                         self.cfg.camera_index = idx
                     self.cap = cap
                     self.opened = True
+                    self._active_cam_idx = idx
                     # Re-sync double-buffer dimensions if camera resolution differs
                     if hasattr(test_frame, "shape") and isinstance(test_frame.shape, tuple) and len(test_frame.shape) >= 2:
                         actual_h, actual_w = int(test_frame.shape[0]), int(test_frame.shape[1])
@@ -212,6 +213,16 @@ class FrameGrabber(threading.Thread):
                 return True
         self.reconnecting = False
         return False
+
+    def reload_config(self, cfg=None):
+        """Live reloads tracker settings (camera hot-switch, etc.) without restart."""
+        if cfg:
+            self.cfg = cfg
+        target_cam = getattr(self.cfg, "camera_index", 0)
+        active_cam = getattr(self, "_active_cam_idx", None)
+        if active_cam is not None and active_cam != target_cam:
+            print(f"[tracker] Live camera switch requested: {active_cam} -> {target_cam}")
+            self.release()
 
     def run(self):
         if not self.cap or not self.opened:

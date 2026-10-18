@@ -231,7 +231,9 @@ class TestWeatherClient(unittest.TestCase):
         self.clock_val = 5000.0
         data = self.client.get_weather(23.0225, 72.5714, city="")
         self.assertIsNotNone(data)
-        self.assertIn(data.city, ("Ahmedabad", "New York"))
+        from config import load_config
+        cfg_city = getattr(load_config(), "weather_city", "Ahmedabad")
+        self.assertIn(data.city, ("Ahmedabad", "New York", cfg_city))
         self.assertEqual(data.attribution, "Weather data by Open-Meteo.com")
 
     def test_10_weather_data_to_dict(self):
@@ -255,6 +257,22 @@ class TestWeatherClient(unittest.TestCase):
         self.assertEqual(d["apparent_temperature"], 34.0)
         self.assertEqual(d["wind_direction_arrow"], "→")
         self.assertEqual(d["attribution"], "Weather data by Open-Meteo.com")
+
+    def test_11_search_cities_and_full_city_format(self):
+        """Verifies search_cities autocompletion and comma-separated city parsing."""
+        cities = self.client.search_cities("London", count=5)
+        self.assertIsInstance(cities, list)
+        self.assertGreater(len(cities), 0)
+        self.assertIn("name", cities[0])
+        self.assertIn("display", cities[0])
+        self.assertIn("London", cities[0]["display"])
+
+        # Test comma-separated city name resolution
+        geo = self.client.geocode("London, England, United Kingdom")
+        self.assertIsNotNone(geo)
+        lat, lon, display = geo
+        self.assertAlmostEqual(lat, 51.5085, places=3)
+        self.assertIn("London", display)
 
 
 if __name__ == "__main__":

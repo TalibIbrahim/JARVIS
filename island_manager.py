@@ -179,6 +179,7 @@ class IslandPageManager:
         self.backdrop_blur: bool = False
         self.backdrop_opacity: float = 0.95
         self.hide_fullscreen: bool = True
+        self.waveform_color: str = "blue"
 
         # Preemption Arbitration State
         self._assistant_active: bool = False
@@ -641,6 +642,7 @@ class IslandPageManager:
         self.backdrop_opacity = float(_get("island_backdrop_opacity", self.backdrop_opacity))
         self.pin_open = bool(_get("island_pin_open", self.pin_open))
         self.hide_fullscreen = bool(_get("island_hide_fullscreen", self.hide_fullscreen))
+        self.waveform_color = str(_get("island_waveform_color", self.waveform_color))
 
     # ──────────────────────────────────────────────────────────────────────────
     # Tracking & Assistant Subsystem Status Helpers (Phase 4)

@@ -331,6 +331,20 @@ class WinRTSMTCBackend:
             self._active_session = chosen
             return chosen
 
+        # 3. Retain recently active session if it is still present in sessions list (e.g. video paused for a long time)
+        if self._active_session and self._active_session in sessions:
+            return self._active_session
+
+        # 4. Fall back to current_session if valid
+        if current_session:
+            self._active_session = current_session
+            return current_session
+
+        # 5. Fall back to any session remaining in the system (e.g. stopped/idle video player)
+        if sessions:
+            self._active_session = sessions[0]
+            return sessions[0]
+
         self._active_session = current_session
         return current_session
 
@@ -439,6 +453,8 @@ class WinRTSMTCBackend:
             session = self._active_session or self._select_active_session(mgr)
             if session:
                 res = await session.try_toggle_play_pause_async()
+                if not res:
+                    res = await session.try_play_async()
                 return bool(res)
         except Exception as exc:
             print(f"[media_adapter] SMTC play_pause error: {exc}")
@@ -700,6 +716,58 @@ class MediaAdapter:
                     self._metadata.last_playback_change = time.time()
             return True
 
+        return success
+
+    def play(self) -> bool:
+        """Resumes playback with debouncing, SMTC direct targeting, and fallback."""
+        if not self._debounce_check():
+            return False
+
+        success = False
+        if self._backend.is_available():
+            try:
+                if self._loop and self._loop.is_running():
+                    fut = asyncio.run_coroutine_threadsafe(self._backend.play(), self._loop)
+                    success = fut.result(timeout=0.6)
+                else:
+                    success = asyncio.run(self._backend.play())
+            except Exception:
+                success = False
+
+        if not success:
+            return self.play_pause()
+
+        with self._lock:
+            if self._metadata:
+                self._metadata.is_playing = True
+                self._metadata.status = "playing"
+                self._metadata.last_playback_change = time.time()
+        return success
+
+    def pause(self) -> bool:
+        """Pauses playback with debouncing, SMTC direct targeting, and fallback."""
+        if not self._debounce_check():
+            return False
+
+        success = False
+        if self._backend.is_available():
+            try:
+                if self._loop and self._loop.is_running():
+                    fut = asyncio.run_coroutine_threadsafe(self._backend.pause(), self._loop)
+                    success = fut.result(timeout=0.6)
+                else:
+                    success = asyncio.run(self._backend.pause())
+            except Exception:
+                success = False
+
+        if not success:
+            return self.play_pause()
+
+        with self._lock:
+            if self._metadata:
+                self._metadata.is_playing = False
+                self._metadata.status = "paused"
+                self._metadata.last_playback_change = time.time()
         return success
 
     def next_track(self) -> bool:

@@ -327,9 +327,16 @@ class AppleDynamicIsland(QWidget):
         self.dark_mode, self.accent_color = get_system_theme()
         if self.mgr.cfg and getattr(self.mgr.cfg, "theme_mode", "auto") != "auto":
             self.dark_mode = (self.mgr.cfg.theme_mode == "dark")
+        self.shape_style = getattr(self.mgr.cfg, "island_shape_style", "pill") if (self.mgr and getattr(self.mgr, "cfg", None)) else "pill"
 
         self.resize(120, 32)
         self._center_top()
+
+    def reload_config(self):
+        if self.mgr and getattr(self.mgr, "cfg", None):
+            self.shape_style = getattr(self.mgr.cfg, "island_shape_style", "pill")
+            self._center_top()
+            self.update()
 
     def make_click_through(self):
         if sys.platform != "win32":
@@ -367,7 +374,9 @@ class AppleDynamicIsland(QWidget):
                 w = max(40, min(int(round(self.spring_w.value)), 3840))
                 h = max(20, min(int(round(self.spring_h.value)), 2160))
                 cx = geom.x() + (geom.width() - w) // 2
-                self.setGeometry(cx, geom.y(), w, h)
+                is_pill = getattr(self, "shape_style", "pill") == "pill"
+                top_margin = 10 if is_pill else 0
+                self.setGeometry(cx, geom.y() + top_margin, w, h)
         except Exception as exc:
             print(f"[overlay] center_top error: {exc}")
 
@@ -456,32 +465,57 @@ class AppleDynamicIsland(QWidget):
         is_prompt = (now < self.prompt_until and bool(self.user_prompt)) or (is_thinking and bool(self.user_prompt))
 
         # 1. Soft Multi-Layered Drop Shadow
-        pill_rect = QRectF(2, -18, w - 4, h + 16)
-        squircle = create_squircle_path(pill_rect, r)
+        is_pill = getattr(self, "shape_style", "pill") == "pill"
+        if is_pill:
+            pill_rect = QRectF(2, 2, w - 4, h - 4)
+            squircle = create_squircle_path(pill_rect, r)
 
-        for offset, alpha in [(2, 14), (4, 22), (6, 32)]:
-            shadow_rect = QRectF(2, -18 + offset, w - 4, h + 16)
-            shadow_path = create_squircle_path(shadow_rect, r)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-            p.drawPath(shadow_path)
+            for offset, alpha in [(2, 14), (4, 22), (6, 32)]:
+                shadow_rect = QRectF(2, 2 + offset, w - 4, h - 4)
+                shadow_path = create_squircle_path(shadow_rect, r)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+                p.drawPath(shadow_path)
 
-        # 2. Base Glass Tint Fill (Refined macOS graphite / frosted milk)
-        bg_grad = QLinearGradient(0, -18, 0, h)
-        if self.dark_mode:
-            bg_grad.setColorAt(0.0, QColor(36, 36, 42, 215))
-            bg_grad.setColorAt(1.0, QColor(22, 22, 26, 230))
+            bg_grad = QLinearGradient(0, 2, 0, h - 2)
+            if self.dark_mode:
+                bg_grad.setColorAt(0.0, QColor(36, 36, 42, 215))
+                bg_grad.setColorAt(1.0, QColor(22, 22, 26, 230))
+            else:
+                bg_grad.setColorAt(0.0, QColor(248, 248, 252, 225))
+                bg_grad.setColorAt(1.0, QColor(232, 232, 238, 235))
+
+            p.fillPath(squircle, QBrush(bg_grad))
+
+            sheen_grad = QLinearGradient(0, 2, 0, (h - 2) * 0.5)
+            sheen_grad.setColorAt(0.0, QColor(255, 255, 255, 30 if self.dark_mode else 80))
+            sheen_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+            p.fillPath(squircle, QBrush(sheen_grad))
         else:
-            bg_grad.setColorAt(0.0, QColor(248, 248, 252, 225))
-            bg_grad.setColorAt(1.0, QColor(232, 232, 238, 235))
+            pill_rect = QRectF(2, -r, w - 4, h + r - 2)
+            squircle = create_squircle_path(pill_rect, r)
 
-        p.fillPath(squircle, QBrush(bg_grad))
+            for offset, alpha in [(2, 14), (4, 22), (6, 32)]:
+                shadow_rect = QRectF(2, -r + offset, w - 4, h + r - 2)
+                shadow_path = create_squircle_path(shadow_rect, r)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+                p.drawPath(shadow_path)
 
-        # 3. Specular Sheen (Upper half highlight)
-        sheen_grad = QLinearGradient(0, -18, 0, h * 0.5)
-        sheen_grad.setColorAt(0.0, QColor(255, 255, 255, 30 if self.dark_mode else 80))
-        sheen_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-        p.fillPath(squircle, QBrush(sheen_grad))
+            bg_grad = QLinearGradient(0, 0, 0, h)
+            if self.dark_mode:
+                bg_grad.setColorAt(0.0, QColor(36, 36, 42, 215))
+                bg_grad.setColorAt(1.0, QColor(22, 22, 26, 230))
+            else:
+                bg_grad.setColorAt(0.0, QColor(248, 248, 252, 225))
+                bg_grad.setColorAt(1.0, QColor(232, 232, 238, 235))
+
+            p.fillPath(squircle, QBrush(bg_grad))
+
+            sheen_grad = QLinearGradient(0, 0, 0, h * 0.5)
+            sheen_grad.setColorAt(0.0, QColor(255, 255, 255, 30 if self.dark_mode else 80))
+            sheen_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+            p.fillPath(squircle, QBrush(sheen_grad))
 
         # 4. 1 px Inner Highlight Stroke (Top light reflection, bottom occlusion)
         border_grad = QLinearGradient(0, -18, 0, h)
@@ -2670,6 +2704,19 @@ class Overlay:
         else:
             self.root.mainloop()
 
+    def reload_config(self, new_cfg=None):
+        """Live updates settings across Dynamic Island, overlays, and background subsystems."""
+        if new_cfg is not None:
+            self.cfg = new_cfg
+        if hasattr(self, "island") and hasattr(self.island, "reload_config"):
+            self.island.reload_config()
+        if hasattr(self, "cursor_overlay") and hasattr(self.cursor_overlay, "reload_config"):
+            self.cursor_overlay.reload_config()
+        if hasattr(self, "tray") and hasattr(self.tray, "reload_config"):
+            self.tray.reload_config()
+        if hasattr(self, "ctx") and self.ctx and hasattr(self.ctx, "reload_config"):
+            self.ctx.reload_config(self.cfg)
+
     def open_settings(self, initial_tab=0):
         if not PYSIDE6_AVAILABLE or not self.cfg or not self.ctx:
             return
@@ -2942,6 +2989,8 @@ class Overlay:
                             self.ctx.on_disambiguate_selected(cand)
                         except Exception:
                             pass
+                elif kind == "reload_config":
+                    self.reload_config(d.get("cfg"))
                 elif kind == "expand_card":
                     card = d.get("card", "weather")
                     if hasattr(self.island, "expand_card"):
@@ -2956,15 +3005,29 @@ class Overlay:
                     if hasattr(self.island, "media_title"):
                         if "title" in d: self.island.media_title = str(d["title"])
                         if "artist" in d: self.island.media_artist = str(d["artist"])
+                        if "album" in d: self.island.media_album = str(d["album"])
                         if "playing" in d: self.island.media_playing = bool(d["playing"])
                         if "active" in d: self.island.media_active = bool(d["active"])
                         if "progress" in d: self.island.media_progress = float(d["progress"])
                         if "duration" in d: self.island.media_duration_sec = float(d["duration"])
                         if "position" in d: self.island.media_position_sec = float(d["position"])
                         if "source" in d: self.island.media_source = str(d["source"])
+                        if "thumbnail_bytes" in d:
+                            t_bytes = d["thumbnail_bytes"]
+                            if t_bytes and hasattr(self.island, "set_thumbnail_bytes"):
+                                self.island.set_thumbnail_bytes(t_bytes)
+                            elif t_bytes is None:
+                                self.island.media_album_art = None
+                                if hasattr(self.island, "_icon_cache"):
+                                    self.island._icon_cache.clear()
+                        if "dominant_color" in d:
+                            c_val = d["dominant_color"]
+                            if c_val and hasattr(self.island, "media_dominant_color"):
+                                self.island.media_dominant_color = QColor(c_val) if isinstance(c_val, str) else c_val
                 elif kind == "weather_state":
                     if hasattr(self.island, "weather_temp"):
                         if "temp" in d: self.island.weather_temp = float(d["temp"])
+                        if "unit_symbol" in d: self.island.weather_unit_symbol = str(d["unit_symbol"])
                         if "condition" in d: self.island.weather_condition = str(d["condition"])
                         if "icon" in d: self.island.weather_icon = str(d["icon"])
                         if "high" in d: self.island.weather_high = float(d["high"])

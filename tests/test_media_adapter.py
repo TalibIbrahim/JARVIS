@@ -316,6 +316,58 @@ class TestMediaAdapter(unittest.TestCase):
         chosen_paused = backend._select_active_session(mock_mgr)
         self.assertIn(chosen_paused, [s1, s2])
 
+    def test_15_long_paused_session_retained_when_stopped_and_no_current(self):
+        """When a video has been paused for a long time (stopped, no active OS session), session is retained."""
+        backend = WinRTSMTCBackend()
+
+        s_video = MagicMock()
+        info_video = MagicMock()
+        info_video.playback_status = STATUS_STOPPED
+        s_video.get_playback_info.return_value = info_video
+
+        # Simulate s_video being previously active before being paused for a long time
+        backend._active_session = s_video
+
+        mock_mgr = MagicMock()
+        mock_mgr.get_sessions.return_value = [s_video]
+        mock_mgr.get_current_session.return_value = None  # Windows drops current_session after long pause
+
+        chosen = backend._select_active_session(mock_mgr)
+        self.assertEqual(chosen, s_video)
+
+    def test_16_play_pause_falls_back_to_try_play_when_toggle_fails(self):
+        """When try_toggle_play_pause_async returns False on long-paused session, calls try_play_async."""
+        backend = WinRTSMTCBackend()
+        s = MagicMock()
+
+        async def mock_toggle():
+            return False
+
+        async def mock_play():
+            return True
+
+        s.try_toggle_play_pause_async = mock_toggle
+        s.try_play_async = mock_play
+        backend._active_session = s
+
+        mock_mgr = MagicMock()
+        backend._manager = mock_mgr
+
+        res = asyncio.run(backend.play_pause())
+        self.assertTrue(res)
+
+    def test_17_adapter_play_and_pause_methods(self):
+        """MediaAdapter provides play() and pause() methods that update playback state."""
+        adapter = MediaAdapter(self.mock_backend, debounce_sec=0.0)
+        self.mock_backend.metadata.is_playing = False
+        adapter.refresh_sync()
+
+        self.assertTrue(adapter.play())
+        self.assertTrue(adapter.get_current_media().is_playing)
+
+        self.assertTrue(adapter.pause())
+        self.assertFalse(adapter.get_current_media().is_playing)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -420,6 +420,35 @@ class TestLockContentionAndWakeLatency(unittest.TestCase):
         self.assertTrue(hasattr(v, "listen"))
         self.assertEqual(v.listen(timeout=0.1), "")
 
+    def test_active_command_processed_when_listening_window_expired(self):
+        """Commands flagged with is_command=True must NOT be dropped even if listening_until expired."""
+        cfg = Config()
+        cfg.wake_aliases = ["jarvis"]
+        ctx = MagicMock()
+        v = Voice(cfg, ctx, MagicMock())
+        # Simulate timer expired prior to STT finishing
+        v.listening_until = time.time() - 10.0
+
+        with patch("voice.run_command", return_value="Opening browser."):
+            # User spoke "open chrome" after wake word (command does NOT contain "jarvis")
+            v._process("open chrome", is_command=True)
+
+        ctx.overlay.post.assert_any_call("prompt", text="open chrome", raw="open chrome")
+        ctx.say.assert_called_with("Opening browser.")
+
+    def test_wake_idle_prompts_yes_sir_and_opens_window(self):
+        """When wake is triggered with no trailing utterance, assistant confirms 'Yes, sir?'."""
+        cfg = Config()
+        ctx = MagicMock()
+        v = Voice(cfg, ctx, MagicMock())
+        v.wake_detector = MagicMock()
+
+        v._on_wake_idle()
+
+        ctx.say.assert_called_with("Yes, sir?")
+        self.assertGreater(v.listening_until, time.time())
+        self.assertEqual(v.wake_detector.listening_until, v.listening_until)
+
 
 if __name__ == "__main__":
     unittest.main()

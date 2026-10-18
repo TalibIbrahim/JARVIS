@@ -187,6 +187,12 @@ class AppleDynamicIsland(QWidget):
         self.pin_open: bool = False
         self.card_pages: list[str] = ["media", "time", "weather", "hardware", "jarvis"]
 
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        style_val = getattr(cfg, "island_shape_style", getattr(self.mgr, "shape_style", "pill")) if (cfg or self.mgr) else "pill"
+        if hasattr(style_val, "value"):
+            style_val = style_val.value
+        self.shape_style: str = str(style_val).lower().strip() if style_val else "pill"
+
         # ── State fields ───────────────────────────────────────────────
         self.active          = False
         self.label           = "STANDBY"
@@ -261,6 +267,7 @@ class AppleDynamicIsland(QWidget):
 
         # Weather state
         self.weather_temp: float = 72.0
+        self.weather_unit_symbol: str = "°F"
         self.weather_condition: str = "Partly Cloudy"
         self.weather_icon: str = "partly_cloudy"
         self.weather_high: float = 76.0
@@ -294,6 +301,8 @@ class AppleDynamicIsland(QWidget):
         self.media_progress: float = 84.0 / 200.0
         self.media_album_art: Optional[QPixmap] = None
         self.media_dominant_color: QColor = QColor(175, 82, 222)
+        self.media_average_color: Optional[QColor] = None
+        self.media_secondary_color: Optional[QColor] = None
         self._media_bars: list[float] = [0.35, 0.75, 0.50, 0.85]
         self._dragging_scrubber: bool = False
 
@@ -312,11 +321,15 @@ class AppleDynamicIsland(QWidget):
         self.expanded_until: float = 0.0
         self._card_expand_t: float = 0.0
         self.is_interactive: bool = False
+        self._opened_via_hover: bool = False
+        self._hover_leave_t: float = 0.0
         self._hover_enter_t: float = 0.0
         self._hovered_btn: Optional[str] = None
         self._btn_dwell_elapsed: float = 0.0
         self._btn_flash_until: float = 0.0
         self._prev_active_gesture: str = ""
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        self.waveform_color: str = str(getattr(cfg, "island_waveform_color", "blue")) if cfg else "blue"
 
         # Disambiguation Card State
         self.disambiguate_active: bool = False
@@ -369,15 +382,44 @@ class AppleDynamicIsland(QWidget):
                 dark = False
         return dark, None
 
+    def set_shape_style(self, style: str) -> None:
+        """Dynamically switch between 'pill' (floating stadium capsule) and 'notch' (bezel-attached)."""
+        val = str(getattr(style, "value", style)).lower().strip()
+        if val in ("pill", "notch"):
+            self.shape_style = val
+            if hasattr(self.mgr, "shape_style"):
+                try:
+                    from island_manager import IslandShapeStyle
+                    self.mgr.shape_style = IslandShapeStyle.from_str(val)
+                except Exception:
+                    pass
+            self._center_top()
+            self.update()
+
     def reload_config(self) -> None:
         """Live apply settings without restart."""
         self.dark_mode, _ = self._read_theme()
+        self._icon_cache.clear()
+        self._cached_calendar_data = None
+        self._cached_calendar_key = None
+
         cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
         if cfg:
+            shape_style = getattr(cfg, "island_shape_style", getattr(self.mgr, "shape_style", None))
+            if shape_style:
+                val = str(getattr(shape_style, "value", shape_style)).lower().strip()
+                if val in ("pill", "notch"):
+                    self.shape_style = val
+                    if hasattr(self.mgr, "shape_style"):
+                        try:
+                            from island_manager import IslandShapeStyle
+                            self.mgr.shape_style = IslandShapeStyle.from_str(val)
+                        except Exception:
+                            pass
             city = getattr(cfg, "island_weather_city", getattr(cfg, "weather_city", None))
             if city:
                 self.weather_city = city
-            self.pin_open = getattr(cfg, "island_pin_open", self.pin_open)
+            self.pin_open = bool(getattr(cfg, "island_pin_open", self.pin_open))
             pages = getattr(cfg, "island_pages", ["media", "calendar", "weather", "hardware", "jarvis"])
             enabled_map = getattr(cfg, "island_pages_enabled", {})
             active_pages = []
@@ -388,6 +430,22 @@ class AppleDynamicIsland(QWidget):
                         active_pages.append(canon)
             if active_pages:
                 self.card_pages = active_pages
+
+            hw_layout = getattr(cfg, "island_hardware_layout", "grid")
+            if self.expanded_card in ("hardware", "hardware_grid", "hardware_strip"):
+                self.expanded_card = "hardware_strip" if hw_layout == "strip" else "hardware_grid"
+
+            wf_color = getattr(cfg, "island_waveform_color", None)
+            if wf_color:
+                self.waveform_color = str(wf_color)
+
+            if sys.platform == "win32" and hasattr(self, "winId"):
+                try:
+                    from ui.materials import apply_glass_backdrop
+                    if getattr(cfg, "island_backdrop_blur", False) or getattr(cfg, "glass_blur", False):
+                        apply_glass_backdrop(int(self.winId()), dark=self.dark_mode)
+                except Exception:
+                    pass
 
             now = time.time()
             st = self._resolve_state(now)
@@ -451,9 +509,15 @@ class AppleDynamicIsland(QWidget):
                 # Add horizontal nope offset during NO_SPEECH
                 nope_dx = int(round(self._nope_offset_x))
                 cx = geom.x() + (geom.width() - w) // 2 + nope_dx
+                
+                # Floating pill floats below top bezel; notch attaches flush to top bezel
+                is_pill = getattr(self, "shape_style", "pill") == "pill"
+                top_margin = 10 if is_pill else 0
+                cy = geom.y() + top_margin
+                
                 cur = self.geometry()
-                if cur.x() != cx or cur.y() != geom.y() or cur.width() != w or cur.height() != h:
-                    self.setGeometry(cx, geom.y(), w, h)
+                if cur.x() != cx or cur.y() != cy or cur.width() != w or cur.height() != h:
+                    self.setGeometry(cx, cy, w, h)
         except Exception as exc:
             print(f"[island] center_top: {exc}")
 
@@ -749,6 +813,8 @@ class AppleDynamicIsland(QWidget):
         """Collapse expanded card back to compact pill."""
         self.expanded_card = None
         self.expanded_until = 0.0
+        self._opened_via_hover = False
+        self._hover_leave_t = 0.0
         self.set_interactive(False)
         self._sync_hardware_adapter_lifecycle(time.time())
 
@@ -1278,7 +1344,13 @@ class AppleDynamicIsland(QWidget):
         is_hovering = geom.contains(cursor_pos)
         self._is_hovering = is_hovering
 
-        cfg = getattr(self.mgr, "cfg", None)
+        # When cursor hovers over the island, remove WS_EX_TRANSPARENT so mouse clicks can peek/interact!
+        if is_hovering and not self.is_interactive:
+            self.set_interactive(True)
+        elif not is_hovering and self.expanded_card is None and not self.disambiguate_active and self.is_interactive:
+            self.set_interactive(False)
+
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
         expand_trig = getattr(cfg, "island_expand_trigger", "hover")
 
         # 0. Disambiguation Card Interaction & Auto-collapse
@@ -1317,7 +1389,7 @@ class AppleDynamicIsland(QWidget):
                 self._hovered_chip_idx = None
                 self._chip_dwell_elapsed = 0.0
 
-        # 1. Compact -> Expansion triggers
+        # 1. Compact -> Expansion triggers (Hover peek / Fist-click)
         elif self.expanded_card is None and not self.is_wake and not self.listening and not self.thinking:
             if is_hovering:
                 if self._hover_enter_t == 0.0:
@@ -1325,7 +1397,14 @@ class AppleDynamicIsland(QWidget):
                 thresh = 0.25 if expand_trig == "hover" else 1.0
                 if now - self._hover_enter_t >= thresh:
                     cm = self._get_current_compact_mode()
-                    card = "media" if cm == "media" else ("timer" if cm == "timer" else "weather")
+                    if self.media_playing or self.media_active or getattr(self, "media_title", ""):
+                        card = "media"
+                    elif cm == "timer" or self.timer_active:
+                        card = "timer"
+                    else:
+                        card = "weather"
+                    self._opened_via_hover = True
+                    self._hover_leave_t = 0.0
                     self.expand_card(card)
                     self._hover_enter_t = 0.0
             else:
@@ -1334,15 +1413,31 @@ class AppleDynamicIsland(QWidget):
             # Hand-tracking fist-click trigger
             if is_hovering and self.label == "CLICK" and self._prev_active_gesture != "CLICK":
                 cm = self._get_current_compact_mode()
-                card = "media" if cm == "media" else ("timer" if cm == "timer" else "weather")
+                if self.media_playing or self.media_active or getattr(self, "media_title", ""):
+                    card = "media"
+                elif cm == "timer" or self.timer_active:
+                    card = "timer"
+                else:
+                    card = "weather"
+                self._opened_via_hover = False
                 self.expand_card(card)
 
         # 2. Expanded Card Interaction & Auto-collapse
         elif self.expanded_card:
-            # Auto-collapse after 4 seconds of no interaction (unless pin open)
-            cfg = getattr(self.mgr, "cfg", None)
             is_pinned = getattr(self, "pin_open", False) or getattr(cfg, "island_pin_open", False)
-            if not is_pinned and now >= self.expanded_until:
+
+            # Hover-peek auto-collapse: when opened via hover, collapse shortly after cursor leaves
+            if self._opened_via_hover and not is_pinned:
+                if is_hovering:
+                    self._hover_leave_t = 0.0
+                    self.expanded_until = max(self.expanded_until, now + 1.5)
+                else:
+                    if self._hover_leave_t == 0.0:
+                        self._hover_leave_t = now
+                    elif now - self._hover_leave_t >= 0.35:
+                        self.collapse_card()
+                        return
+            elif not is_pinned and now >= self.expanded_until:
                 self.collapse_card()
                 return
 
@@ -1357,6 +1452,7 @@ class AppleDynamicIsland(QWidget):
                             self._trigger_button(btn)
                             self._btn_dwell_elapsed = 0.0
                             self._btn_flash_until = now + 0.25
+                            self._opened_via_hover = False
                     else:
                         self._hovered_btn = btn
                         self._btn_dwell_elapsed = 0.0
@@ -1366,6 +1462,7 @@ class AppleDynamicIsland(QWidget):
                         self._trigger_button(btn)
                         self._btn_dwell_elapsed = 0.0
                         self._btn_flash_until = now + 0.25
+                        self._opened_via_hover = False
                 else:
                     self._hovered_btn = None
                     self._btn_dwell_elapsed = 0.0
@@ -1430,6 +1527,7 @@ class AppleDynamicIsland(QWidget):
                 return
 
         self.expanded_until = now + 4.0
+        self._opened_via_hover = False
 
         if self.expanded_card:
             dot_idx = self._dot_at(pos)
@@ -1462,7 +1560,13 @@ class AppleDynamicIsland(QWidget):
 
         elif self.expanded_card is None:
             cm = self._get_current_compact_mode()
-            card = "media" if cm == "media" else ("timer" if cm == "timer" else "weather")
+            if self.media_playing or self.media_active or getattr(self, "media_title", ""):
+                card = "media"
+            elif cm == "timer" or self.timer_active:
+                card = "timer"
+            else:
+                card = "weather"
+            self._opened_via_hover = False
             self.expand_card(card)
 
         super().mousePressEvent(event)
@@ -1581,36 +1685,73 @@ class AppleDynamicIsland(QWidget):
 
     def media_toggle_play(self) -> None:
         self.media_playing = not self.media_playing
-        if sys.platform == "win32":
+        success = False
+        try:
+            from media_adapter import get_media_adapter
+            adapter = get_media_adapter()
+            if self.media_playing:
+                success = adapter.play()
+            else:
+                success = adapter.pause()
+        except Exception as exc:
+            print(f"[island] media_toggle_play error: {exc}")
+
+        if not success and sys.platform == "win32":
             try:
                 ctypes.windll.user32.keybd_event(0xB3, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(0xB3, 0, 2, 0)
             except Exception:
                 pass
+        self.update()
 
     def media_prev(self) -> None:
-        if sys.platform == "win32":
+        success = False
+        try:
+            from media_adapter import get_media_adapter
+            success = get_media_adapter().previous_track()
+        except Exception as exc:
+            print(f"[island] media_prev error: {exc}")
+
+        if not success and sys.platform == "win32":
             try:
                 ctypes.windll.user32.keybd_event(0xB1, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(0xB1, 0, 2, 0)
             except Exception:
                 pass
+        self.update()
 
     def media_next(self) -> None:
-        if sys.platform == "win32":
+        success = False
+        try:
+            from media_adapter import get_media_adapter
+            success = get_media_adapter().next_track()
+        except Exception as exc:
+            print(f"[island] media_next error: {exc}")
+
+        if not success and sys.platform == "win32":
             try:
                 ctypes.windll.user32.keybd_event(0xB0, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(0xB0, 0, 2, 0)
             except Exception:
                 pass
+        self.update()
 
-    def format_temp(self, temp_f: float) -> str:
-        cfg = getattr(self.mgr, "cfg", None)
-        units = getattr(cfg, "island_weather_units", "auto").lower()
-        if units == "celsius":
-            c = int(round((temp_f - 32.0) * 5.0 / 9.0))
+    def format_temp(self, temp_val: float) -> str:
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        units = getattr(cfg, "island_weather_units", getattr(cfg, "weather_units", "auto")).lower()
+        current_sym = getattr(self, "weather_unit_symbol", None)
+
+        if current_sym == "°F" and units == "celsius":
+            c = int(round((temp_val - 32.0) * 5.0 / 9.0))
             return f"{c}°"
-        return f"{int(round(temp_f))}°"
+        elif current_sym == "°C" and units == "fahrenheit":
+            f = int(round(temp_val * 9.0 / 5.0 + 32.0))
+            return f"{f}°"
+        elif units == "celsius" and not current_sym and temp_val > 50.0:
+            c = int(round((temp_val - 32.0) * 5.0 / 9.0))
+            return f"{c}°"
+
+        return f"{int(round(temp_val))}°"
 
     def _sync_hardware_adapter_lifecycle(self, now: float) -> None:
         """Polls hardware adapter only while hardware page is active; pauses when collapsed or on other pages."""
@@ -1857,33 +1998,82 @@ class AppleDynamicIsland(QWidget):
         else:
             opacity = min(1.0, max(0.0, self._opacity_spring.value))
 
-        pill_rect = QRectF(2, -16, w - 4, h + 14)
-        squircle  = create_cached_squircle_path(pill_rect, r)
+        is_pill = getattr(self, "shape_style", "pill") == "pill"
+        if is_pill:
+            # Floating stadium capsule with 4 rounded squircle corners
+            pill_rect = QRectF(2, 2, w - 4, h - 4)
+            squircle  = create_cached_squircle_path(pill_rect, r)
 
-        # ── 1. Soft multi-layer drop shadow ──────────────────────────────
-        for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
-            sr = QRectF(2, -16 + offset, w - 4, h + 14)
-            sp = create_cached_squircle_path(sr, r)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-            p.drawPath(sp)
+            # ── 1. Soft multi-layer drop shadow ──────────────────────────────
+            for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
+                sr = QRectF(2, 2 + offset, w - 4, h - 4)
+                sp = create_cached_squircle_path(sr, r)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+                p.drawPath(sp)
 
-        # ── 2. Glass tint fill (Obsidian gradient) ────────────────────────
-        bg_grad = QLinearGradient(0, -16, 0, h)
-        if dark:
-            bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
-            bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
+            # ── 2. Glass tint fill (Obsidian gradient) ────────────────────────
+            bg_grad = QLinearGradient(0, 2, 0, h - 2)
+            cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+            op = float(getattr(cfg, "island_backdrop_opacity", 0.95)) if cfg else 0.95
+            op_scale = max(0.05, min(1.0, op / 0.95))
+            if dark:
+                bg_grad.setColorAt(0.0, QColor(19, 22, 23, int(round(245 * op_scale))))
+                bg_grad.setColorAt(1.0, QColor(10, 10, 10, int(round(250 * op_scale))))
+            else:
+                bg_grad.setColorAt(0.0, QColor(248, 248, 252, int(round(240 * op_scale))))
+                bg_grad.setColorAt(1.0, QColor(230, 230, 238, int(round(248 * op_scale))))
+
+            p.fillPath(squircle, QBrush(bg_grad))
         else:
-            bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
-            bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
+            # Bezel-attached notch: top edge flush against screen bezel, bottom corners rounded
+            pill_rect = QRectF(2, -16, w - 4, h + 14)
+            squircle  = create_cached_squircle_path(pill_rect, r)
 
-        p.fillPath(squircle, QBrush(bg_grad))
+            # ── 1. Soft multi-layer drop shadow ──────────────────────────────
+            for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
+                sr = QRectF(2, -16 + offset, w - 4, h + 14)
+                sp = create_cached_squircle_path(sr, r)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
+                p.drawPath(sp)
 
-        # Media Card dominant color glass ambient tint
+            # ── 2. Glass tint fill (Obsidian gradient) ────────────────────────
+            bg_grad = QLinearGradient(0, -16, 0, h)
+            cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+            op = float(getattr(cfg, "island_backdrop_opacity", 0.95)) if cfg else 0.95
+            op_scale = max(0.05, min(1.0, op / 0.95))
+            if dark:
+                bg_grad.setColorAt(0.0, QColor(19, 22, 23, int(round(245 * op_scale))))
+                bg_grad.setColorAt(1.0, QColor(10, 10, 10, int(round(250 * op_scale))))
+            else:
+                bg_grad.setColorAt(0.0, QColor(248, 248, 252, int(round(240 * op_scale))))
+                bg_grad.setColorAt(1.0, QColor(230, 230, 238, int(round(248 * op_scale))))
+
+            p.fillPath(squircle, QBrush(bg_grad))
+
+        # Media Card dominant & average gradient glass ambient tint
         if state == IslandState.CARD_MEDIA and self.media_dominant_color:
-            tint = QColor(self.media_dominant_color)
-            tint.setAlpha(36 if dark else 24)
-            p.fillPath(squircle, QBrush(tint))
+            if getattr(self, "media_album_art", None) and not self.media_album_art.isNull():
+                card_grad = QLinearGradient(0, 0, w, h)
+                c_start = QColor(self.media_dominant_color)
+                c_start.setAlpha(65 if dark else 45)
+
+                mid_c = getattr(self, "media_secondary_color", None) or getattr(self, "media_average_color", None) or self.media_dominant_color
+                c_mid = QColor(mid_c)
+                c_mid.setAlpha(35 if dark else 24)
+
+                c_end = QColor(mid_c)
+                c_end.setAlpha(10 if dark else 6)
+
+                card_grad.setColorAt(0.0, c_start)
+                card_grad.setColorAt(0.55, c_mid)
+                card_grad.setColorAt(1.0, c_end)
+                p.fillPath(squircle, QBrush(card_grad))
+            else:
+                tint = QColor(self.media_dominant_color)
+                tint.setAlpha(36 if dark else 24)
+                p.fillPath(squircle, QBrush(tint))
 
         # ── 3. Soft edge glow pulse in WAKE or CARD_SENDING / CARD_JARVIS ──
         glow_val = self.spring_glow.value
@@ -1904,7 +2094,10 @@ class AppleDynamicIsland(QWidget):
             self._draw_shimmer(p, squircle, w, h, t, dark)
 
         # ── 5. Top specular sheen ─────────────────────────────────────────
-        sheen = QLinearGradient(0, -16, 0, h * 0.40)
+        if is_pill:
+            sheen = QLinearGradient(0, 2.0, 0, 2.0 + (h - 2.0) * 0.40)
+        else:
+            sheen = QLinearGradient(0, -16, 0, h * 0.40)
         sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
         sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.fillPath(squircle, QBrush(sheen))
@@ -2245,11 +2438,15 @@ class AppleDynamicIsland(QWidget):
             gap = 1.8
             max_bh = 13.0
             p.setPen(Qt.PenStyle.NoPen)
+            wf_cols = self._get_waveform_colors()
             for i in range(4):
                 bh = max(3.0, self._media_bars[i] * max_bh)
                 bx = bx0 + i * (bar_w + gap)
                 by = cy - bh / 2.0
-                bar_col = QColor(175, 82, 222) if i % 2 == 0 else QColor(0, 229, 255)
+                if getattr(self, "waveform_color", "blue") == "multicolor":
+                    bar_col = QColor(175, 82, 222) if i % 2 == 0 else QColor(0, 229, 255)
+                else:
+                    bar_col = wf_cols[1] if i % 2 == 0 else wf_cols[2]
                 p.setBrush(QBrush(bar_col))
                 p.drawRoundedRect(QRectF(bx, by, bar_w, bh), bar_w / 2.0, bar_w / 2.0)
 
@@ -3697,22 +3894,50 @@ class AppleDynamicIsland(QWidget):
         p.drawEllipse(QPointF(cx + w * 0.12, cy - h * 0.45), h * 0.85, h * 0.85)
 
     def set_thumbnail_bytes(self, data: bytes) -> None:
-        """Sets thumbnail from raw bytes and samples dominant color."""
+        """Sets thumbnail from raw bytes and samples dominant & average gradient colors."""
         pix = QPixmap()
         if pix.loadFromData(data):
             self.media_album_art = pix
-            img = pix.toImage().scaled(16, 16)
+            img = pix.toImage().scaled(32, 32)
             r, g, b = 0, 0, 0
             n = img.width() * img.height()
+            r_top, g_top, b_top, n_top = 0, 0, 0, 0
+            r_bot, g_bot, b_bot, n_bot = 0, 0, 0, 0
+            half_h = img.height() // 2
             for y in range(img.height()):
                 for x in range(img.width()):
                     c = img.pixelColor(x, y)
                     r += c.red()
                     g += c.green()
                     b += c.blue()
+                    if y < half_h:
+                        r_top += c.red()
+                        g_top += c.green()
+                        b_top += c.blue()
+                        n_top += 1
+                    else:
+                        r_bot += c.red()
+                        g_bot += c.green()
+                        b_bot += c.blue()
+                        n_bot += 1
             if n > 0:
-                self.media_dominant_color = QColor(int(r / n), int(g / n), int(b / n))
+                avg_col = QColor(int(r / n), int(g / n), int(b / n))
+                top_col = QColor(int(r_top / n_top), int(g_top / n_top), int(b_top / n_top)) if n_top > 0 else avg_col
+                bot_col = QColor(int(r_bot / n_bot), int(g_bot / n_bot), int(b_bot / n_bot)) if n_bot > 0 else avg_col
+                try:
+                    from media_adapter import extract_dominant_color
+                    hex_c = extract_dominant_color(data)
+                    if hex_c and hex_c.startswith("#"):
+                        self.media_dominant_color = QColor(hex_c)
+                    else:
+                        self.media_dominant_color = top_col
+                except Exception:
+                    self.media_dominant_color = top_col
+
+                self.media_average_color = avg_col
+                self.media_secondary_color = bot_col
             self._icon_cache.clear()
+            self.update()
 
     def _get_album_art(self, size: float) -> QPixmap:
         """Returns crisp DPI-safe cached album art pixmap."""
@@ -3885,6 +4110,115 @@ class AppleDynamicIsland(QWidget):
         p.setBrush(QBrush(core))
         p.drawEllipse(QPointF(orb_cx, orb_cy), 6.0, 6.0)
 
+    def _get_waveform_colors(self) -> list[QColor]:
+        """Returns 7 QColor entries for the audio-reactive waveform bars."""
+        c_name = str(getattr(self, "waveform_color", "blue")).lower().strip()
+        if c_name == "multicolor":
+            return [
+                QColor(175, 82, 222, 200),
+                QColor(0,  240, 255, 220),
+                QColor(0,  122, 255, 230),
+                QColor(255, 255, 255, 240),
+                QColor(0,  122, 255, 230),
+                QColor(0,  240, 255, 220),
+                QColor(175, 82, 222, 200),
+            ]
+        if c_name in ("blue", "default"):
+            return [
+                QColor(0, 110, 230, 200),
+                QColor(0, 180, 255, 225),
+                QColor(0, 122, 255, 235),
+                QColor(210, 240, 255, 255),
+                QColor(0, 122, 255, 235),
+                QColor(0, 180, 255, 225),
+                QColor(0, 110, 230, 200),
+            ]
+        if c_name == "cyan":
+            return [
+                QColor(0, 160, 200, 200),
+                QColor(0, 220, 245, 225),
+                QColor(50, 200, 240, 240),
+                QColor(225, 250, 255, 255),
+                QColor(50, 200, 240, 240),
+                QColor(0, 220, 245, 225),
+                QColor(0, 160, 200, 200),
+            ]
+        if c_name == "green":
+            return [
+                QColor(30, 170, 70, 200),
+                QColor(52, 215, 95, 225),
+                QColor(40, 195, 80, 240),
+                QColor(225, 255, 235, 255),
+                QColor(40, 195, 80, 240),
+                QColor(52, 215, 95, 225),
+                QColor(30, 170, 70, 200),
+            ]
+        if c_name == "orange":
+            return [
+                QColor(225, 120, 0, 200),
+                QColor(255, 175, 40, 225),
+                QColor(255, 150, 10, 240),
+                QColor(255, 245, 225, 255),
+                QColor(255, 150, 10, 240),
+                QColor(255, 175, 40, 225),
+                QColor(225, 120, 0, 200),
+            ]
+        if c_name == "purple":
+            return [
+                QColor(140, 60, 185, 200),
+                QColor(190, 105, 235, 225),
+                QColor(175, 82, 222, 240),
+                QColor(250, 235, 255, 255),
+                QColor(175, 82, 222, 240),
+                QColor(190, 105, 235, 225),
+                QColor(140, 60, 185, 200),
+            ]
+        if c_name == "red":
+            return [
+                QColor(215, 45, 35, 200),
+                QColor(255, 95, 85, 225),
+                QColor(255, 69, 58, 240),
+                QColor(255, 235, 235, 255),
+                QColor(255, 69, 58, 240),
+                QColor(255, 95, 85, 225),
+                QColor(215, 45, 35, 200),
+            ]
+        if c_name == "pink":
+            return [
+                QColor(215, 30, 70, 200),
+                QColor(255, 80, 120, 225),
+                QColor(255, 45, 85, 240),
+                QColor(255, 235, 245, 255),
+                QColor(255, 45, 85, 240),
+                QColor(255, 80, 120, 225),
+                QColor(215, 30, 70, 200),
+            ]
+        if c_name in ("monochrome", "white", "gray", "grey"):
+            return [
+                QColor(160, 160, 165, 200),
+                QColor(210, 210, 215, 225),
+                QColor(230, 230, 235, 240),
+                QColor(255, 255, 255, 255),
+                QColor(230, 230, 235, 240),
+                QColor(210, 210, 215, 225),
+                QColor(160, 160, 165, 200),
+            ]
+
+        base = QColor(c_name)
+        if not base.isValid():
+            base = QColor(0, 122, 255)
+        r, g, b = base.red(), base.green(), base.blue()
+        c_dark = QColor(int(r * 0.78), int(g * 0.78), int(b * 0.78), 200)
+        c_bright = QColor(min(255, int(r * 1.25 + 25)), min(255, int(g * 1.25 + 25)), min(255, int(b * 1.25 + 25)), 225)
+        c_main = QColor(r, g, b, 240)
+        c_crest = QColor(min(255, int(r * 0.35 + 255 * 0.65)), min(255, int(g * 0.35 + 255 * 0.65)), min(255, int(b * 0.35 + 255 * 0.65)), 255)
+        return [c_dark, c_bright, c_main, c_crest, c_main, c_bright, c_dark]
+
+    def _get_waveform_base_color(self) -> QColor:
+        """Returns the primary base QColor for waveform accent elements."""
+        cols = self._get_waveform_colors()
+        return cols[2]
+
     def _draw_waveform_bars(self, p: QPainter, w: float, cy: float) -> None:
         n       = 7
         bar_w   = 3.0
@@ -3893,15 +4227,7 @@ class AppleDynamicIsland(QWidget):
         wx0     = w - total_w - 18.0
         max_h   = 18.0
 
-        colors = [
-            QColor(175, 82, 222, 200),
-            QColor(0,  240, 255, 220),
-            QColor(0,  122, 255, 230),
-            QColor(255, 255, 255, 240),
-            QColor(0,  122, 255, 230),
-            QColor(0,  240, 255, 220),
-            QColor(175, 82, 222, 200),
-        ]
+        colors = self._get_waveform_colors()
         for i in range(n):
             bar_h = max(3.0, self._wave_bars[i] * max_h)
             bx    = wx0 + i * (bar_w + gap)

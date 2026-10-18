@@ -556,6 +556,7 @@ def render_island_view(state_name: str, dpi: float, theme: str) -> QImage:
     with injected_clock(now):
         mgr = DummyOverlayMgr()
         island = AppleDynamicIsland(mgr)
+        island.shape_style = "notch"
         island.t0 = now
         island.last_frame_t = now
 
@@ -695,6 +696,7 @@ def render_island_animation_frame(sequence_name: str, t_offset: float, dpi: floa
     with injected_clock(t0):
         mgr = DummyOverlayMgr()
         island = AppleDynamicIsland(mgr)
+        island.shape_style = "notch"
         island.t0 = t0
         island.last_frame_t = t0
 

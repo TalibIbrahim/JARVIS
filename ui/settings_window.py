@@ -31,7 +31,8 @@ from PySide6.QtWidgets import (
     QDialog, QWidget, QHBoxLayout, QVBoxLayout, QStackedWidget,
     QScrollArea, QFrame, QLabel, QComboBox, QLineEdit, QFileDialog,
     QSizePolicy, QProgressBar, QListWidget, QListWidgetItem, QMenu,
-    QApplication, QAbstractItemView, QTableWidget, QTableWidgetItem, QInputDialog
+    QApplication, QAbstractItemView, QTableWidget, QTableWidgetItem, QInputDialog,
+    QPushButton, QColorDialog
 )
 
 from ui.tokens import T, TYPE, COLOR, SPACING, RADIUS, SIZES, qfont
@@ -1903,25 +1904,128 @@ class SettingsWindow(QDialog):
                             "Starting day of the week in the expanded Calendar month grid",
                             self.first_weekday_control)
 
-        # 6. City Input Field
-        city_default = getattr(self.cfg, "island_weather_city", getattr(self.cfg, "weather_city", "Ahmedabad"))
-        self.city_search_edit = QLineEdit(city_default)
+        # 6. City Input Field / Searchable Dropdown
+        city_default = getattr(self.cfg, "island_weather_city", getattr(self.cfg, "weather_city", "Lahore, Punjab, Pakistan"))
+        self.city_combo = QComboBox()
+        self.city_combo.setEditable(True)
+        self.city_combo.setFixedWidth(230)
+        self.city_search_edit = self.city_combo.lineEdit()
         self.city_edit = self.city_search_edit
-        self.city_search_edit.setPlaceholderText("Enter city (e.g. Ahmedabad, London)")
-        self.city_search_edit.setFixedWidth(200)
-        self.city_search_edit.setStyleSheet(
-            f"background: {'rgba(255,255,255,0.08)' if self._dark else 'rgba(0,0,0,0.05)'}; "
-            f"border: 1px solid {'rgba(255,255,255,0.12)' if self._dark else 'rgba(0,0,0,0.12)'}; "
-            f"border-radius: 6px; padding: 4px 8px; color: {T.color.label.resolve(self._dark).name()};"
-        )
-        def _on_city_changed(v):
-            cleaned = v.strip() or "Ahmedabad"
-            self._save("island_weather_city", cleaned)
-            self._save("weather_city", cleaned)
-        self.city_search_edit.textChanged.connect(_on_city_changed)
+        self.city_search_edit.setPlaceholderText("Search city (e.g. Lahore, London)")
+
+        fill_c = 'rgba(255,255,255,0.08)' if self._dark else 'rgba(0,0,0,0.05)'
+        border_c = 'rgba(255,255,255,0.12)' if self._dark else 'rgba(0,0,0,0.12)'
+        label_c = T.color.label.resolve(self._dark).name()
+        accent_c = T.color.accent.resolve(self._dark).name()
+        popup_c = '#242426' if self._dark else '#FFFFFF'
+
+        self.city_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {fill_c};
+                border: 1px solid {border_c};
+                border-radius: 6px;
+                color: {label_c};
+                padding: 4px 8px;
+                font-size: 12px;
+            }}
+            QComboBox:hover {{ border-color: rgba(128,128,128,0.4); }}
+            QComboBox:focus {{ border: 1.5px solid {accent_c}; }}
+            QComboBox::drop-down {{ border: none; width: 22px; }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {label_c};
+                margin-right: 6px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {popup_c};
+                border: 1px solid {border_c};
+                border-radius: 6px;
+                color: {label_c};
+                selection-background-color: {accent_c};
+                selection-color: #ffffff;
+                outline: none;
+                padding: 4px;
+            }}
+        """)
+
+        popular_cities = [
+            "Lahore, Punjab, Pakistan",
+            "Karachi, Sindh, Pakistan",
+            "Islamabad, Islamabad Capital Territory, Pakistan",
+            "London, England, United Kingdom",
+            "New York, New York, United States",
+            "Dubai, Dubai, United Arab Emirates",
+            "Tokyo, Tokyo, Japan",
+            "Paris, Île-de-France, France",
+            "Ahmedabad, Gujarat, India",
+            "Delhi, Delhi, India",
+            "Toronto, Ontario, Canada",
+            "Sydney, New South Wales, Australia",
+        ]
+        if city_default and city_default not in popular_cities:
+            self.city_combo.addItem(city_default)
+        for c in popular_cities:
+            self.city_combo.addItem(c)
+        self.city_combo.setCurrentText(city_default)
+
+        self._city_search_timer = QTimer(self)
+        self._city_search_timer.setSingleShot(True)
+        self._city_search_timer.setInterval(400)
+
+        def _do_city_search():
+            q = self.city_search_edit.text().strip()
+            if len(q) < 2:
+                return
+            def _async_query():
+                try:
+                    from weather_client import get_weather_client
+                    client = get_weather_client()
+                    res = client.search_cities(q, count=6)
+                    if res:
+                        displays = [r["display"] for r in res]
+                        QTimer.singleShot(0, lambda: _show_city_results(q, displays))
+                except Exception as err:
+                    print(f"[settings] city search note: {err}")
+            threading.Thread(target=_async_query, daemon=True).start()
+
+        def _show_city_results(orig_q, displays):
+            if not displays:
+                return
+            cur = self.city_search_edit.text()
+            self.city_combo.blockSignals(True)
+            self.city_combo.clear()
+            for d in displays:
+                self.city_combo.addItem(d)
+            self.city_combo.setCurrentText(cur)
+            self.city_combo.blockSignals(False)
+            if self.city_combo.hasFocus() or self.city_search_edit.hasFocus():
+                self.city_combo.showPopup()
+
+        self._city_search_timer.timeout.connect(_do_city_search)
+
+        def _on_city_text_edited(v):
+            cleaned = v.strip()
+            if cleaned:
+                self._save("island_weather_city", cleaned)
+                self._save("weather_city", cleaned)
+                self._city_search_timer.start()
+
+        self.city_search_edit.textChanged.connect(_on_city_text_edited)
+
+        def _on_city_activated(idx):
+            val = self.city_combo.itemText(idx).strip()
+            if val:
+                self._city_search_timer.stop()
+                self._save("island_weather_city", val)
+                self._save("weather_city", val)
+
+        self.city_combo.activated.connect(_on_city_activated)
+
         island_card.add_row("City Location",
                             "Location used for live weather forecasts and modular metrics",
-                            self.city_search_edit)
+                            self.city_combo)
 
         # 7. Weather / Speed Units
         self.units_control = SegmentedControl([
@@ -1993,7 +2097,138 @@ class SettingsWindow(QDialog):
                             "Primary interaction method to expand the island into full cards",
                             self.expand_trigger_control)
 
-        # 13. Hide during Fullscreen Apps
+        # 13. Waveform Color (Blue (Default) / Cyan / Green / Orange / Purple / Red / Pink / Monochrome / Multicolor / Custom)
+        wf_container = QWidget()
+        wf_layout = QHBoxLayout(wf_container)
+        wf_layout.setContentsMargins(0, 0, 0, 0)
+        wf_layout.setSpacing(8)
+
+        self.wf_color_combo = QComboBox()
+        presets = [
+            ("Blue (Default)", "blue", "#007AFF"),
+            ("Cyan",           "cyan", "#32ADE6"),
+            ("Green",          "green", "#30D158"),
+            ("Orange",         "orange", "#FF9F0A"),
+            ("Purple",         "purple", "#AF52DE"),
+            ("Red",            "red", "#FF453A"),
+            ("Pink",           "pink", "#FF2D55"),
+            ("Monochrome",     "monochrome", "#E5E5EA"),
+            ("Multicolor",     "multicolor", "#AF52DE"),
+        ]
+        cur_wf = str(getattr(self.cfg, "island_waveform_color", "blue")).strip()
+        matched_idx = -1
+        for idx, (lbl, key, hex_c) in enumerate(presets):
+            self.wf_color_combo.addItem(lbl, key)
+            if cur_wf.lower() == key:
+                matched_idx = idx
+
+        if matched_idx != -1:
+            self.wf_color_combo.setCurrentIndex(matched_idx)
+        else:
+            self.wf_color_combo.addItem(f"Custom ({cur_wf})", cur_wf)
+            self.wf_color_combo.setCurrentIndex(len(presets))
+
+        self.wf_color_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {fill_c};
+                border: 1px solid {border_c};
+                border-radius: 6px;
+                color: {label_c};
+                padding: 4px 8px;
+                font-size: 12px;
+                min-width: 140px;
+            }}
+            QComboBox:hover {{ border-color: rgba(128,128,128,0.4); }}
+            QComboBox:focus {{ border: 1.5px solid {accent_c}; }}
+            QComboBox::drop-down {{ border: none; width: 22px; }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {label_c};
+                margin-right: 6px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {popup_c};
+                border: 1px solid {border_c};
+                border-radius: 6px;
+                color: {label_c};
+                selection-background-color: {accent_c};
+                selection-color: #ffffff;
+                outline: none;
+                padding: 4px;
+            }}
+        """)
+
+        self.wf_color_btn = QPushButton()
+        self.wf_color_btn.setFixedSize(26, 26)
+        self.wf_color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wf_color_btn.setToolTip("Click to pick custom waveform color")
+
+        def _get_preset_hex(key: str) -> str:
+            for _, k, h in presets:
+                if k == key.lower():
+                    return h
+            return key if key.startswith("#") else "#007AFF"
+
+        def _update_swatch_style(hex_color: str):
+            self.wf_color_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {hex_color};
+                    border: 2px solid {'rgba(255,255,255,0.7)' if self._dark else 'rgba(0,0,0,0.2)'};
+                    border-radius: 13px;
+                }}
+                QPushButton:hover {{
+                    border: 2px solid {'#FFFFFF' if self._dark else '#000000'};
+                }}
+            """)
+
+        cur_hex = _get_preset_hex(cur_wf)
+        _update_swatch_style(cur_hex)
+
+        def _on_wf_combo_changed(idx: int):
+            data = self.wf_color_combo.itemData(idx)
+            hex_val = _get_preset_hex(data)
+            _update_swatch_style(hex_val)
+            self._save("island_waveform_color", data)
+
+        def _pick_custom_color():
+            initial = QColor(_get_preset_hex(str(getattr(self.cfg, "island_waveform_color", "blue"))))
+            col = QColorDialog.getColor(initial, self, "Select Waveform Accent Color")
+            if col.isValid():
+                hex_str = col.name().upper()
+                _update_swatch_style(hex_str)
+                matched = False
+                for i, (_, k, h) in enumerate(presets):
+                    if h.upper() == hex_str:
+                        self.wf_color_combo.blockSignals(True)
+                        self.wf_color_combo.setCurrentIndex(i)
+                        self.wf_color_combo.blockSignals(False)
+                        self._save("island_waveform_color", k)
+                        matched = True
+                        break
+                if not matched:
+                    if self.wf_color_combo.count() > len(presets):
+                        self.wf_color_combo.setItemText(len(presets), f"Custom ({hex_str})")
+                        self.wf_color_combo.setItemData(len(presets), hex_str)
+                    else:
+                        self.wf_color_combo.addItem(f"Custom ({hex_str})", hex_str)
+                    self.wf_color_combo.blockSignals(True)
+                    self.wf_color_combo.setCurrentIndex(len(presets))
+                    self.wf_color_combo.blockSignals(False)
+                    self._save("island_waveform_color", hex_str)
+
+        self.wf_color_combo.currentIndexChanged.connect(_on_wf_combo_changed)
+        self.wf_color_btn.clicked.connect(_pick_custom_color)
+
+        wf_layout.addWidget(self.wf_color_combo)
+        wf_layout.addWidget(self.wf_color_btn)
+
+        island_card.add_row("Waveform Color",
+                            "Accent color palette for voice listening and audio-reactive waveforms (Default: Blue)",
+                            wf_container)
+
+        # 14. Hide during Fullscreen Apps
         self.hide_fullscreen_switch = AppleSwitch(getattr(self.cfg, "island_hide_fullscreen", getattr(self.cfg, "hide_fullscreen", True)))
         self.sw_fs = self.hide_fullscreen_switch
         def _on_fs_toggled(v):
@@ -2430,6 +2665,14 @@ class SettingsWindow(QDialog):
             return
         try:
             setattr(self.cfg, key, value)
+            if key == "island_weather_city":
+                setattr(self.cfg, "weather_city", value)
+            elif key == "weather_city":
+                setattr(self.cfg, "island_weather_city", value)
+            elif key == "island_weather_units":
+                setattr(self.cfg, "weather_units", value)
+            elif key == "weather_units":
+                setattr(self.cfg, "island_weather_units", value)
         except Exception:
             pass
         try:
@@ -2439,18 +2682,51 @@ class SettingsWindow(QDialog):
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             data[key] = value
+            if key == "island_weather_city":
+                data["weather_city"] = value
+            elif key == "weather_city":
+                data["island_weather_city"] = value
+            elif key == "island_weather_units":
+                data["weather_units"] = value
+            elif key == "weather_units":
+                data["island_weather_units"] = value
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
         except Exception as exc:
             print(f"[settings] save error: {exc}")
         try:
+            # 1. Propagate live reload via Context & Overlay if available
+            if hasattr(self, "ctx") and self.ctx:
+                if hasattr(self.ctx, "overlay") and self.ctx.overlay and hasattr(self.ctx.overlay, "reload_config"):
+                    self.ctx.overlay.reload_config(self.cfg)
+                if hasattr(self.ctx, "reload_config"):
+                    self.ctx.reload_config(self.cfg)
+
+            # 2. Propagate to all active Qt top-level widgets
             for w in QApplication.topLevelWidgets():
                 if hasattr(w, "reload_config"):
                     w.reload_config()
+                if hasattr(w, "mgr") and hasattr(w.mgr, "reload_config"):
+                    w.mgr.reload_config()
                 if hasattr(w, "island") and hasattr(w.island, "reload_config"):
                     w.island.reload_config()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[settings] reload_config error: {exc}")
+
+        # 3. Live theme update on settings dialog itself
+        if key == "theme_mode":
+            try:
+                self._poll_theme()
+            except Exception:
+                pass
+
+        # 4. Immediate weather refresh if weather settings changed
+        if key in ("island_weather_city", "weather_city", "island_weather_units", "weather_units"):
+            try:
+                from weather_client import trigger_weather_refresh
+                trigger_weather_refresh()
+            except Exception:
+                pass
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 

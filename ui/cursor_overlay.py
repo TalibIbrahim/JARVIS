@@ -80,6 +80,11 @@ class CursorFeedbackOverlay(QWidget):
         self.resize(160, 160)
         self._apply_click_through()
 
+    def reload_config(self) -> None:
+        """Live updates theme and appearance settings without restart."""
+        self.dark_mode = T.is_dark()
+        self.update()
+
     def _apply_click_through(self) -> None:
         if sys.platform != "win32":
             return

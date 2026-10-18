@@ -155,6 +155,7 @@ class Config:
     island_pin_open: bool = False                  # suppress auto-collapse when pinned
     island_expand_trigger: str = "hover"           # "hover", "click", "dwell", "fist", "voice"
     island_hide_fullscreen: bool = True            # hide island when fullscreen app active
+    island_waveform_color: str = "blue"            # "blue" (default: blue only), "cyan", "green", "orange", "purple", "red", "pink", "monochrome", "multicolor", or hex "#RRGGBB"
 
     # --- updates ---
     auto_update_check: bool = True      # automatically check for GitHub releases on startup

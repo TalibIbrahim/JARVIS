@@ -589,6 +589,12 @@ class Speaker(threading.Thread):
         self._sapi_engine = None
         self.is_speaking = False
 
+    def reload_config(self, cfg=None):
+        """Live updates speech settings without restart."""
+        if cfg:
+            self.cfg = cfg
+        self.enabled = getattr(self.cfg, "speak", True)
+
     def say(self, text):
         is_enabled = getattr(self.cfg, "speak", self.enabled) if self.cfg else self.enabled
         if is_enabled and text:
@@ -775,6 +781,7 @@ class WakeWordDetector(threading.Thread):
         on_wake=None,
         on_utterance=None,
         on_no_speech=None,
+        on_wake_idle=None,
         stop_event=None,
         sensitivity="balanced",
         followup_window=6.0,
@@ -785,6 +792,7 @@ class WakeWordDetector(threading.Thread):
         self.on_wake = on_wake
         self.on_utterance = on_utterance
         self.on_no_speech = on_no_speech
+        self.on_wake_idle = on_wake_idle
         self.stop = stop_event or threading.Event()
         self.sensitivity_str = sensitivity
         self.threshold = parse_sensitivity(getattr(cfg, "wake_sensitivity", sensitivity))
@@ -1076,7 +1084,7 @@ class WakeWordDetector(threading.Thread):
                         )
                         pre_roll.clear()
                         if raw:
-                            self._dispatch_utterance(raw)
+                            self._dispatch_utterance(raw, is_command=True)
                         continue
 
                     pre_roll.append(data)
@@ -1103,10 +1111,31 @@ class WakeWordDetector(threading.Thread):
                                 pre_roll=list(pre_roll),
                                 chunk_samples=chunk_samples,
                                 sample_rate=sample_rate,
+                                timeout_no_speech=min(self.followup_window, 3.5),
                             )
                             pre_roll.clear()
                             if raw:
-                                self._dispatch_utterance(raw)
+                                self._dispatch_utterance(raw, is_command=True)
+                            else:
+                                if self.on_wake_idle:
+                                    try:
+                                        self.on_wake_idle()
+                                    except Exception as idle_err:
+                                        print(f"[voice] on_wake_idle error: {idle_err}")
+                                self.listening_until = time.time() + self.followup_window
+                    elif not getattr(self.cfg, "wake_word_enabled", True):
+                        # Wake word disabled: continuous VAD voice command capture
+                        if self.vad.is_speech(arr, rms):
+                            pre_roll.append(data)
+                            raw = self.record_utterance_with_vad(
+                                stream=stream,
+                                pre_roll=list(pre_roll),
+                                chunk_samples=chunk_samples,
+                                sample_rate=sample_rate,
+                            )
+                            pre_roll.clear()
+                            if raw:
+                                self._dispatch_utterance(raw, is_command=True)
             finally:
                 if stream is not None:
                     try:
@@ -1165,9 +1194,11 @@ class WakeWordDetector(threading.Thread):
                 except Exception:
                     pass
 
-    def _dispatch_utterance(self, raw_bytes: bytes):
+    def _dispatch_utterance(self, raw_bytes: bytes, is_command: bool = True):
         if self.on_utterance:
             try:
+                self.on_utterance(raw_bytes, is_command=is_command)
+            except TypeError:
                 self.on_utterance(raw_bytes)
             except Exception as e:
                 print(f"[voice] dispatch utterance error: {e}")
@@ -1223,9 +1254,22 @@ class Voice(threading.Thread):
             return self.wake_detector.get_followup_window()
         return self.followup_window
 
+    def reload_config(self, cfg=None):
+        """Live updates voice & wake settings without restart."""
+        if cfg:
+            self.cfg = cfg
+        sens = getattr(self.cfg, "wake_sensitivity", "balanced") if self.cfg else "balanced"
+        self.set_sensitivity(sens)
+        win = float(getattr(self.cfg, "wake_followup_window", getattr(self.cfg, "command_window", 6.0))) if self.cfg else 6.0
+        self.set_followup_window(win)
+        if self.wake_detector:
+            self.wake_detector.cfg = self.cfg
+
     def _on_wake_detected(self):
         now = time.time()
         self.listening_until = now + self.followup_window
+        if self.wake_detector:
+            self.wake_detector.listening_until = self.listening_until
         if hasattr(self.ctx, "overlay") and self.ctx.overlay:
             try:
                 self.ctx.overlay.post("wake", duration=0.6)
@@ -1241,8 +1285,24 @@ class Voice(threading.Thread):
             except Exception:
                 pass
 
+    def _on_wake_idle(self):
+        """User triggered wake word and paused; prompt confirmation and open follow-up window."""
+        now = time.time()
+        self.listening_until = now + self.followup_window
+        if self.wake_detector:
+            self.wake_detector.listening_until = self.listening_until
+        if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+            try:
+                self.ctx.overlay.post("listening", until=self.listening_until)
+            except Exception:
+                pass
+        if hasattr(self.ctx, "say"):
+            self.ctx.say("Yes, sir?")
+
     def _on_no_speech_detected(self):
         self.listening_until = 0.0
+        if self.wake_detector:
+            self.wake_detector.listening_until = 0.0
         if hasattr(self.ctx, "overlay") and self.ctx.overlay:
             try:
                 self.ctx.overlay.post("no_speech")
@@ -1258,14 +1318,14 @@ class Voice(threading.Thread):
             except Exception:
                 pass
 
-    def _on_utterance_recorded(self, raw_bytes: bytes):
+    def _on_utterance_recorded(self, raw_bytes: bytes, is_command: bool = True):
         if not raw_bytes:
             return
         Voice._last_raw_audio = raw_bytes
         try:
             import speech_recognition as sr
             audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
-            self.audio_q.put_nowait(audio)
+            self.audio_q.put_nowait((audio, is_command, time.time()))
         except Exception:
             pass
 
@@ -1299,6 +1359,7 @@ class Voice(threading.Thread):
             on_wake=self._on_wake_detected,
             on_utterance=self._on_utterance_recorded,
             on_no_speech=self._on_no_speech_detected,
+            on_wake_idle=self._on_wake_idle,
             stop_event=self.stop,
             sensitivity=self.sensitivity,
             followup_window=self.followup_window,
@@ -1312,6 +1373,15 @@ class Voice(threading.Thread):
                 print(f"[voice] Switching microphone to [{configured_idx}]...")
                 self.wake_detector.device_index = configured_idx
                 self.current_mic_index = configured_idx
+
+            configured_sens = getattr(self.cfg, "wake_sensitivity", None)
+            if configured_sens is not None and configured_sens != self.wake_detector.sensitivity_str:
+                self.set_sensitivity(configured_sens)
+
+            configured_followup = getattr(self.cfg, "wake_followup_window", None)
+            if configured_followup is not None and float(configured_followup) != self.wake_detector.followup_window:
+                self.set_followup_window(float(configured_followup))
+
             self.stop.wait(timeout=0.5)
 
     def _fallback_google(self, recognizer, audio, sr):
@@ -1338,9 +1408,16 @@ class Voice(threading.Thread):
 
         while not self.stop.is_set():
             try:
-                audio = self.audio_q.get(timeout=0.5)
+                item = self.audio_q.get(timeout=0.5)
             except queue.Empty:
                 continue
+
+            if isinstance(item, tuple):
+                audio, is_command, enqueued_at = item
+            else:
+                audio = item
+                is_command = False
+                enqueued_at = time.time()
 
             # Energy-based VAD validation before sending audio
             raw_bytes = audio.get_raw_data()
@@ -1350,10 +1427,10 @@ class Voice(threading.Thread):
             rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
 
             now = time.time()
-            is_active_session = now < self.listening_until
+            is_active_session = is_command or (now < self.listening_until) or (self.wake_detector and now < self.wake_detector.listening_until)
 
-            # Noise gate: reject quiet acoustic flutter (< 35.0) and require clear speech (> 48.0) in standby
-            min_rms = 35.0 if is_active_session else 48.0
+            # Noise gate: reject quiet acoustic flutter (< 25.0) in active session, require clear speech (> 40.0) in standby
+            min_rms = 25.0 if is_active_session else 40.0
             if rms < min_rms:
                 continue
 
@@ -1379,7 +1456,7 @@ class Voice(threading.Thread):
                     pass
 
             text = None
-            key = get_api_key()
+            key = get_api_key(self.cfg)
             ai_enabled = getattr(self.cfg, "ai_enabled", False)
             use_groq = bool(ai_enabled and key and now >= self.groq_cooldown_until)
 
@@ -1397,6 +1474,7 @@ class Voice(threading.Thread):
                     self.groq_cooldown_until = 0.0
                 except AuthenticationError as auth_err:
                     print(f"[voice] Groq key authentication failed: {auth_err}")
+                    self.groq_cooldown_until = time.time() + 300.0  # 5 min cooldown on auth failure
                     if hasattr(self.ctx, "overlay") and self.ctx.overlay:
                         try:
                             self.ctx.overlay.post("ai_error", text="Invalid Groq Key")
@@ -1429,13 +1507,18 @@ class Voice(threading.Thread):
                 text = self._fallback_google(recognizer, audio, sr)
 
             if text:
-                self._process(text)
+                try:
+                    self._process(text, is_command=is_command)
+                except TypeError:
+                    self._process(text)
 
-    def _process(self, text):
+    def _process(self, text, is_command: bool = False):
         t = text.lower().strip()
         now = time.time()
         command = None
-        if now < self.listening_until:
+        is_active = is_command or (now < self.listening_until) or (self.wake_detector and now < self.wake_detector.listening_until)
+
+        if is_active:
             command = t
             for alias in getattr(self.cfg, "wake_aliases", ["jarvis"]):
                 pattern = r"^\s*" + re.escape(alias) + r"\b"
@@ -1444,6 +1527,8 @@ class Voice(threading.Thread):
                     stripped = command[match.end():].strip(" ,.!?")
                     if stripped:
                         command = stripped
+                    else:
+                        command = ""
                     break
         else:
             for alias in getattr(self.cfg, "wake_aliases", ["jarvis"]):
@@ -1461,25 +1546,31 @@ class Voice(threading.Thread):
                         pass
                 return
 
-            if not command:
-                self.listening_until = now + getattr(self.cfg, "wake_followup_window", getattr(self.cfg, "command_window", 6.0))
+        if not command:
+            self.listening_until = now + getattr(self.cfg, "wake_followup_window", getattr(self.cfg, "command_window", 6.0))
+            if self.wake_detector:
+                self.wake_detector.listening_until = self.listening_until
+            try:
+                self.ctx.overlay.post("wake", duration=0.6)
+                self.ctx.overlay.post("wake_detected")
+                self.ctx.overlay.post("listening", until=self.listening_until)
+            except Exception:
+                pass
+            if getattr(self.cfg, "chime_enabled", True):
+                play_chime(non_blocking=True)
+            if hasattr(self.ctx, "chirp"):
                 try:
-                    self.ctx.overlay.post("wake", duration=0.6)
-                    self.ctx.overlay.post("wake_detected")
-                    self.ctx.overlay.post("listening", until=self.listening_until)
+                    self.ctx.chirp("wake")
                 except Exception:
                     pass
-                if getattr(self.cfg, "chime_enabled", True):
-                    play_chime(non_blocking=True)
-                if hasattr(self.ctx, "chirp"):
-                    try:
-                        self.ctx.chirp("wake")
-                    except Exception:
-                        pass
-                self.ctx.say("Yes, sir?")
-                return
+            self.ctx.say("Yes, sir?")
+            return
 
-        self.listening_until = 0.0
+        # Keep follow-up window open after executing command
+        followup_sec = float(getattr(self.cfg, "wake_followup_window", getattr(self.cfg, "command_window", 6.0)))
+        self.listening_until = time.time() + followup_sec
+        if self.wake_detector:
+            self.wake_detector.listening_until = self.listening_until
 
         # Continuously adapt voice profile on confirmed commands
         if Voice._last_raw_audio:

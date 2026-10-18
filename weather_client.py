@@ -251,16 +251,27 @@ class WeatherClient:
         try:
             data = self._fetcher(url, 6.0)
             results = data.get("results")
+            if (not results) and ("," in clean):
+                first_seg = clean.split(",")[0].strip()
+                query2 = urllib.parse.urlencode({"name": first_seg, "count": 5, "format": "json"})
+                url2 = f"{GEOCODING_URL}?{query2}"
+                data2 = self._fetcher(url2, 6.0)
+                results = data2.get("results")
             if results and len(results) > 0:
                 item = results[0]
                 lat = float(item["latitude"])
                 lon = float(item["longitude"])
                 name = str(item.get("name", clean))
                 admin1 = item.get("admin1")
-                if admin1 and admin1 != name:
-                    display = f"{name}, {admin1}"
-                else:
-                    display = name
+                country = item.get("country")
+                parts = [p for p in [name, admin1, country] if p]
+                seen = set()
+                uniq_parts = []
+                for p in parts:
+                    if p.lower() not in seen:
+                        seen.add(p.lower())
+                        uniq_parts.append(p)
+                display = ", ".join(uniq_parts)
                 res = (lat, lon, display)
                 if len(self._geo_cache) >= self._max_cache_entries:
                     oldest_k = next(iter(self._geo_cache))
@@ -271,6 +282,48 @@ class WeatherClient:
             print(f"[weather_client] Geocoding error for '{city_name}': {exc}")
 
         return None
+
+    def search_cities(self, query: str, count: int = 6) -> List[Dict[str, Any]]:
+        """
+        Queries Open-Meteo geocoding API for city search autocomplete.
+        Returns a list of dicts with: name, display, country, admin1, latitude, longitude.
+        """
+        clean = (query or "").strip()
+        if len(clean) < 2:
+            return []
+
+        encoded = urllib.parse.urlencode({"name": clean, "count": count, "format": "json"})
+        url = f"{GEOCODING_URL}?{encoded}"
+        try:
+            data = self._fetcher(url, 4.0)
+            results = data.get("results", [])
+            output = []
+            for item in results:
+                name = str(item.get("name", clean))
+                admin1 = str(item.get("admin1", ""))
+                country = str(item.get("country", ""))
+                lat = float(item.get("latitude", 0.0))
+                lon = float(item.get("longitude", 0.0))
+                parts = [p for p in [name, admin1, country] if p]
+                seen = set()
+                uniq_parts = []
+                for p in parts:
+                    if p.lower() not in seen:
+                        seen.add(p.lower())
+                        uniq_parts.append(p)
+                display = ", ".join(uniq_parts)
+                output.append({
+                    "name": name,
+                    "display": display,
+                    "country": country,
+                    "admin1": admin1,
+                    "latitude": lat,
+                    "longitude": lon,
+                })
+            return output
+        except Exception as exc:
+            print(f"[weather_client] search_cities error for '{query}': {exc}")
+            return []
 
     def get_weather(
         self,
@@ -473,3 +526,21 @@ def clear_weather_cache() -> None:
     global _WEATHER_CLIENT
     if _WEATHER_CLIENT is not None:
         _WEATHER_CLIENT.clear_cache()
+
+
+_WEATHER_REFRESH_CALLBACK: Optional[Callable[[], None]] = None
+
+
+def register_weather_refresh_callback(cb: Callable[[], None]) -> None:
+    global _WEATHER_REFRESH_CALLBACK
+    _WEATHER_REFRESH_CALLBACK = cb
+
+
+def trigger_weather_refresh() -> None:
+    global _WEATHER_REFRESH_CALLBACK
+    if _WEATHER_REFRESH_CALLBACK is not None:
+        try:
+            import threading
+            threading.Thread(target=_WEATHER_REFRESH_CALLBACK, daemon=True).start()
+        except Exception as exc:
+            print(f"[weather_client] refresh trigger error: {exc}")

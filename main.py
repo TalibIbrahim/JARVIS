@@ -29,13 +29,32 @@ def _enable_dpi_awareness():
 class Context:
     """Small bundle shared by the tracker, voice commands and hotkeys."""
 
-    def __init__(self, engine, overlay, speaker, stop, updater=None, tracker=None):
+    def __init__(self, engine, overlay, speaker, stop, updater=None, tracker=None, controller=None, voice=None, cfg=None):
         self.engine = engine
         self.overlay = overlay
         self.speaker = speaker
         self.stop = stop
         self.updater = updater
         self.tracker = tracker
+        self.controller = controller
+        self.voice = voice
+        self.cfg = cfg
+
+    def reload_config(self, new_cfg=None):
+        if new_cfg is not None:
+            self.cfg = new_cfg
+        if hasattr(self.engine, "cfg"):
+            self.engine.cfg = self.cfg
+        if hasattr(self.engine, "reload_config"):
+            self.engine.reload_config(self.cfg)
+        if hasattr(self.controller, "reload_config"):
+            self.controller.reload_config(self.cfg)
+        if hasattr(self.tracker, "reload_config"):
+            self.tracker.reload_config(self.cfg)
+        if hasattr(self.speaker, "reload_config"):
+            self.speaker.reload_config(self.cfg)
+        if hasattr(self.voice, "reload_config"):
+            self.voice.reload_config(self.cfg)
 
     def say(self, text):
         if not text:
@@ -211,7 +230,7 @@ def main():
     overlay = Overlay(stop, cfg=cfg)
     controller.set_overlay(overlay)
     engine.set_overlay(overlay)
-    ctx = Context(engine, overlay, speaker, stop)
+    ctx = Context(engine, overlay, speaker, stop, controller=controller, cfg=cfg)
     overlay.ctx = ctx
 
     try:
@@ -257,9 +276,14 @@ def main():
         def _on_voice_error(name, exc):
             explain_graceful_degradation("voice", overlay=overlay, speaker=speaker)
 
+        def _make_voice():
+            v = Voice(cfg, ctx, stop)
+            ctx.voice = v
+            return v
+
         supervisor.register(
             name="Voice",
-            factory=lambda: Voice(cfg, ctx, stop),
+            factory=_make_voice,
             max_restarts=5,
             backoff_base=1.0,
             on_error=_on_voice_error,
@@ -275,28 +299,36 @@ def main():
             dur = float(meta.duration) if meta.duration else 0.0
             pos = float(meta.position) if meta.position else 0.0
             prog = (pos / dur) if dur > 0 else 0.0
+            thumb = meta.get_artwork_bytes(fallback=True) if hasattr(meta, "get_artwork_bytes") else getattr(meta, "thumbnail_bytes", None)
+            dom_col = meta.get_dominant_color() if hasattr(meta, "get_dominant_color") else getattr(meta, "dominant_color", None)
             overlay.post(
                 "media_state",
                 title=meta.title,
                 artist=meta.artist,
+                album=getattr(meta, "album", ""),
                 playing=meta.is_playing,
                 active=meta.has_media,
                 position=pos,
                 duration=dur,
                 progress=prog,
                 source=meta.source_app_id,
+                thumbnail_bytes=thumb,
+                dominant_color=dom_col,
             )
         else:
             overlay.post(
                 "media_state",
                 title="",
                 artist="",
+                album="",
                 playing=False,
                 active=False,
                 position=0.0,
                 duration=0.0,
                 progress=0.0,
                 source="",
+                thumbnail_bytes=None,
+                dominant_color=None,
             )
 
     media_adapter.add_listener(_on_media_changed)
@@ -335,7 +367,14 @@ def main():
                     feels_like=w.apparent_temperature,
                     city=w.city.split(",")[0],
                     hourly=h_list,
+                    unit_symbol=w.unit_symbol,
                 )
+
+        try:
+            from weather_client import register_weather_refresh_callback
+            register_weather_refresh_callback(_fetch_and_post)
+        except Exception:
+            pass
 
         def _poller_loop():
             if not stop.wait(2.0):

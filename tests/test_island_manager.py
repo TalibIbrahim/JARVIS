@@ -472,6 +472,7 @@ class TestIslandPageManager(unittest.TestCase):
         cfg.island_pin_open = True
         cfg.island_backdrop_blur = True
         cfg.island_backdrop_opacity = 0.88
+        cfg.island_waveform_color = "cyan"
 
         mgr = IslandPageManager(config=cfg, clock_fn=self.clock)
         self.assertEqual(mgr.pages, [IslandPage.WEATHER, IslandPage.MEDIA])
@@ -484,6 +485,7 @@ class TestIslandPageManager(unittest.TestCase):
         self.assertTrue(mgr.pin_open)
         self.assertTrue(mgr.backdrop_blur)
         self.assertEqual(mgr.backdrop_opacity, 0.88)
+        self.assertEqual(mgr.waveform_color, "cyan")
 
     def test_config_serializable_dict(self):
         """Config.to_dict() returns valid serializable dictionary with all island keys."""
@@ -503,6 +505,7 @@ class TestIslandPageManager(unittest.TestCase):
         self.assertIn("island_pin_open", d)
         self.assertIn("island_expand_trigger", d)
         self.assertIn("island_hide_fullscreen", d)
+        self.assertIn("island_waveform_color", d)
 
     def test_tracking_toggle_and_setter(self):
         """IslandPageManager supports tracking state querying, toggling, and setting."""
