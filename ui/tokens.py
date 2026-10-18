@@ -3,7 +3,7 @@ ui/tokens.py — J.A.R.V.I.S. Design Token System
 Single source of truth for all colors, type scale, spacing, radii, shadows, and motion.
 
 Philosophy:
-  - Apple Human Interface Guidelines (macOS Sonoma / iOS 17) on Windows
+  - Apple HIG, Liquid Glass (iOS 26–27 / macOS 26–27), on Windows
   - Semantic roles, not raw values — consumers never reference hex directly
   - Per-monitor DPI aware: px values are logical pixels scaled at call-site
   - Light + Dark per token; High-contrast overrides in HC namespace

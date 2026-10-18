@@ -1,7 +1,7 @@
 """
 ui/settings_window.py — J.A.R.V.I.S. Apple HIG System Settings Window
 
-920×640 resizable dialog following macOS Sonoma System Settings layout:
+920×640 resizable dialog following the macOS 26 System Settings layout (Liquid Glass):
   Left:  220 px sidebar with search, icon tiles, section groups, pill selection
   Right: scrollable content area with Large Title, inset grouped cards, footnotes
 
@@ -2378,7 +2378,7 @@ class SettingsWindow(QDialog):
 
         info_card.add_row("Version",    "", _info_lbl(f"v{APP_VERSION}"))
         info_card.add_row("Platform",   "", _info_lbl(f"Windows 64-bit  |  Python {sys.version.split()[0]}"))
-        info_card.add_row("Design",     "Apple Human Interface Guidelines", _info_lbl("Sonoma / iOS 17"))
+        info_card.add_row("Design",     "Apple Human Interface Guidelines", _info_lbl("Liquid Glass"))
         info_card.add_row("Architecture","Touchless hand-gesture PC control", _info_lbl("120 Hz decoupled, sub-ms latency"))
         layout.addWidget(info_card)
 

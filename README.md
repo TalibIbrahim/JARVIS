@@ -7,7 +7,7 @@
 <p align="center">
   Real-time MediaPipe hand tracking with zero cloud dependencies at runtime,<br>
   an Apple HIG Dynamic Island with 60 FPS spring physics, OpenWakeWord streaming,<br>
-  WinRT SMTC media integration, Open-Meteo weather, and macOS Sonoma-style settings.
+  WinRT SMTC media integration, Open-Meteo weather, and Liquid Glass–style settings.
 </p>
 
 <p align="center">
@@ -35,7 +35,7 @@
 
 ## What's New in v2.0.0
 
-J.A.R.V.I.S. v2.0.0 is a massive architectural evolution that transforms JARVIS from a gesture controller into an all-in-one desktop assistant with a native **Apple Human Interface Guidelines (HIG)** Dynamic Island, an interactive **macOS Sonoma-style Settings Window**, and a non-autoregressive **System 1 Reflex Engine**.
+J.A.R.V.I.S. v2.0.0 is a massive architectural evolution that transforms JARVIS from a gesture controller into an all-in-one desktop assistant with a native **Apple Human Interface Guidelines (HIG)** Dynamic Island, an interactive **Liquid Glass Settings Window**, and a non-autoregressive **System 1 Reflex Engine**.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -44,7 +44,7 @@ J.A.R.V.I.S. v2.0.0 is a massive architectural evolution that transforms JARVIS 
 │ 🏝️ Dynamic Island (60 FPS)      │  Spring physics, SMTC media, weather,  │
 │                                │  live timer, visual HUDs, click-thru  │
 ├────────────────────────────────┼───────────────────────────────────────┤
-│ ⚙️ macOS Sonoma Settings        │  7 Apple HIG panes, vector icons,     │
+│ ⚙️ Liquid Glass Settings        │  7 Apple HIG panes, vector icons,     │
 │                                │  mic meter, live config persistence   │
 ├────────────────────────────────┼───────────────────────────────────────┤
 │ 🎙️ OpenWakeWord + VAD           │  16 kHz stream, sub-1ms intent reflex,│
@@ -92,7 +92,7 @@ Built entirely with native PySide6 and running at **60 FPS**, the Dynamic Island
 
 ---
 
-## Settings Control Center (macOS Sonoma-Style)
+## Settings Control Center (Liquid Glass)
 
 J.A.R.V.I.S. v2.0.0 features a completely redesigned, Apple HIG-compliant Settings Window (`ui/settings_window.py`):
 
