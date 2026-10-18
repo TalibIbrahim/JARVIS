@@ -27,6 +27,20 @@ from context_resolver import Candidate, get_context_resolver, get_disambiguation
 
 # Precompiled regex patterns to guarantee zero runtime re.compile() overhead
 _RE_NON_WORD = re.compile(r"[^\w\s]")
+_RE_LEAD_FILLER = re.compile(
+    r"^(?:can you please|hey jarvis|ok jarvis|okay jarvis|can you|could you|would you|please|jarvis|just|kindly)\b\s*")
+_RE_TRAIL_FILLER = re.compile(r"\s*\b(?:thank you|for me|please|now|thanks|jarvis)$")
+
+
+def strip_fillers(norm_text: str) -> str:
+    """Repeatedly strips polite leading/trailing filler words; never returns an empty string."""
+    cur = norm_text
+    while True:
+        nxt = _RE_LEAD_FILLER.sub("", cur, count=1)
+        nxt = _RE_TRAIL_FILLER.sub("", nxt, count=1).strip()
+        if not nxt or nxt == cur:
+            return cur
+        cur = nxt
 _RE_OPEN_FOLDER = re.compile(r"(?:open|show|bring\s+up)\s+(?:the\s+)?(?:folder\s+)?(.+?)(?:\s+folder|\s+directory)?$")
 _RE_STRIP_MY_THE = re.compile(r"^(?:my|the)\s+")
 _RE_FILE_EXT = re.compile(r"\b(pdf|txt|md|docx|xlsx|csv|png|jpg|mp4|py)\b")
@@ -339,6 +353,84 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
     ]
 }
  
+# Intents that write/change state or launch something. Fuzzy (non-exact) System 1 matches
+# for these need higher confidence and margin than read-only intents.
+SIDE_EFFECT_INTENTS = frozenset({
+    "volume_up", "volume_down", "mute", "play_pause", "play_music", "next_track", "previous_track",
+    "show_desktop", "lock_workstation", "screenshot", "stealth_mode", "clean_slate",
+    "target_practice", "sleep_mode", "wake_mode", "open_app", "open_site", "train_voice",
+    "island_toggle_tracking", "island_set_pin", "open_folder", "open_recent_file",
+    "show_last_download", "remember_folder", "set_volume", "brightness_up", "brightness_down",
+    "set_brightness", "toggle_night_light", "snap_window", "maximize_window", "switch_to_app",
+    "move_to_other_monitor", "close_window", "open_this", "copy_this", "close_this",
+    "sleep_system", "toggle_wifi", "toggle_bluetooth", "toggle_do_not_disturb",
+    "shutdown_system", "restart_system", "set_timer", "cancel_timer", "quick_note",
+    "start_routine",
+})
+SIDE_EFFECT_MIN_SCORE = 0.55
+SIDE_EFFECT_MIN_MARGIN = 0.08
+_RE_WEATHER_CUE = re.compile(r"\b(?:weather|temperature|forecast|rain|raining|hot|cold|outside)\b")
+
+
+def extract_whitelist_args(action: Optional[str], clean_text: str) -> Dict[str, Any]:
+    """For open_app/open_site: the whitelisted APPS/SITES name present as a whole word, if any."""
+    if action not in ("open_app", "open_site"):
+        return {}
+    from commands import APPS, SITES
+    table, key = (APPS, "app") if action == "open_app" else (SITES, "site")
+    for name in sorted(table, key=len, reverse=True):
+        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", clean_text):
+            return {key: name}
+    return {}
+
+
+def apply_decision_policy(top_act: Optional[str], top_score: float, margin: float, clean_text: str,
+                          extracted_args: Optional[Dict[str, Any]] = None,
+                          min_score: float = 0.25, min_margin: float = 0.03) -> Optional[str]:
+    """
+    Pure System 1 acceptance policy. Returns top_act if it may execute, else None.
+    - conversation / no action -> None; score >= 0.85 -> accepted.
+    - SIDE_EFFECT_INTENTS need score >= 0.55 and margin >= 0.08, except open_app/open_site with a
+      whitelisted APPS/SITES name present (extracted_args), which only need the standard margin.
+    - weather additionally needs a whole-word weather cue in clean_text.
+    - everything else uses min_score / min_margin.
+    """
+    if not top_act or top_act == "conversation":
+        return None
+    if top_score >= 0.85:
+        return top_act
+    need_score, need_margin = min_score, min_margin
+    if top_act in SIDE_EFFECT_INTENTS:
+        need_score = max(min_score, SIDE_EFFECT_MIN_SCORE)
+        args = extracted_args if extracted_args is not None else extract_whitelist_args(top_act, clean_text)
+        if not (top_act in ("open_app", "open_site") and args):
+            need_margin = max(min_margin, SIDE_EFFECT_MIN_MARGIN)
+    elif top_act == "weather" and not _RE_WEATHER_CUE.search(clean_text):
+        return None
+    if top_score >= need_score and margin >= need_margin:
+        return top_act
+    return None
+
+
+def decide_with_policy(score_fn, text: str, min_score: float = 0.25,
+                       min_margin: float = 0.03) -> Tuple[Optional[str], float]:
+    """
+    score_fn(norm_text) -> (top_act, top_score, margin). Scores the raw text under the policy;
+    if rejected, retries once on strip_fillers(text). Returns (action_or_None, score).
+    """
+    act, score, margin = score_fn(text)
+    res = apply_decision_policy(act, score, margin, text, None, min_score, min_margin)
+    if res is not None:
+        return res, score
+    stripped = strip_fillers(text)
+    if stripped != text:
+        act2, score2, margin2 = score_fn(stripped)
+        res2 = apply_decision_policy(act2, score2, margin2, stripped, None, min_score, min_margin)
+        if res2 is not None:
+            return res2, score2
+    return None, score
+
+
 _EXACT_PROTOTYPE_MAP: Dict[str, str] = {}
 for _act, _phrases in INTENT_PROTOTYPES.items():
     for _p in _phrases:
@@ -537,56 +629,43 @@ class SemanticDecisionEngine:
         norm_text = " ".join(cleaned.split())
         if not norm_text:
             return None, 0.0
-        return self._decide_memo(norm_text, min_score, min_margin)
+        return decide_with_policy(self._raw_scores_memo, norm_text, min_score, min_margin)
 
-    @lru_cache(maxsize=1024)
-    def _decide_memo(self, norm_text: str, min_score: float, min_margin: float) -> Tuple[Optional[str], float]:
+    def _raw_scores(self, norm_text: str) -> Tuple[Optional[str], float, float]:
+        """Policy-free scoring: (top_act, top_score, margin). Exact prototype hits return (act, 1.0, 1.0)."""
         with perf.span("intent_decision"):
-            # 1. Early exit on exact prototype string match (sub-microsecond response)
             if norm_text in _EXACT_PROTOTYPE_MAP:
-                matched_act = _EXACT_PROTOTYPE_MAP[norm_text]
-                if matched_act == "conversation":
-                    return None, 1.0
-                return matched_act, 1.0
-
-            # 2. Vectorized TF-IDF exemplar matching
+                return _EXACT_PROTOTYPE_MAP[norm_text], 1.0, 1.0
             tokens = self._tokenize(norm_text)
             vec = self._vectorize_tokens(tokens)
             if np.linalg.norm(vec) < 1e-6 or len(self._exemplar_actions) == 0:
-                return None, 0.0
-
+                return None, 0.0, 0.0
             raw_sims = np.dot(self._exemplar_matrix, vec)
             n_actions = len(self._action_names)
             action_max_sims = np.zeros(n_actions, dtype=np.float32)
             np.maximum.at(action_max_sims, self._exemplar_action_indices, raw_sims)
-
             top_idx = int(np.argmax(action_max_sims))
             top_score = float(action_max_sims[top_idx])
             top_act = self._action_names[top_idx]
-
-            # 3. Early exit on high-confidence match (S* >= 0.85)
-            if top_score >= 0.85:
-                if top_act == "conversation":
-                    return None, top_score
-                return top_act, top_score
-
-            # 4. Margin-based thresholding for moderate confidence
             action_max_sims[top_idx] = -1.0
             second_score = float(np.max(action_max_sims)) if n_actions > 1 else 0.0
-            margin = top_score - second_score
+            return top_act, top_score, top_score - second_score
 
-            if top_act == "conversation":
-                return None, top_score
+    @lru_cache(maxsize=1024)
+    def _raw_scores_memo(self, norm_text: str) -> Tuple[Optional[str], float, float]:
+        return self._raw_scores(norm_text)
 
-            if top_score >= min_score and margin >= min_margin:
-                return top_act, top_score
-
-            return None, top_score
+    @lru_cache(maxsize=1024)
+    def _decide_memo(self, norm_text: str, min_score: float, min_margin: float) -> Tuple[Optional[str], float]:
+        """Single-text decision (no filler retry)."""
+        act, score, margin = self._raw_scores(norm_text)
+        return apply_decision_policy(act, score, margin, norm_text, None, min_score, min_margin), score
 
     def clear(self) -> None:
         """Frees large exemplar matrices on shutdown and clears LRU caches."""
         try:
             self._decide_memo.cache_clear()
+            self._raw_scores_memo.cache_clear()
         except Exception:
             pass
         self._exemplar_matrix = np.array([], dtype=np.float32)

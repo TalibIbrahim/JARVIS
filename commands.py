@@ -884,7 +884,8 @@ def _run_single_command(text, ctx):
     # --- apps and web ---
     m = re.match(r"(?:open|launch|start|run|bring up|go to)\s+(?:up\s+)?(?:the\s+)?(.+)", clean_t)
     if m:
-        name = m.group(1).strip()
+        from decision_engine import strip_fillers
+        name = strip_fillers(m.group(1).strip())
         if name in SITES:
             webbrowser.open(SITES[name])
             _post_action(ctx, "open_site", True, args={"site": name}, text=text)
@@ -1320,6 +1321,9 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
     api_key = get_api_key()
 
     if not ai_enabled or not api_key:
+        if is_visual_query(user_text):
+            # Camera frame must never be fetched or uploaded without the AI switch and a key.
+            return screen_awareness.vision_blocked_reply(ctx, "Visual analysis")
         return "I didn't catch a command for that, sir."
 
     timeout = min(max(int(getattr(cfg, "ai_timeout", 8)), 3), 15) if cfg else 8
@@ -1334,6 +1338,9 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
     try:
         # Visual scene query inspection
         if is_visual_query(user_text) and getattr(cfg, "ai_vision_enabled", True):
+            blocked = screen_awareness.vision_blocked_reply(ctx, "Visual analysis")
+            if blocked:
+                return blocked
             tracker = getattr(ctx, "tracker", None) if ctx else None
             frame = tracker.get_latest_frame() if tracker else None
             if frame is not None:

@@ -34,45 +34,45 @@ def baseline_decide_unoptimized(
     - No S* >= 0.85 early exit.
     - Full matrix dot-product + stable argsort over all action heads.
     """
-    clean = re.sub(r"[^\w\s]", " ", user_text.lower()).strip()
-    words = clean.split()
-    tokens = list(words)
-    for w in words:
-        if len(w) >= 3:
-            for i in range(len(w) - 2):
-                tokens.append(f"#{w[i:i+3]}")
+    def score_fn(norm_text: str) -> Tuple[Optional[str], float, float]:
+        clean = re.sub(r"[^\w\s]", " ", norm_text.lower()).strip()
+        words = clean.split()
+        tokens = list(words)
+        for w in words:
+            if len(w) >= 3:
+                for i in range(len(w) - 2):
+                    tokens.append(f"#{w[i:i+3]}")
 
-    vec = np.zeros(len(engine._vocab), dtype=np.float32)
-    for t in tokens:
-        if t in engine._vocab:
-            vec[engine._vocab[t]] += 1.0
-    vec *= engine._idf
-    norm = np.linalg.norm(vec)
-    if norm > 1e-6:
-        vec = vec / norm
+        vec = np.zeros(len(engine._vocab), dtype=np.float32)
+        for t in tokens:
+            if t in engine._vocab:
+                vec[engine._vocab[t]] += 1.0
+        vec *= engine._idf
+        norm = np.linalg.norm(vec)
+        if norm > 1e-6:
+            vec = vec / norm
 
-    if norm < 1e-6 or len(engine._exemplar_actions) == 0:
+        if norm < 1e-6 or len(engine._exemplar_actions) == 0:
+            return None, 0.0, 0.0
+
+        raw_sims = np.dot(engine._exemplar_matrix, vec)
+        n_actions = len(engine._action_names)
+        action_max_sims = np.zeros(n_actions, dtype=np.float32)
+        np.maximum.at(action_max_sims, engine._exemplar_action_indices, raw_sims)
+
+        order = np.argsort(-action_max_sims, kind="stable")
+        top_idx = order[0]
+        top_act = engine._action_names[top_idx]
+        top_score = float(action_max_sims[top_idx])
+        second_score = float(action_max_sims[order[1]]) if n_actions > 1 else 0.0
+        return top_act, top_score, top_score - second_score
+
+    if not user_text:
         return None, 0.0
-
-    raw_sims = np.dot(engine._exemplar_matrix, vec)
-    n_actions = len(engine._action_names)
-    action_max_sims = np.zeros(n_actions, dtype=np.float32)
-    np.maximum.at(action_max_sims, engine._exemplar_action_indices, raw_sims)
-
-    order = np.argsort(-action_max_sims, kind="stable")
-    top_idx = order[0]
-    top_act = engine._action_names[top_idx]
-    top_score = float(action_max_sims[top_idx])
-    second_score = float(action_max_sims[order[1]]) if n_actions > 1 else 0.0
-    margin = top_score - second_score
-
-    if top_act == "conversation":
-        return None, top_score
-
-    if top_score >= min_score and margin >= min_margin:
-        return top_act, top_score
-
-    return None, top_score
+    norm_text = " ".join(re.sub(r"[^\w\s]", " ", user_text.lower()).strip().split())
+    if not norm_text:
+        return None, 0.0
+    return decision_engine.decide_with_policy(score_fn, norm_text, min_score, min_margin)
 
 
 def generate_benchmark_corpus() -> List[str]:

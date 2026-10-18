@@ -81,6 +81,38 @@ def is_screen_query(text: str) -> bool:
     return any(re.search(pat, t) for pat in SCREEN_QUERY_PATTERNS)
 
 
+def resolve_cfg(ctx: Any) -> Any:
+    """Same precedence as commands.run_command: ctx.engine.cfg first, then ctx.cfg."""
+    if not ctx:
+        return None
+    engine = getattr(ctx, "engine", None)
+    if engine is not None and hasattr(engine, "cfg"):
+        return engine.cfg
+    return getattr(ctx, "cfg", None)
+
+
+def vision_blocked_reply(ctx: Any, what: str = "Screen analysis") -> Optional[str]:
+    """
+    Returns a spoken refusal (and logs/posts the block) when cloud vision is not allowed,
+    else None. Cloud vision requires cfg.ai_enabled and an API key. Must run before ANY
+    screen or camera capture.
+    """
+    cfg = resolve_cfg(ctx)
+    if cfg is not None and getattr(cfg, "ai_enabled", False) and get_api_key():
+        return None
+    reason = "ai_disabled" if not (cfg is not None and getattr(cfg, "ai_enabled", False)) else "no_api_key"
+    import jarvis_log as _jl
+    _jl.utterance_event(_jl.DECISION, tier="vision", action=f"blocked({reason})")
+    try:
+        from commands import _post_action
+        _post_action(ctx, "screen_awareness", False)
+    except Exception as exc:
+        print(f"[screen_awareness] could not post blocked action: {exc}")
+    if reason == "no_api_key":
+        return f"{what} needs a Groq API key in Settings, sir."
+    return f"{what} needs AI enabled in Settings, sir."
+
+
 class ScreenCaptureAdapter:
     """
     Adapter for capturing in-memory screen snapshots.
@@ -133,7 +165,12 @@ def analyze_screen(query: str, ctx: Any = None, client: Any = None, capture_adap
     5. Returns spoken response.
     """
     overlay = getattr(ctx, "overlay", None) if ctx else None
-    cfg = getattr(ctx, "cfg", None) or (getattr(ctx, "engine", None) and getattr(ctx.engine, "cfg", None))
+    cfg = resolve_cfg(ctx)
+
+    # Hard gate at the capture site: no AI switch / no key means NO capture and NO upload.
+    blocked = vision_blocked_reply(ctx, "Screen analysis")
+    if blocked:
+        return blocked
 
     api_key = get_api_key()
     if not api_key:

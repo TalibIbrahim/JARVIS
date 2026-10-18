@@ -123,13 +123,38 @@ class TestScreenAwareness:
         mock_client = MagicMock()
         mock_client.describe_image.return_value = "One shot screen inspected, sir."
 
+        ctx = MagicMock()
+        ctx.engine = None
+        ctx.cfg = MagicMock(ai_enabled=True)
+
         with patch("screen_awareness.get_capture_adapter", return_value=mock_adapter), \
+             patch("screen_awareness.get_api_key", return_value="gsk_test_key"), \
              patch("ai.get_api_key", return_value="gsk_test_key"):
 
-            reply = screen_awareness.analyze_screen("explain this error", client=mock_client)
+            reply = screen_awareness.analyze_screen("explain this error", ctx=ctx, client=mock_client)
             assert "One shot" in reply
             # Captured exactly once
             assert mock_adapter.capture_screen_jpeg.call_count == 1
+
+    def test_analyze_screen_ai_disabled_no_capture_no_upload(self):
+        """With ai_enabled=False: no capture, no upload, blocked reply."""
+        mock_adapter = MagicMock()
+        mock_adapter.capture_screen_jpeg.return_value = b"\xff\xd8\xffdummy"
+        mock_client = MagicMock()
+        ctx = MagicMock()
+        ctx.engine = None
+        ctx.cfg = MagicMock(ai_enabled=False)
+
+        with patch("screen_awareness.get_capture_adapter", return_value=mock_adapter), \
+             patch("screen_awareness.get_api_key", return_value="gsk_test_key"), \
+             patch("ai.get_api_key", return_value="gsk_test_key"):
+
+            reply = screen_awareness.analyze_screen("explain this error", ctx=ctx, client=mock_client,
+                                                    capture_adapter=mock_adapter)
+            assert mock_adapter.capture_screen_jpeg.call_count == 0
+            assert mock_client.describe_image.call_count == 0
+            assert reply == screen_awareness.vision_blocked_reply(ctx, "Screen analysis")
+            assert reply
 
     def test_analyze_screen_handles_groq_errors(self):
         mock_overlay = MagicMock()
