@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pyautogui
 
+import jarvis_log
 from filters import OneEuro, DeadzoneFilter, OneEuroPoint
 from dwell import DwellClicker
 
@@ -154,7 +155,7 @@ class Controller:
 
         # Decoupled 120+ Hz cursor update thread
         self._stop_thread = threading.Event()
-        self._thread = threading.Thread(target=self._cursor_loop, daemon=True)
+        self._thread = threading.Thread(target=self._cursor_loop, name="CursorLoop", daemon=True)
         self._thread.start()
         try:
             atexit.register(self.failsafe_release)
@@ -259,7 +260,11 @@ class Controller:
             except Exception:
                 pass
 
+        jarvis_log.thread_started("CursorLoop")
         next_tick = time.perf_counter() + dt_target
+        hb_t0 = time.perf_counter()
+        hb_next = hb_t0 + 1.0
+        hb_ticks = 0
         try:
             while not self._stop_thread.is_set():
                 # Smoothly interpolate towards target position
@@ -307,6 +312,13 @@ class Controller:
 
                 next_tick += dt_target
                 now_after = time.perf_counter()
+                hb_ticks += 1
+                if now_after >= hb_next:
+                    jarvis_log.heartbeat("CursorLoop", hz=round(hb_ticks / (now_after - hb_t0)),
+                                         active=bool(self.active))
+                    hb_t0 = now_after
+                    hb_next = now_after + 1.0
+                    hb_ticks = 0
                 if now_after > next_tick:
                     # If behind due to system sleep/resume or lock screen stall
                     if (now_after - next_tick) > 0.20:
@@ -314,6 +326,11 @@ class Controller:
                         self.target_y = self.cur_y
                         self.failsafe_release()
                     next_tick = now_after + dt_target
+        except BaseException as e:
+            jarvis_log.thread_exited("CursorLoop", e)
+            raise
+        else:
+            jarvis_log.thread_exited("CursorLoop")
         finally:
             if self._win:
                 try:

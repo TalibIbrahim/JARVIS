@@ -6,9 +6,48 @@ import time
 import cv2
 import numpy as np
 
+import jarvis_log
 from gestures import Hand, Action
 
+_tlog = jarvis_log.get_logger("tracker")
+
 mp = None
+
+# Read-only (logging-only for now): index of the camera currently held by an open FrameGrabber.
+_ACTIVE_GRABBER_IDX = None
+
+
+def _backend_name(backend):
+    return "DSHOW" if sys.platform == "win32" and backend == getattr(cv2, "CAP_DSHOW", None) else "ANY"
+
+
+def _fourcc_str(cap):
+    try:
+        v = int(cap.get(cv2.CAP_PROP_FOURCC))
+        return "".join(chr((v >> (8 * i)) & 0xFF) for i in range(4)) if v > 0 else "n/a"
+    except Exception:
+        return "?"
+
+
+def _log_cam_open(idx, cap, backend, req_w, req_h, req_fps, first_read, open_ms, where):
+    """Log one camera open candidate. Cheap, never raises. WARNING when not usable."""
+    try:
+        opened = bool(cap.isOpened())
+        try:
+            act_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            act_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            act_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        except Exception:
+            act_w = act_h = -1
+            act_fps = -1.0
+        ok = opened and first_read in (True, "n/a")
+        (_tlog.info if ok else _tlog.warning)(
+            "camera open (%s): idx=%s backend=%s isOpened=%s first_read=%s res=%sx%s (req %sx%s) fps=%.1f (req %s) "
+            "fourcc=%s open_ms=%d result=%s",
+            where, idx, _backend_name(backend), opened, first_read, act_w, act_h, req_w, req_h, act_fps, req_fps,
+            _fourcc_str(cap), open_ms, "OK" if ok else "FAIL")
+    except Exception:
+        pass
 
 
 def _get_mp():
@@ -42,10 +81,21 @@ def list_cameras(force_refresh=False):
         [{'index': int, 'name': str, 'working': bool}]
     """
     global _CAMERA_CACHE, _CAMERA_CACHE_TIME
+    try:
+        f = sys._getframe(1)
+        _site = f"{f.f_code.co_filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{f.f_lineno}"
+    except Exception:
+        _site = "?"
     with _CAMERA_LOCK:
         now = time.time()
-        if not force_refresh and _CAMERA_CACHE is not None and (now - _CAMERA_CACHE_TIME) < _CAMERA_CACHE_TTL:
+        _hit = not force_refresh and _CAMERA_CACHE is not None and (now - _CAMERA_CACHE_TIME) < _CAMERA_CACHE_TTL
+        _tlog.info("list_cameras: caller=%s thread=%s force_refresh=%s cache_hit=%s",
+                   _site, threading.current_thread().name, force_refresh, _hit)
+        if _hit:
             return list(_CAMERA_CACHE)
+        if _ACTIVE_GRABBER_IDX is not None:
+            _tlog.warning("list_cameras: probing while FrameGrabber holds camera idx=%s (caller=%s thread=%s)",
+                          _ACTIVE_GRABBER_IDX, _site, threading.current_thread().name)
 
         qt_cams = []
         try:
@@ -65,6 +115,7 @@ def list_cameras(force_refresh=False):
             if any(w in name.lower() for w in (" ir ", "ir camera", "infrared", "windows hello")):
                 continue
 
+            _t_probe = time.perf_counter()
             cap = cv2.VideoCapture(idx, backend)
             opened = cap.isOpened()
             working = False
@@ -81,6 +132,8 @@ def list_cameras(force_refresh=False):
                 except Exception:
                     pass
 
+            _tlog.info("list_cameras probe: idx=%s name=%r opened=%s working=%s ms=%d", idx, name, opened, working,
+                       int((time.perf_counter() - _t_probe) * 1000))
             if working:
                 cams.append({"index": idx, "name": name, "working": True})
 
@@ -97,7 +150,7 @@ def list_cameras(force_refresh=False):
 class FrameGrabber(threading.Thread):
     """Dedicated background thread for non-blocking camera frame capture at 30+ FPS."""
     def __init__(self, cfg, stop_event):
-        super().__init__(daemon=True)
+        super().__init__(name="FrameGrabber", daemon=True)
         self.cfg = cfg
         self.stop = stop_event
         self.cap = None
@@ -128,6 +181,7 @@ class FrameGrabber(threading.Thread):
         h = int(getattr(self.cfg, "frame_height", 720))
 
         for idx in candidates:
+            _t_open = time.perf_counter()
             cap = cv2.VideoCapture(idx, backend)
             if getattr(self.cfg, "camera_mjpg", True):
                 try:
@@ -148,6 +202,8 @@ class FrameGrabber(threading.Thread):
                 if ret and test_frame is not None:
                     size = getattr(test_frame, "size", 1)
                     is_valid = bool(size > 0 if isinstance(size, (int, float)) else True)
+                _log_cam_open(idx, cap, backend, w, h, getattr(self.cfg, "camera_fps", 30), is_valid,
+                              int((time.perf_counter() - _t_open) * 1000), "FrameGrabber.open_camera")
 
                 if is_valid:
                     if idx != preferred:
@@ -156,6 +212,8 @@ class FrameGrabber(threading.Thread):
                     self.cap = cap
                     self.opened = True
                     self._active_cam_idx = idx
+                    global _ACTIVE_GRABBER_IDX
+                    _ACTIVE_GRABBER_IDX = idx
                     # Re-sync double-buffer dimensions if camera resolution differs
                     if hasattr(test_frame, "shape") and isinstance(test_frame.shape, tuple) and len(test_frame.shape) >= 2:
                         actual_h, actual_w = int(test_frame.shape[0]), int(test_frame.shape[1])
@@ -181,6 +239,8 @@ class FrameGrabber(threading.Thread):
                 except Exception:
                     pass
             else:
+                _log_cam_open(idx, cap, backend, w, h, getattr(self.cfg, "camera_fps", 30), False,
+                              int((time.perf_counter() - _t_open) * 1000), "FrameGrabber.open_camera")
                 try:
                     cap.release()
                 except Exception:
@@ -198,6 +258,8 @@ class FrameGrabber(threading.Thread):
         delays = [1.0, 2.0, 4.0]
         delay_idx = 0
         print("[tracker] Camera disconnected. Entering auto-reconnect backoff loop (1s, 2s, 4s)...")
+        _tlog.warning("reconnect_loop: entering (failures=%s)", self.failures)
+        attempt = 0
         while not self.stop.is_set():
             delay = delays[delay_idx]
             if delay_idx < len(delays) - 1:
@@ -206,12 +268,17 @@ class FrameGrabber(threading.Thread):
                 break
 
             clear_camera_cache()
-            if self.open_camera():
+            attempt += 1
+            _ok = self.open_camera()
+            _tlog.info("reconnect_loop: attempt=%d delay=%.0fs result=%s", attempt, delay, "OK" if _ok else "FAIL")
+            if _ok:
                 self.failures = 0
                 self.reconnecting = False
                 print("[tracker] Camera reconnected: DirectShow device re-opened and buffers re-initialized.")
+                _tlog.info("reconnect_loop: leaving after %d attempt(s): reconnected", attempt)
                 return True
         self.reconnecting = False
+        _tlog.warning("reconnect_loop: leaving after %d attempt(s): stopped/failed", attempt)
         return False
 
     def reload_config(self, cfg=None):
@@ -225,13 +292,29 @@ class FrameGrabber(threading.Thread):
             self.release()
 
     def run(self):
+        jarvis_log.thread_started("FrameGrabber")
+        try:
+            self._run_body()
+        except BaseException as e:
+            jarvis_log.thread_exited("FrameGrabber", e)
+            raise
+        else:
+            jarvis_log.thread_exited("FrameGrabber")
+
+    def _run_body(self):
         if not self.cap or not self.opened:
             if not self.open_camera():
                 if not self.reconnect_loop():
                     return
 
         last_t = time.perf_counter()
+        hb_next = 0.0
         while not self.stop.is_set():
+            _pc = time.perf_counter()
+            if _pc >= hb_next:
+                hb_next = _pc + 1.0
+                jarvis_log.heartbeat("FrameGrabber", fps=round(self.fps, 1), failures=self.failures,
+                                     opened=self.opened)
             if not self.cap or not self.opened:
                 if not self.reconnect_loop():
                     continue
@@ -280,6 +363,7 @@ class FrameGrabber(threading.Thread):
             return self._buffers[self._read_idx], self.latest_t
 
     def release(self):
+        global _ACTIVE_GRABBER_IDX
         if self.cap:
             try:
                 self.cap.release()
@@ -287,11 +371,12 @@ class FrameGrabber(threading.Thread):
                 pass
         self.cap = None
         self.opened = False
+        _ACTIVE_GRABBER_IDX = None
 
 
 class Tracker(threading.Thread):
     def __init__(self, cfg, engine, controller, overlay, ctx, stop_event):
-        super().__init__(daemon=True)
+        super().__init__(name="Tracker", daemon=True)
         self.cfg = cfg
         self.engine = engine
         self.controller = controller
@@ -328,6 +413,16 @@ class Tracker(threading.Thread):
             self._grabber.reload_config(self.cfg)
 
     def run(self):
+        jarvis_log.thread_started("Tracker")
+        try:
+            self._run_body()
+        except BaseException as e:
+            jarvis_log.thread_exited("Tracker", e)
+            raise
+        else:
+            jarvis_log.thread_exited("Tracker")
+
+    def _run_body(self):
         cfg = self.cfg
         use_threaded = getattr(cfg, "threaded_capture", True)
 
@@ -343,6 +438,7 @@ class Tracker(threading.Thread):
             candidates = [preferred] + [i for i in (0, 1, 2) if i != preferred]
             cap = None
             for idx in candidates:
+                _t_open = time.perf_counter()
                 cand_cap = cv2.VideoCapture(idx, backend)
                 if getattr(cfg, "camera_mjpg", True):
                     try:
@@ -352,6 +448,9 @@ class Tracker(threading.Thread):
                 cand_cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
                 cand_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
                 cand_cap.set(cv2.CAP_PROP_FPS, getattr(cfg, "camera_fps", 30))
+                _log_cam_open(idx, cand_cap, backend, cfg.frame_width, cfg.frame_height,
+                              getattr(cfg, "camera_fps", 30), "n/a",
+                              int((time.perf_counter() - _t_open) * 1000), "Tracker.nonthreaded")
                 if cand_cap.isOpened():
                     cap = cand_cap
                     if idx != preferred:
@@ -372,13 +471,20 @@ class Tracker(threading.Thread):
         det_conf = getattr(cfg, "min_detection_confidence", 0.6)
         track_conf = getattr(cfg, "min_tracking_confidence", 0.6)
 
-        mp_mod = _get_mp()
-        hands = mp_mod.solutions.hands.Hands(
-            max_num_hands=2,
-            model_complexity=comp,
-            min_detection_confidence=det_conf,
-            min_tracking_confidence=track_conf
-        )
+        _t_mp = time.perf_counter()
+        try:
+            mp_mod = _get_mp()
+            hands = mp_mod.solutions.hands.Hands(
+                max_num_hands=2,
+                model_complexity=comp,
+                min_detection_confidence=det_conf,
+                min_tracking_confidence=track_conf
+            )
+        except BaseException:
+            _tlog.error("MediaPipe Hands init FAILED after %d ms", int((time.perf_counter() - _t_mp) * 1000),
+                        exc_info=True)
+            raise
+        _tlog.info("MediaPipe Hands init OK in %d ms (complexity=%s)", int((time.perf_counter() - _t_mp) * 1000), comp)
         connections = list(mp_mod.solutions.hands.HAND_CONNECTIONS)
         failures = 0
         last_processed_t = 0.0
@@ -387,8 +493,20 @@ class Tracker(threading.Thread):
 
         hand_visible = False
         last_hand_seen_t = 0.0
+        hb_next = 0.0
+        last_frame_pc = time.perf_counter()
+        n_hands = 0
+        prev_active = bool(getattr(self.engine, "active", False))
         while not self.stop.is_set():
             now_loop = time.perf_counter()
+            if now_loop >= hb_next:
+                hb_next = now_loop + 1.0
+                jarvis_log.heartbeat(
+                    "Tracker",
+                    fps=round(self._grabber.fps if (use_threaded and self._grabber) else self._fps, 1),
+                    inf_ms=round(self._inference_ms, 1),
+                    frame_age_ms=int((now_loop - last_frame_pc) * 1000),
+                    active=bool(getattr(self.engine, "active", False)), hands=n_hands)
             # Adaptive rate: low-power scanning when no hand is in view;
             # jump to full 30 FPS rate instantly the moment a hand is detected,
             # with zero missed first gestures.
@@ -401,6 +519,8 @@ class Tracker(threading.Thread):
                 if raw_frame is None or frame_t <= last_processed_t:
                     if (self._grabber.failures >= 30 or not self._grabber.opened) and failures < 30:
                         failures = 30
+                        _tlog.warning("camera feed lost (grabber failures=%s opened=%s)",
+                                      self._grabber.failures, self._grabber.opened)
                         self.ctx.say("Camera feed lost, sir.")
                         self.overlay.post("error", text="CAMERA FEED LOST")
                         self.controller.handle(Action("lost"))
@@ -410,6 +530,7 @@ class Tracker(threading.Thread):
                 if failures >= 30:
                     failures = 0
                     print("[tracker] Camera feed recovered. Resuming tracking.")
+                    _tlog.info("camera feed recovered")
                     self.controller._reset_filters()
                     self._flip_buf = None
                     self._rgb_buf = None
@@ -417,11 +538,13 @@ class Tracker(threading.Thread):
 
                 failures = 0
                 last_processed_t = frame_t
+                last_frame_pc = frame_t
             else:
                 ok, frame = cap.read()
                 if not ok:
                     failures += 1
                     if failures == 30:
+                        _tlog.warning("camera feed lost (non-threaded read failures=30)")
                         self.ctx.say("Camera feed lost, sir.")
                         self.overlay.post("error", text="CAMERA FEED LOST")
                         self.controller.handle(Action("lost"))
@@ -452,7 +575,10 @@ class Tracker(threading.Thread):
                                 except Exception:
                                     pass
                         continue
+                if failures >= 30:
+                    _tlog.info("camera feed recovered (non-threaded)")
                 failures = 0
+                last_frame_pc = time.perf_counter()
                 raw_frame = frame
                 with self._frame_lock:
                     self._latest_raw_frame = raw_frame
@@ -475,6 +601,7 @@ class Tracker(threading.Thread):
             if result.multi_hand_landmarks:
                 for lms in result.multi_hand_landmarks:
                     found.append(Hand([(p.x, p.y) for p in lms.landmark]))
+            n_hands = len(found)
 
             now = time.time()
             if found:
@@ -488,14 +615,24 @@ class Tracker(threading.Thread):
             inst_fps = 1.0 / dt
             self._fps = 0.9 * self._fps + 0.1 * inst_fps if self._fps > 0 else inst_fps
 
+            gesture_toggled = False
             for action in self.engine.update(found, now):
                 self.controller.handle(action)
                 if action.kind == "activate":
+                    gesture_toggled = True
+                    _tlog.info("engine.active -> True source=gesture")
                     self.ctx.chirp(True)
                     self.ctx.say("Online. At your service, sir.")
                 elif action.kind == "deactivate":
+                    gesture_toggled = True
+                    _tlog.info("engine.active -> False source=gesture")
                     self.ctx.chirp(False)
                     self.ctx.say("Standing by.")
+            _cur_active = bool(getattr(self.engine, "active", False))
+            if _cur_active != prev_active:
+                if not gesture_toggled:
+                    _tlog.info("engine.active -> %s source=unknown/request", _cur_active)
+                prev_active = _cur_active
 
             st = self.engine.status(now)
             st["landmarks"] = [h.lm for h in found]

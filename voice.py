@@ -40,8 +40,31 @@ from chime import (
 )
 
 
-_PORTAUDIO_LOCK = threading.RLock()
+import jarvis_log
+from jarvis_log import redact
+
+_vlog = jarvis_log.get_logger("voice")
+
+_PORTAUDIO_LOCK = jarvis_log.InstrumentedRLock("portaudio", warn_wait_ms=50, warn_hold_ms=250)
 set_audio_lock(_PORTAUDIO_LOCK)
+
+
+def _log_mic_open(p, idx, rate, channels, fpb, result, where):
+    """Log a PortAudio input-open result. Cheap, never raises."""
+    try:
+        name = "?"
+        host = "?"
+        try:
+            info = p.get_default_input_device_info() if idx is None else p.get_device_info_by_index(idx)
+            name = info.get("name", "?")
+            host = p.get_host_api_info_by_index(info["hostApi"])["name"]
+        except Exception:
+            pass
+        lvl = _vlog.info if result == "OK" else _vlog.warning
+        lvl("mic open (%s): idx=%s name=%r hostApi=%r rate=%s ch=%s fpb=%s result=%s",
+            where, idx, name, host, rate, channels, fpb, result)
+    except Exception:
+        pass
 _SHARED_PYAUDIO = None
 
 # Sensitivity mapping for openWakeWord detector
@@ -165,6 +188,7 @@ def list_microphones(probe_rms=False):
         [{'index': int, 'name': str, 'channels': int, 'working': bool, 'rms': float, 'is_virtual': bool}]
     """
     mics = []
+    _n_probe_fail = 0
     with _PORTAUDIO_LOCK:
         try:
             import pyaudio
@@ -203,6 +227,7 @@ def list_microphones(probe_rms=False):
                         except Exception:
                             working = False
                             rms = 0.0
+                            _n_probe_fail += 1
 
                     mics.append({
                         "index": i,
@@ -216,6 +241,12 @@ def list_microphones(probe_rms=False):
                     pass
         except Exception as exc:
             print(f"[voice] error enumerating microphones: {exc}")
+    try:
+        if probe_rms:
+            _vlog.info("list_microphones probe: inputs=%d probe_failed=%d working=%s", len(mics), _n_probe_fail,
+                       [(m["index"], round(m["rms"], 1)) for m in mics if m["working"]])
+    except Exception:
+        pass
     return mics
 
 
@@ -229,12 +260,15 @@ def find_best_microphone(cfg=None, probe_working=False):
     cfg_idx = getattr(cfg, "mic_device_index", None) if cfg else None
     mics = list_microphones(probe_rms=probe_working)
     if not mics:
+        _vlog.warning("find_best_microphone: no input devices (probe_working=%s)", probe_working)
         return None, "Default System Microphone"
 
     # 1. Explicitly requested device in config (if physical and working)
     if cfg_idx is not None:
         for m in mics:
             if m["index"] == cfg_idx and m["working"] and not m["is_virtual"]:
+                _vlog.info("find_best_microphone: reason=configured idx=%s name=%r probe_working=%s",
+                           m["index"], m["name"], probe_working)
                 return m["index"], m["name"]
 
     # 2. Filter working non-virtual devices
@@ -257,14 +291,23 @@ def find_best_microphone(cfg=None, probe_working=False):
     if physical_working:
         physical_working.sort(key=rank_mic, reverse=True)
         best = physical_working[0]
+        try:
+            top = [(m["index"], m["name"][:30], round(rank_mic(m), 1)) for m in physical_working[:3]]
+            _vlog.info("find_best_microphone: reason=ranked idx=%s name=%r probe_working=%s cfg_idx=%s top3=%s",
+                       best["index"], best["name"], probe_working, cfg_idx, top)
+        except Exception:
+            pass
         return best["index"], best["name"]
 
     # 3. Fallback to any working device
     any_working = [m for m in mics if m["working"]]
     if any_working:
         any_working.sort(key=lambda m: m["rms"], reverse=True)
+        _vlog.info("find_best_microphone: reason=fallback idx=%s name=%r probe_working=%s",
+                   any_working[0]["index"], any_working[0]["name"], probe_working)
         return any_working[0]["index"], any_working[0]["name"]
 
+    _vlog.warning("find_best_microphone: reason=fallback none working (probe_working=%s)", probe_working)
     return None, mics[0]["name"] if mics else "Default Microphone"
 
 
@@ -303,7 +346,9 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
             input_device_index=dev_idx,
             frames_per_buffer=chunk_samples
         )
-    except Exception:
+        _log_mic_open(p, dev_idx, rate, ch, chunk_samples, "OK", "probe_mic_level")
+    except Exception as exc:
+        _vlog.warning("mic open (probe_mic_level) FAILED: idx=%s fpb=%s err=%r", device_index, chunk_samples, exc)
         return 0.0, 0.0
     finally:
         _PORTAUDIO_LOCK.release()
@@ -581,7 +626,7 @@ class Speaker(threading.Thread):
     """
 
     def __init__(self, enabled=True, cfg=None):
-        super().__init__(daemon=True)
+        super().__init__(name="Speaker", daemon=True)
         self.enabled = enabled
         self.cfg = cfg
         self.q = queue.Queue()
@@ -739,6 +784,16 @@ class Speaker(threading.Thread):
             Voice.is_speaking = False
 
     def run(self):
+        jarvis_log.thread_started("Speaker")
+        try:
+            self._run_body()
+        except BaseException as e:
+            jarvis_log.thread_exited("Speaker", e)
+            raise
+        else:
+            jarvis_log.thread_exited("Speaker")
+
+    def _run_body(self):
         # Pre-warm Piper model in background so spoken responses are instantaneous
         engine_type = getattr(self.cfg, "tts_engine", "piper") if self.cfg else "piper"
         if engine_type == "piper":
@@ -748,9 +803,14 @@ class Speaker(threading.Thread):
                 print(f"[voice] Piper pre-warm note: {e}")
 
         while True:
-            text = self.q.get()
+            jarvis_log.heartbeat("Speaker", speaking=self.is_speaking, q=self.q.qsize())
+            try:
+                text = self.q.get(timeout=1.0)
+            except queue.Empty:
+                continue
             if text is None:
                 return
+            t_say = time.monotonic()
             try:
                 engine_type = getattr(self.cfg, "tts_engine", "piper") if self.cfg else "piper"
                 if engine_type == "piper":
@@ -759,6 +819,10 @@ class Speaker(threading.Thread):
                     self._say_system(text)
             except Exception as exc:
                 print(f"[voice] speech output error: {exc}")
+            dt_say = time.monotonic() - t_say
+            if dt_say > 30.0:
+                _vlog.warning("Speaker: say() playback took %.1fs (>30s) engine=%s text=%s",
+                              dt_say, engine_type, redact(text))
 
 
 class WakeWordDetector(threading.Thread):
@@ -803,7 +867,49 @@ class WakeWordDetector(threading.Thread):
         self.model = None
         self.listening_until = 0.0
         self.is_recording = False
+        # diagnostics state (logging only)
+        self._hb_t = 0.0
+        self._flat_since = None
+        self._flat_flagged = False
+        self._st_t = time.monotonic()
+        self._st_max_score = 0.0
+        self._st_vad_speech = 0
+        self._st_vad_total = 0
+        self._st_loud = 0
+        self._st_chunks = 0
         self._init_model()
+
+    def _diag_chunk(self, rms):
+        """Logging-only per-chunk bookkeeping: heartbeat (<=1/s) and RMS flatline detection."""
+        now = time.monotonic()
+        if rms < 1.0:
+            if self._flat_since is None:
+                self._flat_since = now
+            elif not self._flat_flagged and now - self._flat_since >= 5.0:
+                self._flat_flagged = True
+                _vlog.warning("mic flatline (all-zero input) on device [%s] %s",
+                              self.device_index, Voice.current_mic_name)
+        else:
+            if self._flat_flagged:
+                _vlog.info("mic flatline ended on device [%s] (rms=%.1f)", self.device_index, rms)
+            self._flat_since = None
+            self._flat_flagged = False
+        self._st_chunks += 1
+        if rms >= self.vad.energy_threshold:
+            self._st_loud += 1
+        if now - self._hb_t >= 1.0:
+            self._hb_t = now
+            jarvis_log.heartbeat(
+                "WakeWordDetector", rms=int(round(rms)), rec=self.is_recording,
+                follow=round(max(0.0, self.listening_until - time.time()), 1),
+                speaking=Voice.is_speaking)
+        if now - self._st_t >= 60.0:
+            _vlog.info("wake stats %.0fs: max_score=%.2f vad_speech=%d/%d (vad-evaluated) rms>=%.0f=%d/%d chunks",
+                       now - self._st_t, self._st_max_score, self._st_vad_speech, self._st_vad_total,
+                       self.vad.energy_threshold, self._st_loud, self._st_chunks)
+            self._st_t = now
+            self._st_max_score = 0.0
+            self._st_vad_speech = self._st_vad_total = self._st_loud = self._st_chunks = 0
 
     def _init_model(self):
         try:
@@ -836,6 +942,7 @@ class WakeWordDetector(threading.Thread):
         pre_roll: list = None,
         chunk_samples: int = 1280,
         sample_rate: int = 16000,
+        trigger: str = "vad",
     ) -> bytes:
         """
         Record with VAD: streams chunks while continuously updating Voice._latest_rms.
@@ -849,10 +956,17 @@ class WakeWordDetector(threading.Thread):
         speech_detected = False
         consecutive_silence = 0.0
         start_time = time.time()
+        # diagnostics only
+        reason = "stop"
+        uid = None
+        speech_chunks = 0
+        total_chunks = 0
+        rms_list = []
 
         try:
             while not self.stop.is_set():
                 if Voice.is_speaking:
+                    reason = "speaking"
                     break
 
                 data = None
@@ -860,8 +974,10 @@ class WakeWordDetector(threading.Thread):
                     try:
                         data = stream.read(chunk_samples, exception_on_overflow=False)
                     except Exception:
+                        reason = "stream_error"
                         break
                 if not data:
+                    reason = "stream_error"
                     break
 
                 arr = np.frombuffer(data, dtype=np.int16)
@@ -869,15 +985,23 @@ class WakeWordDetector(threading.Thread):
                 Voice._latest_rms = rms
                 Voice._latest_time = time.time()
                 recorded_frames.append(data)
+                self._diag_chunk(rms)
 
                 now = time.time()
                 elapsed = now - start_time
                 chunk_has_speech = self.vad.is_speech(arr, rms)
+                total_chunks += 1
+                rms_list.append(rms)
+                if chunk_has_speech:
+                    speech_chunks += 1
 
                 if not speech_detected:
                     if chunk_has_speech:
                         speech_detected = True
                         consecutive_silence = 0.0
+                        uid = jarvis_log.new_utterance()
+                        jarvis_log.utterance_event(jarvis_log.AUDIO_START, uid, trigger=trigger,
+                                                   device=self.device_index)
                     elif elapsed >= timeout_no_speech:
                         # 5 s silence with no speech
                         if self.on_no_speech:
@@ -893,10 +1017,20 @@ class WakeWordDetector(threading.Thread):
                     else:
                         consecutive_silence += chunk_duration
                         if consecutive_silence >= silence_endpoint:
+                            reason = "silence"
                             break
                     if elapsed >= max_duration:
+                        reason = "max_duration"
                         break
 
+            if speech_detected:
+                try:
+                    jarvis_log.utterance_event(
+                        jarvis_log.ENDPOINT, uid, reason=reason, dur_s=f"{time.time() - start_time:.2f}",
+                        speech_chunks=speech_chunks, total_chunks=total_chunks,
+                        rms_p50=int(sorted(rms_list)[len(rms_list) // 2]) if rms_list else 0)
+                except Exception:
+                    pass
             if not speech_detected or len(recorded_frames) < 3:
                 return None
 
@@ -958,6 +1092,7 @@ class WakeWordDetector(threading.Thread):
         delays = [1.0, 2.0, 4.0]
         delay_idx = 0
         print("[voice] Audio stream disconnected. Entering backoff retry loop (1s, 2s, 4s)...")
+        _vlog.warning("reconnect_stream: entering backoff loop")
 
         while not self.stop.is_set():
             delay = delays[delay_idx]
@@ -982,6 +1117,7 @@ class WakeWordDetector(threading.Thread):
                         input_device_index=best_idx,
                         frames_per_buffer=chunk_samples,
                     )
+                _log_mic_open(p, best_idx, sample_rate, 1, chunk_samples, "OK", "reconnect_stream")
                 # Verify reading at least one frame works without exception
                 test_data = test_stream.read(chunk_samples, exception_on_overflow=False)
                 if test_data and len(test_data) > 0:
@@ -997,11 +1133,21 @@ class WakeWordDetector(threading.Thread):
                             test_stream.close()
                     except Exception:
                         pass
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_mic_open(p, best_idx, sample_rate, 1, chunk_samples, repr(exc), "reconnect_stream")
         return None
 
     def run(self):
+        jarvis_log.thread_started("WakeWordDetector")
+        try:
+            self._run_body()
+        except BaseException as e:
+            jarvis_log.thread_exited("WakeWordDetector", e)
+            raise
+        else:
+            jarvis_log.thread_exited("WakeWordDetector")
+
+    def _run_body(self):
         import pyaudio
         p = get_shared_pyaudio()
 
@@ -1026,7 +1172,9 @@ class WakeWordDetector(threading.Thread):
                         input_device_index=active_idx,
                         frames_per_buffer=chunk_samples,
                     )
+                _log_mic_open(p, active_idx, sample_rate, 1, chunk_samples, "OK", "WakeWordDetector.run")
             except Exception as exc:
+                _log_mic_open(p, active_idx, sample_rate, 1, chunk_samples, repr(exc), "WakeWordDetector.run")
                 print(f"[voice] WakeWordDetector failed to open mic [{active_idx}]: {exc}")
                 stream = self.reconnect_stream(sample_rate, chunk_samples)
                 if stream is None:
@@ -1054,6 +1202,7 @@ class WakeWordDetector(threading.Thread):
                     rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
                     Voice._latest_rms = rms
                     Voice._latest_time = time.time()
+                    self._diag_chunk(rms)
 
                     # Suppress wake word if assistant is speaking
                     if Voice.is_speaking:
@@ -1081,6 +1230,7 @@ class WakeWordDetector(threading.Thread):
                             pre_roll=list(pre_roll),
                             chunk_samples=chunk_samples,
                             sample_rate=sample_rate,
+                            trigger="followup",
                         )
                         pre_roll.clear()
                         if raw:
@@ -1094,8 +1244,11 @@ class WakeWordDetector(threading.Thread):
                     if getattr(self.cfg, "wake_word_enabled", True) and self.model is not None:
                         pred = self.model.predict(arr)
                         score = pred.get("hey_jarvis", 0.0)
+                        if score > self._st_max_score:
+                            self._st_max_score = float(score)
                         if self.guard.evaluate(score, is_speaking=Voice.is_speaking, now=now):
                             wake_triggered = True
+                            _vlog.info("wake: openwakeword score=%.2f", float(score))
                             # WAKE DETECTED!
                             # 1. Fire wake callback immediately
                             if self.on_wake:
@@ -1114,6 +1267,7 @@ class WakeWordDetector(threading.Thread):
                                 chunk_samples=chunk_samples,
                                 sample_rate=sample_rate,
                                 timeout_no_speech=min(self.followup_window, 3.5),
+                                trigger="wake",
                             )
                             pre_roll.clear()
                             if raw:
@@ -1131,7 +1285,13 @@ class WakeWordDetector(threading.Thread):
                     # even if openWakeWord did not trigger on "hey_jarvis".
                     # _recognition_worker and _process verify wake_aliases in passive standby,
                     # ensuring zero false activations from random background speech.
-                    if not wake_triggered and self.vad.is_speech(arr, rms):
+                    vad_speech = False
+                    if not wake_triggered:
+                        vad_speech = self.vad.is_speech(arr, rms)
+                        self._st_vad_total += 1
+                        if vad_speech:
+                            self._st_vad_speech += 1
+                    if vad_speech:
                         raw = self.record_utterance_with_vad(
                             stream=stream,
                             pre_roll=list(pre_roll),
@@ -1186,8 +1346,11 @@ class WakeWordDetector(threading.Thread):
                     input_device_index=active_idx,
                     frames_per_buffer=1280,
                 )
+            _log_mic_open(p, active_idx, 16000, 1, 1280, "OK", "WakeWordDetector.listen")
             return self.record_utterance_with_vad(stream=stream, timeout_no_speech=timeout_no_speech)
         except Exception as exc:
+            if stream is None:
+                _log_mic_open(p, active_idx, 16000, 1, 1280, repr(exc), "WakeWordDetector.listen")
             print(f"[voice] listen failed: {exc}")
             return None
         finally:
@@ -1217,10 +1380,11 @@ class Voice(threading.Thread):
     is_speaking = False
 
     def __init__(self, cfg, ctx, stop_event):
-        super().__init__(daemon=True)
+        super().__init__(name="Voice", daemon=True)
         self.cfg = cfg
         self.ctx = ctx
         self.stop = stop_event
+        self._groq_cd_logged = 0.0
         self.listening_until = 0.0
         self.audio_q = queue.Queue(maxsize=3)
         self.current_mic_index = None
@@ -1327,14 +1491,29 @@ class Voice(threading.Thread):
         if not raw_bytes:
             return
         Voice._last_raw_audio = raw_bytes
+        uid = jarvis_log.current_utterance()
         try:
             import speech_recognition as sr
             audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
-            self.audio_q.put_nowait((audio, is_command, time.time()))
-        except Exception:
-            pass
+            self.audio_q.put_nowait((audio, is_command, time.time(), uid))
+        except queue.Full:
+            qs = self.audio_q.qsize()
+            jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="audio_q_full", qsize=qs)
+            _vlog.warning("audio_q full (qsize=%d): dropping utterance %s", qs, uid)
+        except Exception as exc:
+            _vlog.warning("enqueue utterance %s failed: %r", uid, exc)
 
     def run(self):
+        jarvis_log.thread_started("Voice")
+        try:
+            self._run_body()
+        except BaseException as e:
+            jarvis_log.thread_exited("Voice", e)
+            raise
+        else:
+            jarvis_log.thread_exited("Voice")
+
+    def _run_body(self):
         try:
             import speech_recognition as sr
         except ImportError:
@@ -1355,7 +1534,9 @@ class Voice(threading.Thread):
         print(f"[voice] Connecting to microphone [{dev_idx}]: {dev_name}")
 
         # STT background worker
-        worker = threading.Thread(target=self._recognition_worker, args=(recognizer, sr), daemon=True)
+        worker = threading.Thread(target=jarvis_log.run_logged,
+                                  args=("STTWorker", self._recognition_worker, recognizer, sr),
+                                  name="STTWorker", daemon=True)
         worker.start()
 
         # Dedicated openWakeWord detector at 16 kHz
@@ -1373,6 +1554,7 @@ class Voice(threading.Thread):
         self.wake_detector.start()
 
         while not self.stop.is_set():
+            jarvis_log.heartbeat("Voice")
             configured_idx = getattr(self.cfg, "mic_device_index", None)
             if configured_idx is not None and configured_idx != self.wake_detector.device_index:
                 print(f"[voice] Switching microphone to [{configured_idx}]...")
@@ -1391,43 +1573,74 @@ class Voice(threading.Thread):
 
     def _fallback_google(self, recognizer, audio, sr):
         """Falls back to Google SpeechRecognition if Groq is unavailable."""
+        t0 = time.monotonic()
+        try:
+            nbytes = len(audio.get_raw_data())
+            jarvis_log.utterance_event(jarvis_log.STT_SENT, engine="google", bytes=nbytes,
+                                       dur_s=f"{nbytes / 32000.0:.2f}")
+        except Exception:
+            pass
         try:
             print("[voice] Falling back to Google SpeechRecognition...")
             text = recognizer.recognize_google(audio)
-            print(f"[voice] Google Heard: \"{text}\"")
+            print(f"[voice] Google Heard: \"{redact(text)}\"")
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", text=text, ok=bool(text),
+                                       ms=int((time.monotonic() - t0) * 1000))
             return text
-        except sr.UnknownValueError:
+        except sr.UnknownValueError as exc:
             print("[voice] (Audio captured, but speech could not be understood)")
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", ok=False, err=type(exc).__name__,
+                                       ms=int((time.monotonic() - t0) * 1000))
             return None
         except sr.RequestError as re_err:
             print(f"[voice] Google speech service error: {re_err}")
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", ok=False, err=type(re_err).__name__,
+                                       ms=int((time.monotonic() - t0) * 1000))
             self.ctx.say("The speech service is unreachable, sir.")
             time.sleep(4)
             return None
         except Exception as exc:
             print(f"[voice] Google recognition error: {exc}")
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", ok=False, err=type(exc).__name__,
+                                       ms=int((time.monotonic() - t0) * 1000))
             return None
 
     def _recognition_worker(self, recognizer, sr):
         vp = get_voice_profile()
 
         while not self.stop.is_set():
+            jarvis_log.heartbeat("STTWorker", q=self.audio_q.qsize())
             try:
                 item = self.audio_q.get(timeout=0.5)
             except queue.Empty:
                 continue
 
+            uid = None
             if isinstance(item, tuple):
-                audio, is_command, enqueued_at = item
+                if len(item) >= 4:
+                    audio, is_command, enqueued_at, uid = item[:4]
+                else:
+                    audio, is_command, enqueued_at = item
             else:
                 audio = item
                 is_command = False
                 enqueued_at = time.time()
 
+            jarvis_log.set_current_utterance(uid)
+            try:
+                self._handle_audio_item(recognizer, sr, vp, audio, is_command, enqueued_at, uid)
+            finally:
+                jarvis_log.set_current_utterance(None)
+
+    def _handle_audio_item(self, recognizer, sr, vp, audio, is_command, enqueued_at, uid):
+        # (body of the former _recognition_worker loop; `continue` -> `return`)
+        if True:
             # Energy-based VAD validation before sending audio
             raw_bytes = audio.get_raw_data()
             if not raw_bytes or len(raw_bytes) < 3200:
-                continue
+                jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="too_short",
+                                           bytes=len(raw_bytes) if raw_bytes else 0)
+                return
             arr = np.frombuffer(raw_bytes, dtype=np.int16)
             rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
 
@@ -1437,14 +1650,17 @@ class Voice(threading.Thread):
             # Noise gate: reject quiet acoustic flutter (< 25.0) in active session, require clear speech (> 40.0) in standby
             min_rms = 25.0 if is_active_session else 40.0
             if rms < min_rms:
-                continue
+                jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="rms_gate",
+                                           rms=int(rms), min=int(min_rms))
+                return
 
             # Speaker verification gate (if enrolled and enabled in config)
             if vp.is_enrolled and getattr(self.cfg, "voice_speaker_verification", False):
                 is_match, sim = vp.verify(raw_bytes)
                 if not is_match:
                     print(f"[voice] Speaker verification rejected non-owner audio (similarity: {sim:.2f})")
-                    continue
+                    jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="speaker_verify", sim=f"{sim:.2f}")
+                    return
 
             # Cache latest valid speech audio for profile enrollment ("train my voice")
             Voice._last_raw_audio = raw_bytes
@@ -1464,8 +1680,14 @@ class Voice(threading.Thread):
             key = get_api_key(self.cfg)
             ai_enabled = getattr(self.cfg, "ai_enabled", False)
             use_groq = bool(ai_enabled and key and now >= self.groq_cooldown_until)
+            if ai_enabled and key and not use_groq and self._groq_cd_logged != self.groq_cooldown_until:
+                self._groq_cd_logged = self.groq_cooldown_until
+                _vlog.warning("Groq cooling down until %s (%.0fs left); using Google",
+                              time.strftime("%H:%M:%S", time.localtime(self.groq_cooldown_until)),
+                              self.groq_cooldown_until - now)
 
             if use_groq:
+                t_groq = time.monotonic()
                 try:
                     # Convert in-memory audio chunk to 16 kHz mono WAV (zero temp files)
                     wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
@@ -1473,11 +1695,17 @@ class Voice(threading.Thread):
                     timeout = getattr(self.cfg, "ai_timeout", 10)
                     client = GroqClient(api_key=key, timeout=timeout)
                     print(f"[voice] Transcribing complete utterance via Groq Whisper ({stt_model})...")
+                    jarvis_log.utterance_event(jarvis_log.STT_SENT, uid, engine="groq", bytes=len(wav_bytes),
+                                               dur_s=f"{len(raw_bytes) / 32000.0:.2f}")
                     text = client.transcribe(wav_bytes, model=stt_model, language="en")
-                    print(f"[voice] Groq Heard: \"{text}\"")
+                    print(f"[voice] Groq Heard: \"{redact(text)}\"")
+                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", text=text, ok=bool(text),
+                                               ms=int((time.monotonic() - t_groq) * 1000))
                     # Clear any prior cooldown
                     self.groq_cooldown_until = 0.0
                 except AuthenticationError as auth_err:
+                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
+                                               err=type(auth_err).__name__, ms=int((time.monotonic() - t_groq) * 1000))
                     print(f"[voice] Groq key authentication failed: {auth_err}")
                     self.groq_cooldown_until = time.time() + 300.0  # 5 min cooldown on auth failure
                     if hasattr(self.ctx, "overlay") and self.ctx.overlay:
@@ -1487,6 +1715,8 @@ class Voice(threading.Thread):
                             pass
                     text = self._fallback_google(recognizer, audio, sr)
                 except RateLimitError as rl_err:
+                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
+                                               err=type(rl_err).__name__, ms=int((time.monotonic() - t_groq) * 1000))
                     print(f"[voice] Groq rate limit: {rl_err}")
                     wait_sec = rl_err.retry_after if rl_err.retry_after else 10.0
                     self.groq_cooldown_until = time.time() + wait_sec
@@ -1497,6 +1727,8 @@ class Voice(threading.Thread):
                             pass
                     text = self._fallback_google(recognizer, audio, sr)
                 except (OfflineError, TimeoutError) as net_err:
+                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
+                                               err=type(net_err).__name__, ms=int((time.monotonic() - t_groq) * 1000))
                     print(f"[voice] Groq network offline/timeout: {net_err}")
                     self.groq_cooldown_until = time.time() + 15.0
                     if hasattr(self.ctx, "overlay") and self.ctx.overlay:
@@ -1506,6 +1738,8 @@ class Voice(threading.Thread):
                             pass
                     text = self._fallback_google(recognizer, audio, sr)
                 except Exception as exc:
+                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
+                                               err=type(exc).__name__, ms=int((time.monotonic() - t_groq) * 1000))
                     print(f"[voice] Groq error ({exc}), falling back to Google...")
                     text = self._fallback_google(recognizer, audio, sr)
             else:
@@ -1522,6 +1756,7 @@ class Voice(threading.Thread):
         now = time.time()
         command = None
         is_active = is_command or (now < self.listening_until) or (self.wake_detector and now < self.wake_detector.listening_until)
+        matched_alias = None
 
         if is_active:
             command = t
@@ -1529,20 +1764,25 @@ class Voice(threading.Thread):
                 pattern = r"^\s*" + re.escape(alias) + r"\b"
                 match = re.search(pattern, command)
                 if match:
+                    matched_alias = alias
                     stripped = command[match.end():].strip(" ,.!?")
                     if stripped:
                         command = stripped
                     else:
                         command = ""
                     break
+            jarvis_log.utterance_event(jarvis_log.WAKE_GATE, active=True, matched=matched_alias, command=command)
         else:
             for alias in getattr(self.cfg, "wake_aliases", ["jarvis"]):
                 pattern = r"\b" + re.escape(alias) + r"\b"
                 match = re.search(pattern, t)
                 if match:
+                    matched_alias = alias
                     command = t[match.end():].strip(" ,.!?")
                     break
+            jarvis_log.utterance_event(jarvis_log.WAKE_GATE, active=False, matched=matched_alias, command=command)
             if command is None:
+                jarvis_log.utterance_event(jarvis_log.DROPPED, reason="no_wake_word")
                 # No wake word: ignore and clear any listening state on the island
                 if hasattr(self.ctx, "overlay") and self.ctx.overlay:
                     try:
@@ -1569,6 +1809,7 @@ class Voice(threading.Thread):
                 except Exception:
                     pass
             self.ctx.say("Yes, sir?")
+            jarvis_log.utterance_event(jarvis_log.RESULT, step="wake_ack", ok=True)
             return
 
         # Keep follow-up window open after executing command
@@ -1613,11 +1854,18 @@ class Voice(threading.Thread):
             island_reply = handle_island_voice_command(command, self.ctx)
             if island_reply:
                 self.ctx.say(island_reply)
+                jarvis_log.utterance_event(jarvis_log.RESULT, step="reply", ok=True, via="island")
                 return
 
-            reply = run_command(command, self.ctx)
+            try:
+                reply = run_command(command, self.ctx)
+            except Exception as exc:
+                _vlog.error("run_command raised %s for utterance %s", type(exc).__name__,
+                            jarvis_log.current_utterance(), exc_info=True)
+                raise
             if reply:
                 self.ctx.say(reply)
+            jarvis_log.utterance_event(jarvis_log.RESULT, step="reply", ok=reply is not None)
         finally:
             if hasattr(self.ctx, "overlay") and self.ctx.overlay:
                 try:
