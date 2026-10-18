@@ -2054,11 +2054,11 @@ class SettingsWindow(QDialog):
                             self.hw_layout_control)
 
         # 9. Backdrop Glass Blur (toggle)
-        self.backdrop_blur_switch = AppleSwitch(getattr(self.cfg, "island_backdrop_blur", getattr(self.cfg, "glass_blur", True)))
+        self.backdrop_blur_switch = AppleSwitch(bool(getattr(self.cfg, "island_backdrop_blur", False)))
         self.sw_island_blur = self.backdrop_blur_switch
         self.backdrop_blur_switch.toggled.connect(lambda v: self._save("island_backdrop_blur", v))
         island_card.add_row("Backdrop Blur",
-                            "Enable hardware-accelerated Mica or Acrylic blur behind the island surface",
+                            "Enable hardware-accelerated Windows Acrylic blur (may show rectangular DWM border on Windows 11)",
                             self.backdrop_blur_switch)
 
         # 10. Backdrop Opacity Slider

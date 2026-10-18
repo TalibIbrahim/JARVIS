@@ -189,6 +189,42 @@ def apply_glass_backdrop(hwnd, dark=True):
     return False
 
 
+def remove_backdrop(hwnd):
+    """Removes DWM Acrylic/Mica backdrop from HWND."""
+    if sys.platform != "win32":
+        return False
+    try:
+        dwm = ctypes.windll.dwmapi
+        none_val = ctypes.c_int(1)  # DWMSBT_NONE
+        dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(none_val), ctypes.sizeof(none_val))
+    except Exception:
+        pass
+    try:
+        class AccentPolicy(ctypes.Structure):
+            _fields_ = [
+                ("AccentState", ctypes.c_int),
+                ("AccentFlags", ctypes.c_int),
+                ("GradientColor", ctypes.c_int),
+                ("AnimationId", ctypes.c_int),
+            ]
+        class WindowCompositionAttributeData(ctypes.Structure):
+            _fields_ = [
+                ("Attribute", ctypes.c_int),
+                ("Data", ctypes.c_void_p),
+                ("SizeOfData", ctypes.c_size_t),
+            ]
+        user32 = ctypes.windll.user32
+        set_attr = getattr(user32, "SetWindowCompositionAttribute", None)
+        if set_attr:
+            accent = AccentPolicy(0, 0, 0, 0)
+            data = WindowCompositionAttributeData(19, ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p), ctypes.sizeof(accent))
+            set_attr(hwnd, ctypes.byref(data))
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def get_system_theme():
     """Detects Windows Light/Dark mode and accent color."""
     dark = True
@@ -345,9 +381,11 @@ class AppleDynamicIsland(QWidget):
             user32 = ctypes.windll.user32
             hwnd = int(self.winId())
             style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-            user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20 | 0x80 | 0x08000000)
-            if getattr(self.mgr.cfg, "glass_blur", True):
+            cfg = getattr(self.mgr, "cfg", None)
+            if getattr(cfg, "island_backdrop_blur", False):
                 apply_glass_backdrop(hwnd, dark=self.dark_mode)
+            else:
+                remove_backdrop(hwnd)
         except Exception as exc:
             print(f"[overlay] backdrop error: {exc}")
 

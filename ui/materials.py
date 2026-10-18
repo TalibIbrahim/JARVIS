@@ -251,6 +251,50 @@ def apply_acrylic(hwnd: int, dark: bool = True, opacity: float = 1.0) -> bool:
     return False
 
 
+def remove_backdrop(hwnd: int) -> bool:
+    """
+    Removes native DWM backdrops (Acrylic/Mica) so shaped/floating windows with
+    WA_TranslucentBackground remain 100% invisible outside their vector path.
+    """
+    if sys.platform != "win32":
+        return False
+    ok = False
+    try:
+        ok = _dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_NONE)
+    except Exception:
+        pass
+    try:
+        class AccentPolicy(ctypes.Structure):
+            _fields_ = [
+                ("AccentState",   ctypes.c_int),
+                ("AccentFlags",   ctypes.c_int),
+                ("GradientColor", ctypes.c_int),
+                ("AnimationId",   ctypes.c_int),
+            ]
+
+        class WCA_DATA(ctypes.Structure):
+            _fields_ = [
+                ("Attribute",  ctypes.c_int),
+                ("Data",       ctypes.c_void_p),
+                ("SizeOfData", ctypes.c_size_t),
+            ]
+
+        user32 = ctypes.windll.user32
+        fn = getattr(user32, "SetWindowCompositionAttribute", None)
+        if fn:
+            accent = AccentPolicy(0, 0, 0, 0)
+            data = WCA_DATA(
+                19,
+                ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p),
+                ctypes.sizeof(accent),
+            )
+            fn(hwnd, ctypes.byref(data))
+            ok = True
+    except Exception:
+        pass
+    return ok
+
+
 def apply_best_backdrop(
     hwnd: int,
     dark: bool = True,

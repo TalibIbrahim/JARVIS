@@ -441,9 +441,11 @@ class AppleDynamicIsland(QWidget):
 
             if sys.platform == "win32" and hasattr(self, "winId"):
                 try:
-                    from ui.materials import apply_glass_backdrop
-                    if getattr(cfg, "island_backdrop_blur", False) or getattr(cfg, "glass_blur", False):
-                        apply_glass_backdrop(int(self.winId()), dark=self.dark_mode)
+                    from ui.materials import apply_acrylic, remove_backdrop
+                    if getattr(cfg, "island_backdrop_blur", False):
+                        apply_acrylic(int(self.winId()), dark=self.dark_mode)
+                    else:
+                        remove_backdrop(int(self.winId()))
                 except Exception:
                     pass
 
@@ -488,14 +490,18 @@ class AppleDynamicIsland(QWidget):
             print(f"[island] set_interactive error: {exc}")
 
     def make_click_through(self) -> None:
-        """Apply WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE and Acrylic."""
+        """Apply WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE and remove DWM rectangular backdrop."""
         self.set_interactive(False)
         if sys.platform != "win32":
             return
         try:
             hwnd = int(self.winId())
-            if getattr(getattr(self.mgr, "cfg", None), "glass_blur", True):
+            from ui.materials import apply_acrylic, remove_backdrop
+            cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+            if getattr(cfg, "island_backdrop_blur", False):
                 apply_acrylic(hwnd, self.dark_mode)
+            else:
+                remove_backdrop(hwnd)
         except Exception as exc:
             print(f"[island] backdrop error: {exc}")
 
