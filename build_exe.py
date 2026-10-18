@@ -35,6 +35,12 @@ def build():
         "--hidden-import", "onnxruntime",
         "--hidden-import", "scipy",
         "--hidden-import", "scipy.signal",
+        "--hidden-import", "psutil",
+        "--hidden-import", "pynvml",
+        "--hidden-import", "PIL",
+        "--hidden-import", "PIL.Image",
+        "--hidden-import", "pycaw",
+        "--hidden-import", "comtypes",
         "--collect-data", "certifi",
         "--collect-data", "piper",
         "--collect-data", "openwakeword",
@@ -51,6 +57,7 @@ def build():
         print("\n[build] SUCCESS! Output generated: dist/JARVIS.exe")
     else:
         print(f"\n[build] FAILED with return code {res.returncode}")
+        sys.exit(res.returncode)
 
 
 if __name__ == "__main__":
