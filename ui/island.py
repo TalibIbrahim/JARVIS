@@ -225,6 +225,11 @@ class AppleDynamicIsland(QWidget):
         self._thinking_start_t: float = 0.0
         self._listening_start_t: float = 0.0
         self.is_ai_error     = False
+        # Worker health (None = unknown -> legacy activity dot, not health).
+        self.worker_health_state: str | None = None
+        self.worker_health_reason: str = ""
+        self._wh_from_col: QColor | None = None
+        self._wh_t0: float = 0.0
         self.is_transcribing = False
 
         # Result state
@@ -972,6 +977,39 @@ class AppleDynamicIsland(QWidget):
                 tw, th = self._target_size(self._resolve_state(now), now)
                 self.spring_h.set_target(th)
                 self.spring_h.vel = 80.0
+
+    _WH_COLORS = {"ok": "#34C759", "paused": "#8E8E93", "down": "#FF453A"}
+
+    def set_worker_health(self, state: str, reason: str = "") -> None:
+        """Worker-health status dot (GUI thread only; posted via Overlay)."""
+        state = state if state in self._WH_COLORS else None
+        reason = str(reason or "")[:28]
+        if state == self.worker_health_state and reason == self.worker_health_reason:
+            return
+        # Crossfade origin = colour currently shown (150 ms, instant if reduce_motion).
+        self._wh_from_col = self._worker_health_color(time.monotonic())
+        self._wh_t0 = time.monotonic()
+        self.worker_health_state = state
+        self.worker_health_reason = reason
+        self.update()
+
+    def _worker_health_color(self, now_m: float) -> QColor | None:
+        st = self.worker_health_state
+        if st is None:
+            return None
+        target = QColor(self._WH_COLORS[st])
+        src = self._wh_from_col
+        if src is None or T.reduce_motion():
+            return target
+        k = (now_m - self._wh_t0) / 0.15
+        if k >= 1.0:
+            return target
+        k = max(0.0, k)
+        return QColor(
+            int(src.red() + (target.red() - src.red()) * k),
+            int(src.green() + (target.green() - src.green()) * k),
+            int(src.blue() + (target.blue() - src.blue()) * k),
+        )
 
     def set_partial_transcript(self, text: str, now: float) -> None:
         """Update live partial transcript with word-by-word arrival timestamps."""
@@ -2411,6 +2449,13 @@ class AppleDynamicIsland(QWidget):
             dot_col = COLOR.accent_green
         else:
             dot_col = QColor("#8E8E93" if dark else "#AEAEB2")
+        # Worker health (once known) takes over the existing trailing dot.
+        _wh = self._worker_health_color(time.monotonic())
+        if _wh is not None:
+            dot_col = _wh
+            dot_r = 3.5
+            if self._wh_from_col is not None and time.monotonic() - self._wh_t0 < 0.16:
+                self.update()
 
         if compact_mode == "media":
             # ── Media compact layout ─────────────────────────────────────
@@ -3627,6 +3672,9 @@ class AppleDynamicIsland(QWidget):
         p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.Normal))
         p.setPen(QColor("#8E9094"))
         cam_mic_txt = "Camera: 60 FPS   •   Mic: Online"
+        if self.worker_health_state == "down":
+            p.setPen(QColor("#FF453A"))
+            cam_mic_txt = "Down: " + (self.worker_health_reason or "worker stopped")
         p.drawText(QRectF(lx + 12.0 * scale, ty1 + 45.0 * scale, status_w - 24.0 * scale, 14.0 * scale),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, cam_mic_txt)
 

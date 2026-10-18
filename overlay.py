@@ -3040,6 +3040,9 @@ class Overlay:
                     card = d.get("card", "weather")
                     if hasattr(self.island, "expand_card"):
                         self.island.expand_card(card)
+                elif kind == "worker_health":
+                    if hasattr(self.island, "set_worker_health"):
+                        self.island.set_worker_health(str(d.get("state", "")), str(d.get("reason", "")))
                 elif kind == "collapse_card":
                     if hasattr(self.island, "collapse_card"):
                         self.island.collapse_card()

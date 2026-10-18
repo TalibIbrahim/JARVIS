@@ -90,6 +90,7 @@ except ImportError:
 class SettingsBridge(QObject):
     test_conn_result = Signal(bool, str, dict)
     test_mic_result  = Signal(dict)
+    cameras_result   = Signal(int, list)
     updater_event    = Signal(str, dict)
     mic_level_updated = Signal(float)
     diagnostics_result = Signal(list)
@@ -1012,8 +1013,35 @@ class SettingsWindow(QDialog):
         cam_combo = AppleComboBox()
         cam_combo.setMinimumWidth(220)
 
+        cam_gen = [0]
+
         def populate_cameras(force: bool = False) -> None:
-            cams = list_cameras(force_refresh=force)
+            cam_gen[0] += 1
+            gen = cam_gen[0]
+            cam_combo.blockSignals(True)
+            cam_combo.clear()
+            cam_combo.addItem("Detecting cameras…", None)
+            try:
+                cam_combo.model().item(0).setEnabled(False)
+            except Exception:
+                pass
+            cam_combo.blockSignals(False)
+
+            def _work() -> None:
+                try:
+                    cams = list_cameras(force_refresh=force)
+                except Exception:
+                    cams = []
+                try:
+                    self.bridge.cameras_result.emit(gen, list(cams or []))
+                except RuntimeError:
+                    pass  # window destroyed
+
+            threading.Thread(target=_work, name="settings-cam-probe", daemon=True).start()
+
+        def apply_cameras(gen: int, cams: list) -> None:
+            if gen != cam_gen[0]:
+                return  # stale result
             cam_combo.blockSignals(True)
             cam_combo.clear()
             sel = 0
@@ -1026,6 +1054,7 @@ class SettingsWindow(QDialog):
             cam_combo.setCurrentIndex(sel)
             cam_combo.blockSignals(False)
 
+        self.bridge.cameras_result.connect(apply_cameras)
         populate_cameras()
         cam_combo.currentIndexChanged.connect(
             lambda i: self._save("camera_index", cam_combo.itemData(i))
