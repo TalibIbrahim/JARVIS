@@ -114,3 +114,6 @@ tests/diffs/
 # Only project files on GitHub: no Markdown except the README (local docs, reports, notes stay local)
 *.md
 !/README.md
+
+# Local reference screenshots (user-provided, not project files)
+docs/reference/
