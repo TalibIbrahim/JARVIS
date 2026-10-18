@@ -326,16 +326,23 @@ exit
         return True
 
     def start_periodic_check(self, interval_hours=4):
-        """Starts periodic background checks (every N hours)."""
+        """Starts periodic background checks (every N hours). Returns the worker thread so a
+        supervisor can watch it. The loop ends when the app stop event (ctx.stop) is set."""
+        stop = getattr(getattr(self, "ctx", None), "stop", None)
+        if not isinstance(stop, threading.Event):
+            stop = threading.Event()
+
         def loop():
             # Initial startup check after 8 seconds so the app boots instantly
-            time.sleep(8)
+            if stop.wait(8):
+                return
             if self.auto_check:
                 self.check_async()
 
-            while True:
-                time.sleep(interval_hours * 3600)
+            while not stop.wait(interval_hours * 3600):
                 if self.auto_check:
                     self.check_async()
 
-        threading.Thread(target=loop, daemon=True).start()
+        t = threading.Thread(target=loop, name="AutoUpdaterLoop", daemon=True)
+        t.start()
+        return t

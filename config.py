@@ -93,6 +93,7 @@ class Config:
     tts_engine: str = "piper"           # "piper" (Paul Bettany MCU) or "system" (pyttsx3 SAPI5)
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
+    config_version: int = 2             # bumped by one-time migrations in load_config (2: prune risky wake aliases)
     wake_word_enabled: bool = True      # openWakeWord / wake word detection toggle
     wake_sensitivity: str = "balanced"  # "low", "balanced", "high"
     wake_followup_window: float = 6.0   # seconds Jarvis keeps listening after wake detection
@@ -100,8 +101,7 @@ class Config:
     wake_aliases: list = field(default_factory=lambda: [
         "jarvis", "hey jarvis", "ok jarvis", "okay jarvis", "hi jarvis", "hello jarvis",
         "yo jarvis", "jarvis please", "jarvas", "jervis", "gervais", "javis", "jarviz",
-        "jarves", "jarv", "travis", "service", "harvest", "charvis", "darvis", "jar is",
-        "jar business"
+        "jarves", "jarv", "charvis", "darvis", "jar business"
     ])
     command_window: float = 7.0         # seconds Jarvis keeps listening after "Jarvis?"
     mic_device_index: int = None        # specific microphone device index, or None for auto-detect
@@ -227,7 +227,28 @@ class Config:
                 default_val = getattr(self, key)
                 coerced = _coerce_field_value(key, value, default_val)
                 setattr(self, key, coerced)
+                # An explicit user change makes the value persistent again.
+                clear_runtime_override(self, key)
 
+
+
+def mark_runtime_override(cfg, field_name: str) -> None:
+    """Flag `field_name` as a runtime-only override (CLI flag, device fallback): the live value is
+    used by this process but save_config() will NOT persist it to disk."""
+    ov = getattr(cfg, "_runtime_overrides", None)
+    if not isinstance(ov, set):
+        ov = set()
+        cfg._runtime_overrides = ov
+    ov.add(field_name)
+
+
+def clear_runtime_override(cfg, field_name: str) -> None:
+    ov = getattr(cfg, "_runtime_overrides", None)
+    if isinstance(ov, set):
+        ov.discard(field_name)
+
+
+_DEPRECATED_WAKE_ALIASES = ("service", "harvest", "travis", "jar is")
 
 
 def get_config_path(explicit_path=None):
@@ -336,6 +357,13 @@ def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
     return value
 
 
+def _loaded_version(data: dict) -> int:
+    try:
+        return int(data.get("config_version", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def load_config(path=None):
     """
     Loads configuration from JSON file.
@@ -398,7 +426,18 @@ def load_config(path=None):
     else:
         needs_repair = True
 
-    if needs_repair or type_repaired:
+    # One-time migration (config_version 2): drop common-word wake aliases that Whisper hallucinates.
+    migrated = False
+    if isinstance(data, dict) and _loaded_version(data) < 2:
+        import jarvis_log
+        removed = [a for a in _DEPRECATED_WAKE_ALIASES if a in cfg.wake_aliases]
+        if removed:
+            cfg.wake_aliases = [a for a in cfg.wake_aliases if a not in _DEPRECATED_WAKE_ALIASES]
+            jarvis_log.get_logger("config").info("migrated wake_aliases: removed %s", removed)
+        cfg.config_version = 2
+        migrated = True
+
+    if needs_repair or type_repaired or migrated:
         try:
             save_config(cfg, path=config_path)
         except Exception:
@@ -420,7 +459,10 @@ def save_config(cfg: Config, path=None) -> bool:
                 existing = {}
         if not isinstance(existing, dict):
             existing = {}
+        skip = getattr(cfg, "_runtime_overrides", None) or ()
         for f in fields(Config):
+            if f.name in skip:
+                continue  # runtime-only override: keep whatever is on disk
             val = getattr(cfg, f.name)
             if isinstance(val, (str, int, float, bool, list, dict)) or val is None:
                 existing[f.name] = val

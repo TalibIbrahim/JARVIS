@@ -1,7 +1,6 @@
 """Phase 1 failing-first regression tests pinning diagnosed defects.
 
-Each BUG test is xfail(strict=True) today; when a Phase 2 fix lands the test XPASSes,
-which strict mode turns into a failure, signalling the marker must be removed.
+Each BUG test was xfail(strict=True) before the Phase 2 fixes; they are now plain regression tests.
 Pure/mocked: no camera, mic, network, and no writes to real APPDATA/LOCALAPPDATA.
 """
 import threading
@@ -125,7 +124,6 @@ def test_v1b_mic_energy_threshold_ignored(monkeypatch):
 
 
 # --------------------------------------------------------------------------- V2
-@pytest.mark.xfail(strict=True, reason="BUG-V2: play/pause toggles twice (adapter SMTC + unconditional pyautogui playpause)")
 @pytest.mark.parametrize("mode", ["smtc", "fallback"])
 @pytest.mark.parametrize("text", ["play", "pause", "resume"])
 def test_v2_play_pause_single_toggle(monkeypatch, mode, text):
@@ -137,7 +135,6 @@ def test_v2_play_pause_single_toggle(monkeypatch, mode, text):
     assert total == 1, f"toggled {total} times (adapter={rec.adapter_calls}, keys={rec.keys})"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-V2b: next/previous track double-skip (adapter SMTC + unconditional pyautogui key)")
 @pytest.mark.parametrize("method,key,text", [("next_track", "nexttrack", "next track"),
                                               ("previous_track", "prevtrack", "previous track")])
 def test_v2b_track_skip_single(monkeypatch, method, key, text):
@@ -163,7 +160,6 @@ def _hallucination_case(text):
         assert c.args != (False,), f"{text!r} put Jarvis in standby"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-V3: Whisper noise 'goodbye.' quits Jarvis via substring _any in follow-up window")
 def test_v3_hallucination_goodbye():
     _hallucination_case("goodbye.")
 
@@ -174,7 +170,6 @@ def test_v3_hallucination_guard(text):
     _hallucination_case(text)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-V3b: substring _any matches 'rest'/'sleep'-like words inside ordinary phrases -> standby")
 @pytest.mark.parametrize("text", ["that's interesting", "i need a rest of the day plan", "the forest is nice"])
 def test_v3b_substring_triggers_standby(text):
     ctx = _make_ctx()
@@ -184,7 +179,6 @@ def test_v3b_substring_triggers_standby(text):
 
 
 # --------------------------------------------------------------------------- T3
-@pytest.mark.xfail(strict=True, reason="BUG-T3: supervised thread that dies with exception inside run() is never restarted")
 def test_t3_silent_thread_death_is_restarted():
     from thread_supervisor import ThreadSupervisor
 

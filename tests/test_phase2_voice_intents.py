@@ -105,26 +105,28 @@ class TestPhase2VoiceIntents(unittest.TestCase):
         # Play / Pause
         reply_play = commands.run_command("play", self.ctx)
         self.assertEqual(reply_play, "Done.")
-        mock_adapter.play_pause.assert_called()
-        mock_press.assert_called_with("playpause", _pause=False)
+        mock_adapter.play_pause.assert_called_once()
 
         reply_pause = commands.run_command("pause", self.ctx)
         self.assertEqual(reply_pause, "Done.")
+        self.assertEqual(mock_adapter.play_pause.call_count, 2)
 
         # Skip / Next track
         reply_skip = commands.run_command("skip", self.ctx)
         self.assertEqual(reply_skip, "Skipping.")
-        mock_adapter.next_track.assert_called()
-        mock_press.assert_called_with("nexttrack", _pause=False)
+        mock_adapter.next_track.assert_called_once()
 
         reply_next = commands.run_command("next track", self.ctx)
         self.assertEqual(reply_next, "Skipping.")
+        self.assertEqual(mock_adapter.next_track.call_count, 2)
 
         # Previous track
         reply_prev = commands.run_command("previous track", self.ctx)
         self.assertEqual(reply_prev, "Going back.")
-        mock_adapter.previous_track.assert_called()
-        mock_press.assert_called_with("prevtrack", _pause=False)
+        mock_adapter.previous_track.assert_called_once()
+        # Only the media adapter acts: no extra raw media-key presses (they would double-toggle/skip).
+        for call in mock_press.call_args_list:
+            self.assertNotIn(call.args[0], ("playpause", "nexttrack", "prevtrack"))
 
     def test_05_show_widgets_expansion(self):
         """'show media' and 'show weather' expand the requested widget."""

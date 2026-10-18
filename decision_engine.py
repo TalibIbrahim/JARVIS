@@ -941,6 +941,10 @@ def get_decision_engine() -> SemanticDecisionEngine:
     return _ENGINE
 
 
+_VISUAL_ACTIONS = frozenset({"screen_awareness", "analyze_screen", "camera_capture", "visual_query", "describe_scene"})
+_RE_VISUAL_CUE = re.compile(r"(?<![\w'])(?:screen|see|look|this|that|read|what's on|whats on|show me)(?![\w'])")
+
+
 def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
     """
     Evaluates speech via the local Decision Engine (System 1).
@@ -962,6 +966,9 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
     from commands import APPS, SITES, get_system_telemetry
 
     clean = user_text.lower().strip(" ,.!?")
+    # Wake-word stripping: "jarvis play" must be classified as "play", not as "show jarvis".
+    from commands import strip_wake_prefix
+    clean = strip_wake_prefix(clean)
 
     # Safety Gate: check for unsafe or arbitrary shell/PowerShell execution
     from quick_answers import is_unsafe_shell_command
@@ -1002,6 +1009,18 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
 
     if not action:
         return None
+
+    # System 1 guards: screen/visual actions need an explicit visual cue AND confidence >= 0.70;
+    # power-mode actions need the exact power phrase.
+    import jarvis_log as _jl
+    if action in _VISUAL_ACTIONS and not (prob >= 0.70 and _RE_VISUAL_CUE.search(clean)):
+        _jl.get_logger("decision").info("System 1 %s rejected: no explicit visual cue or conf %.2f < 0.70", action, prob)
+        return None
+    if action in ("sleep_mode", "wake_mode"):
+        from commands import is_power_phrase
+        if not is_power_phrase(clean, "standby" if action == "sleep_mode" else "wake"):
+            _jl.utterance_event(_jl.DECISION, tier="system1", action="power_mode(blocked)")
+            return None
 
     args: Dict[str, Any] = {}
     reply = ""

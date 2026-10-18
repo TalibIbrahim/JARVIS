@@ -102,6 +102,26 @@ class Context:
 
 
 _INSTANCE_MUTEX = None
+_LAST_WORKER_HEALTH: dict = {}
+
+
+def post_worker_health(overlay, state, reason=""):
+    """Post overlay 'worker_health' (keys: state, reason) ONLY when (state, reason) changed; log the transition."""
+    key = id(overlay)
+    new = (state, reason)
+    old = _LAST_WORKER_HEALTH.get(key)
+    if old == new:
+        return False
+    _LAST_WORKER_HEALTH[key] = new
+    log = _jlog.get_logger("health")
+    msg = "worker health %s -> %s (%s)"
+    args = (old[0] if old else "start", state, reason)
+    if state == "down":
+        log.warning(msg, *args)
+    else:
+        log.info(msg, *args)
+    overlay.post("worker_health", state=state, reason=reason)
+    return True
 
 
 def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstance_Mutex"):
@@ -223,12 +243,17 @@ def main():
 
     cfg = load_config()
     _jlog.set_debug_transcripts(getattr(cfg, "debug_log_transcripts", False))
+    # CLI flags are runtime-only: mark them so a later whole-file save_config(cfg) never persists them.
+    from config import mark_runtime_override
     if args.preview:
         cfg.show_preview = True
+        mark_runtime_override(cfg, "show_preview")
     if args.no_voice:
         cfg.voice_enabled = False
+        mark_runtime_override(cfg, "voice_enabled")
     if args.camera is not None:
         cfg.camera_index = args.camera
+        mark_runtime_override(cfg, "camera_index")
 
     stop = threading.Event()
     engine = GestureEngine(cfg)
@@ -275,9 +300,11 @@ def main():
     supervisor.register(
         name="Tracker",
         factory=_make_tracker,
-        max_restarts=5,
+        max_restarts=-1,            # never terminal: keep retrying at the 60 s cap
         backoff_base=1.0,
         on_error=_on_tracker_error,
+        heartbeat_names=["Tracker", "FrameGrabber"],
+        stall_after=10.0,
     )
     supervisor.start("Tracker")
 
@@ -293,9 +320,11 @@ def main():
         supervisor.register(
             name="Voice",
             factory=_make_voice,
-            max_restarts=5,
+            max_restarts=-1,        # never terminal: keep retrying at the 60 s cap
             backoff_base=1.0,
             on_error=_on_voice_error,
+            heartbeat_names=["Voice", "WakeWordDetector", "STTWorker"],
+            stall_after=10.0,
         )
         supervisor.start("Voice")
 
@@ -343,7 +372,7 @@ def main():
     media_adapter.add_listener(_on_media_changed)
     supervisor.register(
         name="MediaAdapter",
-        factory=lambda: media_adapter.start(),
+        factory=lambda: media_adapter.start(),   # returns its worker thread; the supervisor watches it
         max_restarts=3,
         backoff_base=2.0,
     )
@@ -409,6 +438,13 @@ def main():
     )
     supervisor.start("WeatherPoller")
     _jlog.start_heartbeat_monitor()
+
+    # 1 s worker-health poll (supervisor monitor thread); posts to the overlay only on change.
+    supervisor.start_health_monitor(
+        on_health=lambda h: post_worker_health(overlay, h["state"], h["reason"]),
+        context=lambda: {"engine": engine, "tracker": ctx.tracker, "voice": ctx.voice},
+        interval=1.0,
+    )
 
     # Global hotkeys: Ctrl+Alt+J toggles wake/standby, Ctrl+Alt+Q quits.
     try:

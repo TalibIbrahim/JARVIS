@@ -1434,27 +1434,18 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             return True, "Mute toggled"
 
         elif action == "play_pause":
-            try:
-                from media_adapter import get_media_adapter
-                get_media_adapter().play_pause()
-            except Exception:
-                pyautogui.press("playpause", _pause=False)
+            from commands import _media_call
+            _media_call("play_pause")
             return True, "Play/pause toggled"
 
         elif action == "next_track":
-            try:
-                from media_adapter import get_media_adapter
-                get_media_adapter().next_track()
-            except Exception:
-                pyautogui.press("nexttrack", _pause=False)
+            from commands import _media_call
+            _media_call("next_track")
             return True, "Skipped to next track"
 
         elif action == "previous_track":
-            try:
-                from media_adapter import get_media_adapter
-                get_media_adapter().previous_track()
-            except Exception:
-                pyautogui.press("prevtrack", _pause=False)
+            from commands import _media_call
+            _media_call("previous_track")
             return True, "Previous track"
 
         elif action == "weather":
@@ -1618,6 +1609,12 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
 
         elif action == "power_mode":
             mode = str(args.get("mode", "")).strip().lower()
+            from commands import power_action_allowed
+            utt = args.get("_utterance") or getattr(ctx, "_current_utterance", None)
+            if not power_action_allowed(args, utt):
+                import jarvis_log as _jl
+                _jl.utterance_event(_jl.DECISION, tier="system2", action="power_mode(blocked)")
+                return False, "Power action blocked: utterance is not an explicit power command"
             if ctx:
                 if mode == "standby":
                     ctx.set_active(False)

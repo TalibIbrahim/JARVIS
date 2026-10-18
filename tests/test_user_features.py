@@ -74,14 +74,24 @@ class TestMusicPlaybackAndIntelligence(unittest.TestCase):
 
     def test_simple_play_pause_toggle(self):
         """Saying just 'pause' or 'play' should toggle playback without searching music."""
+        from media_adapter import MediaAdapter, set_media_adapter
         ctx = MagicMock()
-        with patch("pyautogui.press") as mock_press:
-            reply = commands.run_command("pause", ctx)
-            self.assertEqual(reply, "Done.")
-            mock_press.assert_called_with("playpause", _pause=False)
+        adapter = MagicMock(spec=MediaAdapter)
+        set_media_adapter(adapter)
+        try:
+            with patch("pyautogui.press") as mock_press:
+                reply = commands.run_command("pause", ctx)
+                self.assertEqual(reply, "Done.")
+                adapter.play_pause.assert_called_once()
 
-            reply2 = commands.run_command("play", ctx)
-            self.assertEqual(reply2, "Done.")
+                reply2 = commands.run_command("play", ctx)
+                self.assertEqual(reply2, "Done.")
+                self.assertEqual(adapter.play_pause.call_count, 2)
+                # The adapter is the only actor: no extra raw "playpause" key press (would double-toggle).
+                for call in mock_press.call_args_list:
+                    self.assertNotEqual(call.args[0], "playpause")
+        finally:
+            set_media_adapter(None)
 
 
 class TestWakeWordSiriExpansion(unittest.TestCase):

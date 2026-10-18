@@ -18,6 +18,7 @@ Features:
 
 from __future__ import annotations
 
+import jarvis_log as _jarvis_log
 import asyncio
 from dataclasses import dataclass
 import io
@@ -537,6 +538,8 @@ class WinRTSMTCBackend:
         self._active_session = None
 
 
+_mlog = _jarvis_log.get_logger("media")
+
 class MediaAdapter:
     """
     Thread-safe media session manager with background polling and debounced controls.
@@ -564,13 +567,14 @@ class MediaAdapter:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-    def start(self):
-        """Starts background async polling thread."""
+    def start(self) -> threading.Thread:
+        """Starts background async polling thread and returns it (so a supervisor can watch it)."""
         if self._thread and self._thread.is_alive():
-            return
+            return self._thread
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._worker_loop, name="MediaAdapterWorker", daemon=True)
         self._thread.start()
+        return self._thread
 
     def stop(self, timeout: float = 2.0):
         """Stops background async polling thread."""
@@ -641,7 +645,7 @@ class MediaAdapter:
         try:
             self._loop.run_until_complete(poll_coro())
         except Exception:
-            pass
+            _mlog.exception("media poll loop died")
         finally:
             self._loop.close()
 
@@ -703,7 +707,8 @@ class MediaAdapter:
                     success = fut.result(timeout=0.6)
                 else:
                     success = asyncio.run(self._backend.play_pause())
-            except Exception:
+            except Exception as exc:
+                _mlog.warning("SMTC command failed (%s: %s); using fallback", type(exc).__name__, exc)
                 success = False
 
         if not success:
@@ -731,7 +736,8 @@ class MediaAdapter:
                     success = fut.result(timeout=0.6)
                 else:
                     success = asyncio.run(self._backend.play())
-            except Exception:
+            except Exception as exc:
+                _mlog.warning("SMTC command failed (%s: %s); using fallback", type(exc).__name__, exc)
                 success = False
 
         if not success:
@@ -757,7 +763,8 @@ class MediaAdapter:
                     success = fut.result(timeout=0.6)
                 else:
                     success = asyncio.run(self._backend.pause())
-            except Exception:
+            except Exception as exc:
+                _mlog.warning("SMTC command failed (%s: %s); using fallback", type(exc).__name__, exc)
                 success = False
 
         if not success:
@@ -783,7 +790,8 @@ class MediaAdapter:
                     success = fut.result(timeout=0.6)
                 else:
                     success = asyncio.run(self._backend.next_track())
-            except Exception:
+            except Exception as exc:
+                _mlog.warning("SMTC command failed (%s: %s); using fallback", type(exc).__name__, exc)
                 success = False
 
         if not success:
@@ -805,7 +813,8 @@ class MediaAdapter:
                     success = fut.result(timeout=0.6)
                 else:
                     success = asyncio.run(self._backend.previous_track())
-            except Exception:
+            except Exception as exc:
+                _mlog.warning("SMTC command failed (%s: %s); using fallback", type(exc).__name__, exc)
                 success = False
 
         if not success:
@@ -837,7 +846,8 @@ class MediaAdapter:
                     success = fut.result(timeout=0.8)
                 else:
                     success = asyncio.run(self._backend.seek(position_seconds))
-            except Exception:
+            except Exception as exc:
+                _mlog.warning("SMTC command failed (%s: %s); using fallback", type(exc).__name__, exc)
                 success = False
 
         # App-without-seek fallback: Always maintain local timeline continuity

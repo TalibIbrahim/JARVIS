@@ -50,8 +50,105 @@ SITES = {
 _PENDING_CONFIRMATION: Optional[str] = None
 
 
+_PHRASE_RE_CACHE: dict = {}
+
+
+def _phrase_regex(phrases: tuple):
+    rx = _PHRASE_RE_CACHE.get(phrases)
+    if rx is None:
+        alts = "|".join(re.escape(p) for p in sorted(set(phrases), key=len, reverse=True) if p)
+        rx = re.compile(r"(?<![\w'])(?:" + alts + r")(?![\w'])") if alts else re.compile(r"(?!)")
+        _PHRASE_RE_CACHE[phrases] = rx
+    return rx
+
+
 def _any(t, *phrases):
-    return any(p in t for p in phrases)
+    """Whole-word / whole-phrase match (PROJECT_CONTEXT 11 forbids substring matching)."""
+    return bool(_phrase_regex(phrases).search(t))
+
+
+# --- exact whole-command matching for power / destructive commands -------------------
+_LEAD_FILLER = ("hey jarvis", "okay jarvis", "ok jarvis", "jarvis", "please")
+_TRAIL_FILLER = ("please", "now", "jarvis")
+
+POWER_QUIT = frozenset({"shut down jarvis", "quit jarvis", "exit jarvis", "power down", "power down jarvis"})
+POWER_STANDBY = frozenset({"go to sleep", "sleep mode", "sleep", "take a nap", "standby", "stand by",
+                           "go to standby", "rest", "rest mode", "standby mode"})
+POWER_WAKE = frozenset({"wake up", "activate", "come online", "i'm back", "im back", "online"})
+
+
+def _power_forms(text) -> list:
+    """Normalized candidate forms of an utterance: lowercase, punctuation stripped, then
+    leading please/jarvis and trailing please/now/jarvis peeled off step by step."""
+    s = str(text or "").lower().replace("’", "'")
+    s = " ".join(re.sub(r"[^\w\s']", " ", s).split())
+    forms = [s]
+    changed = True
+    while changed and s:
+        changed = False
+        for f in _LEAD_FILLER:
+            if s == f:
+                s = ""
+                changed = True
+            elif s.startswith(f + " "):
+                s = s[len(f) + 1:]
+                changed = True
+            if changed:
+                break
+        if not changed:
+            for f in _TRAIL_FILLER:
+                if s.endswith(" " + f):
+                    s = s[:-(len(f) + 1)]
+                    changed = True
+                    break
+        if changed and s:
+            forms.append(s)
+    return forms
+
+
+def _exact(text, *phrases) -> bool:
+    """True only if the WHOLE (normalized) command equals one of the phrases."""
+    wanted = set(phrases)
+    return any(f in wanted for f in _power_forms(text))
+
+
+def is_power_phrase(text, kind: str) -> bool:
+    """kind in {'quit','standby','wake'}; used to gate LLM-chosen power_mode actions."""
+    table = {"quit": POWER_QUIT, "standby": POWER_STANDBY, "wake": POWER_WAKE}
+    return _exact(text, *table.get(kind, ()))
+
+
+_WAKE_PREFIX_RE = re.compile(r"^(?:(?:hey|ok|okay)\s+)?jarvis(?!\w)[\s,.:;!?-]*(?=\S)", re.I)
+
+
+def strip_wake_prefix(t: str) -> str:
+    """Drop a leading '[hey|ok|okay] jarvis' when a command follows it; else return t unchanged."""
+    return _WAKE_PREFIX_RE.sub("", t, count=1).strip() or t
+
+
+def power_action_allowed(args, utterance) -> bool:
+    """An LLM/engine-chosen power_mode standby/quit only runs if the user's own words
+    are an exact power phrase. 'wake' is harmless and always allowed."""
+    mode = str((args or {}).get("mode", "")).strip().lower()
+    if mode not in ("standby", "quit"):
+        return True
+    if not isinstance(utterance, str):
+        return False
+    return is_power_phrase(utterance, mode)
+
+
+def _media_call(method: str) -> bool:
+    """Call ONLY the media adapter (it already falls back to the media key itself).
+    False means the adapter's debounce suppressed it: a deliberate no-op."""
+    try:
+        from media_adapter import get_media_adapter
+        ok = bool(getattr(get_media_adapter(), method)())
+    except Exception:
+        _jl.get_logger("media").exception("media adapter %s failed", method)
+        return False
+    if not ok:
+        _jl.get_logger("media").info("media %s suppressed by adapter debounce (deliberate no-op)", method)
+    return ok
 
 
 def _launch(target):
@@ -400,6 +497,10 @@ def _run_single_command(text, ctx):
     if island_reply:
         return island_reply
 
+    # Strip a leading wake word ("jarvis play" -> "play") now that island navigation
+    # ("jarvis page") has had its chance; keeps downstream matching on the command itself.
+    clean_t = strip_wake_prefix(clean_t)
+
     # Phase 7 Safety Gate: intercept unsafe or arbitrary shell/PowerShell requests
     from quick_answers import is_unsafe_shell_command
     if is_unsafe_shell_command(clean_t):
@@ -508,21 +609,21 @@ def _run_single_command(text, ctx):
                 return msg
 
     # Direct verbal confirmations
-    if _any(clean_t, "yes confirm shutdown", "confirm shutdown"):
+    if _exact(clean_t, "yes confirm shutdown", "confirm shutdown"):
         _PENDING_CONFIRMATION = None
         import system_control
         ok, msg = system_control.shutdown_system(confirmed=True)
         _post_action(ctx, "shutdown_system", ok, text=text)
         return msg
 
-    if _any(clean_t, "yes confirm restart", "confirm restart"):
+    if _exact(clean_t, "yes confirm restart", "confirm restart"):
         _PENDING_CONFIRMATION = None
         import system_control
         ok, msg = system_control.restart_system(confirmed=True)
         _post_action(ctx, "restart_system", ok, text=text)
         return msg
 
-    if _any(clean_t, "confirm close", "force close", "close anyway"):
+    if _exact(clean_t, "confirm close", "force close", "close anyway"):
         _PENDING_CONFIRMATION = None
         import system_control
         ok, msg = system_control.close_window(confirm=True)
@@ -530,14 +631,14 @@ def _run_single_command(text, ctx):
         return "Window closed, sir."
 
     # Destructive actions gates
-    if _any(clean_t, "shut down the pc", "shut down pc", "shut down computer", "turn off pc", "turn off the pc", "power off pc", "shutdown pc", "shutdown computer"):
+    if _exact(clean_t, "shut down the pc", "shut down pc", "shut down computer", "turn off pc", "turn off the pc", "power off pc", "shutdown pc", "shutdown computer"):
         _PENDING_CONFIRMATION = "shutdown"
         return "Shutdown requires confirmation, sir. Please say 'confirm shutdown' to proceed."
     if clean_t == "shutdown":
         _PENDING_CONFIRMATION = "shutdown"
         return "Shutdown requires confirmation, sir. Please say 'confirm shutdown' to proceed."
 
-    if _any(clean_t, "restart pc", "restart the pc", "restart computer", "reboot pc", "reboot computer", "reboot the computer"):
+    if _exact(clean_t, "restart pc", "restart the pc", "restart computer", "reboot pc", "reboot computer", "reboot the computer"):
         _PENDING_CONFIRMATION = "restart"
         return "Restart requires confirmation, sir. Please say 'confirm restart' to proceed."
     if clean_t in ("restart", "reboot"):
@@ -545,22 +646,22 @@ def _run_single_command(text, ctx):
         return "Restart requires confirmation, sir. Please say 'confirm restart' to proceed."
 
     # --- power / mode ---
-    if _any(clean_t, "sleep system", "sleep pc", "sleep computer", "put pc to sleep", "put computer to sleep"):
+    if _exact(clean_t, "sleep system", "sleep pc", "sleep computer", "put pc to sleep", "put computer to sleep"):
         import system_control
         ok, msg = system_control.sleep_system()
         _post_action(ctx, "sleep_system", ok, text=text)
         return "Suspending system power states, sir."
 
-    if _any(clean_t, "shut down jarvis", "quit jarvis", "exit jarvis", "power down", "goodbye"):
+    if _exact(clean_t, *POWER_QUIT):
         _post_action(ctx, "power_mode", True)
         ctx.quit()
         return "Powering down. Goodbye, sir."
-    if _any(clean_t, "go to sleep", "sleep mode", "sleep", "take a nap", "standby", "stand by", "rest"):
+    if _exact(clean_t, *POWER_STANDBY):
         _post_action(ctx, "power_mode", True)
         ctx.set_active(False)
         reset_ai_history()
         return "Going to standby, sir."
-    if _any(clean_t, "wake up", "activate", "come online", "i'm back", "im back", "online"):
+    if _exact(clean_t, *POWER_WAKE):
         _post_action(ctx, "power_mode", True)
         ctx.set_active(True)
         return "Online. At your service, sir."
@@ -926,32 +1027,17 @@ def _run_single_command(text, ctx):
             _post_action(ctx, "now_playing", False)
             return "No media is currently active or playing, sir."
 
-    # 4. Simple Play / Pause toggle and track skipping via SMTC with debouncing
+    # 4. Simple Play / Pause toggle and track skipping: adapter only (it owns the key fallback + debounce)
     if clean_t in ("play", "pause", "resume", "unpause", "play music", "pause music", "stop music", "resume music", "toggle playback", "toggle play", "toggle music", "stop playback"):
-        try:
-            from media_adapter import get_media_adapter
-            get_media_adapter().play_pause()
-        except Exception:
-            pass
-        pyautogui.press("playpause", _pause=False)
+        _media_call("play_pause")
         _post_action(ctx, "play_pause", True)
         return "Done."
     if _any(clean_t, "next track", "next song", "skip", "play next song"):
-        try:
-            from media_adapter import get_media_adapter
-            get_media_adapter().next_track()
-        except Exception:
-            pass
-        pyautogui.press("nexttrack", _pause=False)
+        _media_call("next_track")
         _post_action(ctx, "next_track", True)
         return "Skipping."
     if _any(clean_t, "previous track", "previous song", "go back a song", "replay track"):
-        try:
-            from media_adapter import get_media_adapter
-            get_media_adapter().previous_track()
-        except Exception:
-            pass
-        pyautogui.press("prevtrack", _pause=False)
+        _media_call("previous_track")
         _post_action(ctx, "previous_track", True)
         return "Going back."
 
@@ -1307,7 +1393,11 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
         )
         action, args, reply = parse_ai_response(raw_reply)
 
-        _jl.utterance_event(_jl.DECISION, tier="system2", action=action or "none")
+        if action == "power_mode" and not power_action_allowed(args, user_text):
+            _jl.utterance_event(_jl.DECISION, tier="system2", action="power_mode(blocked)")
+            action = "none"
+        else:
+            _jl.utterance_event(_jl.DECISION, tier="system2", action=action or "none")
         if action and action != "none":
             executed, act_msg = execute_whitelisted_action(action, args, ctx)
             if not executed:
