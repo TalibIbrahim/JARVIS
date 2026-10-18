@@ -138,11 +138,26 @@ class TestVADDetector(unittest.TestCase):
         chunk = np.zeros(1280, dtype=np.int16)
         self.assertFalse(vad.is_speech(chunk, rms=10.0))
 
-    def test_strong_energy_is_speech(self):
-        vad = VADDetector()
+    @staticmethod
+    def _sine():
         sine = (np.sin(np.linspace(0, 50, 1280)) * 5000).astype(np.int16)
-        rms = float(np.sqrt(np.mean(sine.astype(float) ** 2)))
+        return sine, float(np.sqrt(np.mean(sine.astype(float) ** 2)))
+
+    def test_strong_energy_is_speech(self):
+        """Strong energy AND a confident Silero score (0.9) is speech."""
+        vad = VADDetector()
+        vad._vad = MagicMock()
+        vad._vad.predict.return_value = 0.9
+        sine, rms = self._sine()
         self.assertTrue(vad.is_speech(sine, rms=rms))
+
+    def test_strong_energy_with_low_silero_prob_is_not_speech(self):
+        """Loud non-speech (Silero 0.01) must NOT count as speech: Silero is a required vote."""
+        vad = VADDetector()
+        vad._vad = MagicMock()
+        vad._vad.predict.return_value = 0.01
+        sine, rms = self._sine()
+        self.assertFalse(vad.is_speech(sine, rms=rms))
 
 
 class TestWakeWordDetectorFlow(unittest.TestCase):
@@ -161,6 +176,9 @@ class TestWakeWordDetectorFlow(unittest.TestCase):
     def test_record_with_vad_endpoints_on_700ms_silence(self):
         """Speech followed by ~700 ms silence must finish recording."""
         detector = WakeWordDetector()
+        # Stub Silero: loud sine chunks score high, quiet chunks score low.
+        detector.vad._vad = MagicMock()
+        detector.vad._vad.predict.side_effect = lambda c: 0.9 if np.abs(np.asarray(c)).max() > 1000 else 0.01
         # Mock stream providing 4 speech chunks followed by 10 quiet ambient chunks
         speech_chunk = (np.sin(np.linspace(0, 50, 1280)) * 5000).astype(np.int16).tobytes()
         silence_chunk = (np.ones(1280, dtype=np.int16) * 5).tobytes()
@@ -211,6 +229,9 @@ class TestWakeWordDetectorFlow(unittest.TestCase):
     def test_record_with_vad_respects_max_duration_of_8s(self):
         """Recording terminates at 8.0s maximum duration even with continuous speech."""
         detector = WakeWordDetector()
+        # Stub Silero: loud sine chunks score high, quiet chunks score low.
+        detector.vad._vad = MagicMock()
+        detector.vad._vad.predict.side_effect = lambda c: 0.9 if np.abs(np.asarray(c)).max() > 1000 else 0.01
         speech_chunk = (np.sin(np.linspace(0, 50, 1280)) * 5000).astype(np.int16).tobytes()
         mock_stream = MagicMock()
         mock_stream.read.return_value = speech_chunk
@@ -324,11 +345,14 @@ class TestPiperStreamingAndWarmCache(unittest.TestCase):
         self.assertEqual(cached[1], 44100)
 
     @patch("sounddevice.play")
-    @patch("sounddevice.wait")
-    def test_sentence_streaming_calls_sounddevice_per_sentence(self, mock_wait, mock_play):
+    @patch("sounddevice.get_stream")
+    def test_sentence_streaming_calls_sounddevice_per_sentence(self, mock_get_stream, mock_play):
         """Sentence streaming plays each sentence sequentially via sounddevice."""
         import voice
         from voice import Speaker
+
+        # Playback completion is now detected by polling sd.get_stream().active.
+        mock_get_stream.return_value = MagicMock(active=False)
 
         mock_voice = MagicMock()
         class DummyChunk:
@@ -347,7 +371,6 @@ class TestPiperStreamingAndWarmCache(unittest.TestCase):
 
                 # Sounddevice play must have been called 3 times (once per sentence)
                 self.assertEqual(mock_play.call_count, 3)
-                self.assertEqual(mock_wait.call_count, 3)
 
     def test_audio_fidelity_headroom_and_clipping(self):
         """Synthesized audio must have 0.88x headroom scaling and clipped within [-0.95, 0.95]."""

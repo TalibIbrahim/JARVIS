@@ -23,33 +23,32 @@ def main():
     cfg = load_config()
     idx, name = voice.find_best_microphone(cfg)
     print(f"mic: [{idx}] {name}")
-    vad = voice.VADDetector()
+    vad = voice.VADDetector(cfg=cfg)
     print(f"energy_threshold={vad.energy_threshold} vad_threshold={vad.vad_threshold} "
           f"silero={'yes' if vad._vad else 'NO'}")
     import pyaudio
     p = voice.get_shared_pyaudio()
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True,
                     input_device_index=idx, frames_per_buffer=CHUNK)
-    rmss, probs, speech, fallback_only = [], [], 0, 0
+    # Only vad.is_speech() is called (it feeds Silero exactly once per chunk); the score is read
+    # back from vad.last_prob so Silero's internal state is never double-fed.
+    rmss, probs, speech, suppressed = [], [], 0, 0
     n = int(a.seconds * RATE / CHUNK)
     try:
         for _ in range(n):
             data = stream.read(CHUNK, exception_on_overflow=False)
             chunk = np.frombuffer(data, dtype=np.int16)
             rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-            prob = None
-            if vad._vad is not None:
-                try:
-                    prob = float(vad._vad.predict(chunk))
-                except Exception:
-                    prob = None
+            gate_before = vad.gate()
             flagged = vad.is_speech(chunk, rms)
+            prob = vad.last_prob
             rmss.append(rms)
             if prob is not None:
                 probs.append(prob)
             speech += bool(flagged)
-            if flagged and rms >= vad.energy_threshold and (prob is None or prob < vad.vad_threshold):
-                fallback_only += 1
+            # loud enough for the old energy-only rule but vetoed by Silero
+            if not flagged and rms >= gate_before and prob is not None and prob < vad.vad_threshold:
+                suppressed += 1
     finally:
         stream.stop_stream()
         stream.close()
@@ -60,7 +59,8 @@ def main():
         pr = np.array(probs)
         print(f"Silero p50/p90 = {np.percentile(pr, 50):.3f}/{np.percentile(pr, 90):.3f}")
     print(f"flagged speech: {100 * speech / len(r):.1f}%   "
-          f"flagged ONLY by RMS fallback: {100 * fallback_only / len(r):.1f}%")
+          f"loud-but-Silero-vetoed (energy-only would have flagged): {100 * suppressed / len(r):.1f}%")
+    print(f"noise_floor={vad.noise_floor:.1f}  gate={vad.gate():.1f}")
 
 
 if __name__ == "__main__":

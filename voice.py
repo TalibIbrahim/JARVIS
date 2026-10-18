@@ -126,37 +126,118 @@ class WakeWordGuard:
         return False
 
 
+# Whisper hallucinations produced on noise / silence. Applied ONLY to follow-up-window speech
+# (utterances with no wake word); a normalized transcript equal to one of these is dropped.
+WHISPER_NOISE_PHRASES = frozenset({
+    "bye", "bye bye", "goodbye", "thank you", "thanks", "thank you for watching",
+    "thanks for watching", "you", "okay", "ok", "so", "uh", "um", "hmm", "i'll explain",
+    "subtitles by the amara.org community", "",
+})
+
+def _normalize_noise_text(text: str) -> str:
+    """Lowercase, drop punctuation, collapse whitespace (used to match WHISPER_NOISE_PHRASES)."""
+    return " ".join(re.sub(r"[^\w\s]", "", str(text).lower()).split())
+
+
+_WHISPER_NOISE_NORMALIZED = frozenset(_normalize_noise_text(p) for p in WHISPER_NOISE_PHRASES)
+
+# A recording is dispatched only if it holds at least this many speech chunks (3 x 80 ms = 240 ms).
+MIN_SPEECH_CHUNKS = 3
+
+
 class VADDetector:
     """
-    Voice Activity Detection combining Silero VAD (ONNX) and RMS energy fallback.
-    Takes 16 kHz 16-bit PCM chunks and evaluates speech presence.
+    Voice Activity Detection: Silero VAD (ONNX) AND an adaptive RMS gate.
+
+    With Silero available a chunk is speech only if prob >= vad_threshold AND rms >= gate().
+    The energy-only rule (rms >= gate) is used ONLY when Silero failed to load or predict raised
+    (a WARNING is logged once).
+
+    gate = max(energy_floor, NOISE_RATIO * noise_floor)
+      energy_floor = cfg.mic_energy_threshold (read live; the Settings "Mic sensitivity" slider)
+      noise_floor  = rolling 30th percentile of RMS over the last ~5 s of chunks Silero scored < 0.1
     """
-    def __init__(self, energy_threshold=42.0, vad_threshold=0.35):
-        self.energy_threshold = energy_threshold
+    NOISE_RATIO = 1.5
+    NOISE_PROB = 0.1
+    NOISE_WINDOW_S = 5.0
+    NOISE_PERCENTILE = 30.0
+    DEFAULT_ENERGY_FLOOR = 300.0
+
+    def __init__(self, energy_threshold=None, vad_threshold=0.35, cfg=None):
+        self.cfg = cfg
+        self._energy_override = energy_threshold
         self.vad_threshold = vad_threshold
         self._vad = None
+        self._warned_fallback = False
+        self._noise = collections.deque()  # (monotonic_t, rms) of Silero-confirmed non-speech chunks
+        self.noise_floor = 0.0
+        self.last_prob = None
+        self.n_total = 0
+        self.n_speech = 0
         self._init_vad()
 
     def _init_vad(self):
         try:
             from openwakeword.vad import VAD
             self._vad = VAD()
-        except Exception:
+        except Exception as exc:
             self._vad = None
+            self._warn_fallback(f"Silero failed to load: {exc!r}")
+
+    def _warn_fallback(self, why):
+        if not self._warned_fallback:
+            self._warned_fallback = True
+            _vlog.warning("VAD: %s; falling back to the energy-only rule (rms >= gate %.0f)", why, self.gate())
+
+    @property
+    def energy_threshold(self):
+        """Energy floor. Reflects cfg.mic_energy_threshold live (not a hard-coded constant)."""
+        if self._energy_override is not None:
+            return self._energy_override
+        return float(getattr(self.cfg, "mic_energy_threshold", self.DEFAULT_ENERGY_FLOOR))
+
+    @energy_threshold.setter
+    def energy_threshold(self, value):
+        self._energy_override = value
+
+    def gate(self) -> float:
+        return max(float(self.energy_threshold), self.NOISE_RATIO * self.noise_floor)
+
+    def _note_noise(self, rms: float):
+        now = time.monotonic()
+        self._noise.append((now, rms))
+        cutoff = now - self.NOISE_WINDOW_S
+        while self._noise and self._noise[0][0] < cutoff:
+            self._noise.popleft()
+        self.noise_floor = float(np.percentile([r for _, r in self._noise], self.NOISE_PERCENTILE))
 
     def is_speech(self, chunk: np.ndarray, rms: float) -> bool:
-        if rms < self.energy_threshold:
-            return False
-
+        prob = None
         if self._vad is not None:
             try:
                 prob = float(self._vad.predict(chunk))
-                if prob >= self.vad_threshold:
-                    return True
-            except Exception:
-                pass
-        return rms >= self.energy_threshold
+            except Exception as exc:
+                self._warn_fallback(f"Silero predict raised: {exc!r}")
+        self.last_prob = prob
 
+        gate = self.gate()  # decided from history before this chunk is folded in
+        if prob is None:
+            result = rms >= gate
+        else:
+            result = prob >= self.vad_threshold and rms >= gate
+            if prob < self.NOISE_PROB:
+                self._note_noise(rms)
+
+        self.n_total += 1
+        if result:
+            self.n_speech += 1
+        return result
+
+    def take_stats(self):
+        """Returns (chunks_evaluated, chunks_flagged_speech) since the last call and resets both."""
+        out = (self.n_total, self.n_speech)
+        self.n_total = self.n_speech = 0
+        return out
 
 
 def get_shared_pyaudio():
@@ -169,10 +250,37 @@ def get_shared_pyaudio():
         return _SHARED_PYAUDIO
 
 
+_SHARED_OPEN_INPUT_STREAMS = 0  # input streams currently open on the SHARED instance (guarded by _PORTAUDIO_LOCK)
+
+
+def _shared_open(p, **kwargs):
+    """p.open(...) on the shared instance, counting the open input stream."""
+    global _SHARED_OPEN_INPUT_STREAMS
+    with _PORTAUDIO_LOCK:
+        stream = p.open(**kwargs)
+        _SHARED_OPEN_INPUT_STREAMS += 1
+        return stream
+
+
+def _shared_close(stream):
+    """Closes a stream opened with _shared_open and decrements the counter (even if close raises)."""
+    global _SHARED_OPEN_INPUT_STREAMS
+    with _PORTAUDIO_LOCK:
+        try:
+            stream.close()
+        finally:
+            _SHARED_OPEN_INPUT_STREAMS = max(0, _SHARED_OPEN_INPUT_STREAMS - 1)
+
+
 def reset_shared_pyaudio():
-    """Terminates and resets the shared PyAudio instance to detect hotplugged devices."""
+    """Terminates and resets the shared PyAudio instance to detect hotplugged devices.
+    Skipped (WARNING) while any input stream is open on the shared instance."""
     global _SHARED_PYAUDIO
     with _PORTAUDIO_LOCK:
+        if _SHARED_OPEN_INPUT_STREAMS > 0:
+            _vlog.warning("reset_shared_pyaudio: %d input stream(s) still open on the shared instance; "
+                          "skipping terminate", _SHARED_OPEN_INPUT_STREAMS)
+            return
         if _SHARED_PYAUDIO is not None:
             try:
                 _SHARED_PYAUDIO.terminate()
@@ -210,7 +318,7 @@ def list_microphones(probe_rms=False):
                     rms = 0.0
                     if probe_rms:
                         try:
-                            stream = p.open(
+                            stream = _shared_open(p, 
                                 format=pyaudio.paInt16,
                                 channels=ch,
                                 rate=rate,
@@ -220,7 +328,7 @@ def list_microphones(probe_rms=False):
                             )
                             data = stream.read(1024, exception_on_overflow=False)
                             stream.stop_stream()
-                            stream.close()
+                            _shared_close(stream)
                             arr = np.frombuffer(data, dtype=np.int16)
                             rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
                             working = True
@@ -229,13 +337,18 @@ def list_microphones(probe_rms=False):
                             rms = 0.0
                             _n_probe_fail += 1
 
+                    try:
+                        host_api = p.get_host_api_info_by_index(info["hostApi"])["name"]
+                    except Exception:
+                        host_api = "?"
                     mics.append({
                         "index": i,
                         "name": name,
                         "channels": max_ch,
                         "working": working,
                         "rms": rms,
-                        "is_virtual": is_virtual
+                        "is_virtual": is_virtual,
+                        "host_api": host_api,
                     })
                 except Exception:
                     pass
@@ -250,13 +363,141 @@ def list_microphones(probe_rms=False):
     return mics
 
 
-def find_best_microphone(cfg=None, probe_working=False):
+def _rank_mic_by_name(m):
+    """Name-keyword ranking shared by the legacy and the 16 kHz-tested selection."""
+    score = 0.0
+    name = m["name"].lower()
+    if "array" in name:
+        score += 40.0
+    if "microphone" in name or "mic" in name:
+        score += 30.0
+    if "intel" in name or "realtek" in name:
+        score += 20.0
+    return score
+
+
+def _host_priority_16k(host_api):
+    """MME first, then DirectSound, then anything else. WASAPI and WDM-KS are excluded elsewhere."""
+    h = str(host_api).lower()
+    if "mme" in h:
+        return 0
+    if "directsound" in h:
+        return 1
+    return 2
+
+
+def _host_excluded_16k(host_api):
+    """WASAPI rejects 16 kHz shared-mode opens (-9997); WDM-KS fails with -9999."""
+    h = str(host_api).lower()
+    return "wasapi" in h or "wdm" in h
+
+
+def probe_16k_open(p, idx, chunk_samples=1280):
+    """
+    Opens device idx at 16 kHz mono and reads one chunk, exactly like the Settings test does.
+    Lock is held only for open and close, never during the read.
+    Returns (ok, detail, rms).
+    """
+    import pyaudio
+    stream = None
+    try:
+        with _PORTAUDIO_LOCK:
+            stream = _shared_open(p, format=pyaudio.paInt16, channels=1, rate=16000, input=True,
+                            input_device_index=idx, frames_per_buffer=chunk_samples)
+        data = stream.read(chunk_samples, exception_on_overflow=False)
+        if not data:
+            return False, "read returned no data", 0.0
+        arr = np.frombuffer(data, dtype=np.int16)
+        return True, "OK", float(np.sqrt(np.mean(arr.astype(float) ** 2)))
+    except Exception as exc:
+        return False, repr(exc), 0.0
+    finally:
+        if stream is not None:
+            try:
+                with _PORTAUDIO_LOCK:
+                    stream.stop_stream()
+                    _shared_close(stream)
+            except Exception as close_exc:
+                _vlog.warning("probe_16k_open: closing probe stream idx=%s failed: %r", idx, close_exc)
+
+
+def _find_best_microphone_16k(cfg):
+    """
+    Pipeline mic selection. Every candidate must pass a 16 kHz mono open + one-chunk read.
+    Order: configured device, the Windows default input (if not virtual), then ranking restricted
+    to tested devices on MME, then DirectSound (never WASAPI or WDM-KS). Every result is logged.
+    """
+    mics = list_microphones()
+    if not mics:
+        _vlog.warning("find_best_microphone[16k]: no input devices")
+        return None, "Default System Microphone"
+    p = get_shared_pyaudio()
+    cfg_idx = getattr(cfg, "mic_device_index", None) if cfg else None
+    tested = {}
+
+    def _test(m):
+        if m["index"] not in tested:
+            ok, detail, rms = probe_16k_open(p, m["index"])
+            tested[m["index"]] = ok
+            (_vlog.info if ok else _vlog.warning)(
+                "find_best_microphone[16k]: candidate idx=%s hostApi=%s name=%r virtual=%s -> %s%s",
+                m["index"], m["host_api"], m["name"], m["is_virtual"], "OK" if ok else "FAIL",
+                f" rms={rms:.0f}" if ok else f" ({detail})")
+        return tested[m["index"]]
+
+    # 1. Explicit user choice (honored if it opens at 16 kHz)
+    if cfg_idx is not None:
+        for m in mics:
+            if m["index"] == cfg_idx and not m["is_virtual"] and _test(m):
+                _vlog.info("find_best_microphone[16k]: reason=configured idx=%s name=%r", m["index"], m["name"])
+                return m["index"], m["name"]
+        _vlog.warning("find_best_microphone[16k]: configured idx=%s unusable at 16 kHz; ranking instead", cfg_idx)
+
+    # 2. The Windows default input device (what the Settings test uses)
+    else:
+        dflt = None
+        try:
+            dflt = p.get_default_input_device_info()
+        except Exception as exc:
+            _vlog.warning("find_best_microphone[16k]: no default input device: %r", exc)
+        if dflt is not None:
+            for m in mics:
+                if m["index"] == dflt.get("index"):
+                    if m["is_virtual"]:
+                        _vlog.info("find_best_microphone[16k]: default input idx=%s %r is virtual; skipped",
+                                   m["index"], m["name"])
+                    elif _test(m):
+                        _vlog.info("find_best_microphone[16k]: reason=windows_default idx=%s name=%r",
+                                   m["index"], m["name"])
+                        return m["index"], m["name"]
+                    break
+
+    # 3. Ranking among devices that pass the 16 kHz open test (MME, then DirectSound)
+    for allow_virtual in (False, True):
+        cands = [m for m in mics if m["is_virtual"] == allow_virtual and not _host_excluded_16k(m["host_api"])]
+        cands.sort(key=lambda m: (_host_priority_16k(m["host_api"]), -_rank_mic_by_name(m)))
+        for m in cands:
+            if _test(m):
+                _vlog.info("find_best_microphone[16k]: reason=ranked idx=%s hostApi=%s name=%r",
+                           m["index"], m["host_api"], m["name"])
+                return m["index"], m["name"]
+    excluded = [(m["index"], m["host_api"]) for m in mics if _host_excluded_16k(m["host_api"])]
+    _vlog.warning("find_best_microphone[16k]: no candidate opened at 16 kHz (excluded WASAPI/WDM-KS: %s)", excluded)
+    return None, mics[0]["name"]
+
+
+def find_best_microphone(cfg=None, probe_working=False, require_16k=False):
     """
     Finds the most suitable microphone device index and name.
+    require_16k=True (pipeline use, not for the GUI thread): only devices that open at 16 kHz mono
+    and deliver a chunk are considered; prefers cfg index, the Windows default input, then MME/DirectSound.
+    Otherwise:
     1. If cfg.mic_device_index is explicitly specified, verifies and uses it.
     2. Otherwise, auto-probes all devices, filtering out silent virtual audio cables
        and selecting the physical microphone with active audio signal.
     """
+    if require_16k:
+        return _find_best_microphone_16k(cfg)
     cfg_idx = getattr(cfg, "mic_device_index", None) if cfg else None
     mics = list_microphones(probe_rms=probe_working)
     if not mics:
@@ -326,19 +567,20 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
     if not acquired:
         return 0.0, 0.0
     stream = None
+    own = None  # private short-lived instance: terminate() of the shared one cannot affect it
     try:
         import pyaudio
-        p = get_shared_pyaudio()
+        own = pyaudio.PyAudio()
         if device_index is None:
-            info = p.get_default_input_device_info()
+            info = own.get_default_input_device_info()
             dev_idx = info["index"]
         else:
-            info = p.get_device_info_by_index(device_index)
+            info = own.get_device_info_by_index(device_index)
             dev_idx = device_index
         ch = min(info.get("maxInputChannels", 1), 2)
         rate = int(info.get("defaultSampleRate", 44100))
 
-        stream = p.open(
+        stream = own.open(
             format=pyaudio.paInt16,
             channels=ch,
             rate=rate,
@@ -346,9 +588,11 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
             input_device_index=dev_idx,
             frames_per_buffer=chunk_samples
         )
-        _log_mic_open(p, dev_idx, rate, ch, chunk_samples, "OK", "probe_mic_level")
+        _log_mic_open(own, dev_idx, rate, ch, chunk_samples, "OK", "probe_mic_level")
     except Exception as exc:
         _vlog.warning("mic open (probe_mic_level) FAILED: idx=%s fpb=%s err=%r", device_index, chunk_samples, exc)
+        if own is not None:
+            own.terminate()
         return 0.0, 0.0
     finally:
         _PORTAUDIO_LOCK.release()
@@ -359,16 +603,17 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
         rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
         norm = min(max((rms - 20.0) / 2500.0, 0.0), 1.0)
         return norm, rms
-    except Exception:
+    except Exception as exc:
+        _vlog.warning("probe_mic_level read failed: %r", exc)
         return 0.0, 0.0
     finally:
-        if stream is not None:
+        with _PORTAUDIO_LOCK:
             try:
-                with _PORTAUDIO_LOCK:
-                    stream.stop_stream()
-                    stream.close()
-            except Exception:
-                pass
+                stream.stop_stream()
+                stream.close()
+            except Exception as exc:
+                _vlog.warning("probe_mic_level close failed: %r", exc)
+            own.terminate()
 
 
 def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
@@ -617,6 +862,33 @@ def get_shared_piper(model_path: str, config_path: str):
         return None
 
 
+def _play_and_wait_bounded(sd, audio, samplerate):
+    """
+    sd.play() under _PORTAUDIO_LOCK, then a bounded wait instead of the unbounded sd.wait().
+    Polls sd.get_stream().active every 0.05 s (Speaker heartbeat inside the loop so a long reply
+    does not look like a stall). Deadline = audio duration + 2.0 s; on expiry sd.stop() and a WARNING.
+    Returns True if playback finished, False if it was cut at the deadline.
+    """
+    with _PORTAUDIO_LOCK:
+        sd.play(audio, samplerate=samplerate, latency="high")
+    duration = len(audio) / float(samplerate)
+    deadline = duration + 2.0
+    t0 = time.monotonic()
+    while True:
+        jarvis_log.heartbeat("Speaker", speaking=True, playing=round(time.monotonic() - t0, 1))
+        if not sd.get_stream().active:
+            return True
+        if time.monotonic() - t0 >= deadline:
+            try:
+                dev = sd.query_devices(kind="output").get("name", "?")
+            except Exception as exc:
+                dev = f"? ({exc!r})"
+            sd.stop()
+            _vlog.warning("playback did not finish within %.1fs, device=%s", deadline, dev)
+            return False
+        time.sleep(0.05)
+
+
 class Speaker(threading.Thread):
     """
     Synthesizes and plays spoken feedback for J.A.R.V.I.S.
@@ -729,9 +1001,7 @@ class Speaker(threading.Thread):
             if len(sentences) == 1:
                 audio, target_sr = get_sentence_audio(sentences[0])
                 if len(audio) > 0:
-                    with _PORTAUDIO_LOCK:
-                        sd.play(audio, samplerate=target_sr, latency="high")
-                    sd.wait()
+                    _play_and_wait_bounded(sd, audio, target_sr)
                 return
 
             # Multi-sentence streaming:
@@ -758,9 +1028,7 @@ class Speaker(threading.Thread):
 
             # 3. Play first sentence immediately via sounddevice
             if len(audio0) > 0:
-                with _PORTAUDIO_LOCK:
-                    sd.play(audio0, samplerate=sr0, latency="high")
-                sd.wait()
+                _play_and_wait_bounded(sd, audio0, sr0)
 
             # 4. Stream remaining sentences as they complete synthesis
             while True:
@@ -771,9 +1039,7 @@ class Speaker(threading.Thread):
                     raise item
                 audio_next, sr_next = item
                 if len(audio_next) > 0:
-                    with _PORTAUDIO_LOCK:
-                        sd.play(audio_next, samplerate=sr_next, latency="high")
-                    sd.wait()
+                    _play_and_wait_bounded(sd, audio_next, sr_next)
 
         except Exception as exc:
             print(f"[voice] Piper synthesis/playback error: {exc}, falling back to system TTS")
@@ -852,7 +1118,7 @@ class WakeWordDetector(threading.Thread):
         device_index=None,
     ):
         super().__init__(name="WakeWordDetector", daemon=True)
-        self.cfg = cfg
+        self.cfg = cfg  # property: also keeps self.vad.cfg in sync (live mic_energy_threshold)
         self.on_wake = on_wake
         self.on_utterance = on_utterance
         self.on_no_speech = on_no_speech
@@ -863,7 +1129,7 @@ class WakeWordDetector(threading.Thread):
         self.followup_window = float(getattr(cfg, "wake_followup_window", getattr(cfg, "command_window", followup_window)))
         self.device_index = device_index
         self.guard = WakeWordGuard(threshold=self.threshold)
-        self.vad = VADDetector()
+        self.vad = VADDetector(cfg=cfg)
         self.model = None
         self.listening_until = 0.0
         self.is_recording = False
@@ -873,20 +1139,79 @@ class WakeWordDetector(threading.Thread):
         self._flat_flagged = False
         self._st_t = time.monotonic()
         self._st_max_score = 0.0
-        self._st_vad_speech = 0
-        self._st_vad_total = 0
         self._st_loud = 0
         self._st_chunks = 0
+        self._stream_fault = None   # "stream_stall" | "stream_error" | "flatline" set by read paths
+        self._mic_state = ("down", "not started")
         self._init_model()
 
+    STALL_TIMEOUT_S = 2.0     # no data for this long => stream stall
+    STALL_POLL_S = 0.01
+
+    @property
+    def cfg(self):
+        return self._cfg
+
+    @cfg.setter
+    def cfg(self, value):
+        self._cfg = value
+        vad = getattr(self, "vad", None)
+        if vad is not None:
+            vad.cfg = value
+
+    def _set_state(self, state, reason=""):
+        self._mic_state = (state, reason)
+
+    def mic_state(self):
+        """("ok"|"reconnecting"|"stalled"|"flatline"|"down", reason)."""
+        if self.ident is not None and not self.is_alive():
+            return "down", "WakeWordDetector thread not running"
+        state, reason = self._mic_state
+        if state in ("reconnecting", "stalled", "down"):
+            return state, reason
+        if self._flat_flagged:
+            return "flatline", f"all-zero input on device [{self.device_index}]"
+        return state, reason
+
+    def _read_chunk(self, stream, chunk_samples):
+        """
+        One bounded chunk read. Before each blocking read, check stream.get_read_available(); if a full
+        chunk is not available, wait in 0.01 s steps and declare a stall after STALL_TIMEOUT_S of no data
+        (nothing is aborted from another thread). Returns (data, fault) with fault in
+        None | "stop" | "stream_stall" | "stream_error".
+        """
+        try:
+            avail = stream.get_read_available()
+            if isinstance(avail, (int, np.integer)) and avail < chunk_samples:
+                t0 = time.monotonic()
+                while avail < chunk_samples:
+                    if self.stop.wait(self.STALL_POLL_S):
+                        return None, "stop"
+                    if time.monotonic() - t0 >= self.STALL_TIMEOUT_S:
+                        _vlog.warning("mic stream stall: no data for %.1fs on device [%s] %s (avail=%s/%s)",
+                                      self.STALL_TIMEOUT_S, self.device_index, Voice.current_mic_name,
+                                      avail, chunk_samples)
+                        return None, "stream_stall"
+                    avail = stream.get_read_available()
+            return stream.read(chunk_samples, exception_on_overflow=False), None
+        except Exception as exc:
+            _vlog.warning("mic stream read error on device [%s] %s: %r", self.device_index,
+                          Voice.current_mic_name, exc)
+            print(f"[voice] Microphone stream read error: {exc}. Unplug / disconnect detected.")
+            return None, "stream_error"
+
     def _diag_chunk(self, rms):
-        """Logging-only per-chunk bookkeeping: heartbeat (<=1/s) and RMS flatline detection."""
+        """Per-chunk bookkeeping: heartbeat (<=1/s), 60 s stats line, RMS flatline detection.
+        Returns True exactly once per flatline episode (all-zero input for 5 s straight); the caller
+        then takes the stream_error / reconnect path."""
         now = time.monotonic()
+        flat_new = False
         if rms < 1.0:
             if self._flat_since is None:
                 self._flat_since = now
             elif not self._flat_flagged and now - self._flat_since >= 5.0:
                 self._flat_flagged = True
+                flat_new = True
                 _vlog.warning("mic flatline (all-zero input) on device [%s] %s",
                               self.device_index, Voice.current_mic_name)
         else:
@@ -895,7 +1220,7 @@ class WakeWordDetector(threading.Thread):
             self._flat_since = None
             self._flat_flagged = False
         self._st_chunks += 1
-        if rms >= self.vad.energy_threshold:
+        if rms >= self.vad.gate():
             self._st_loud += 1
         if now - self._hb_t >= 1.0:
             self._hb_t = now
@@ -904,12 +1229,16 @@ class WakeWordDetector(threading.Thread):
                 follow=round(max(0.0, self.listening_until - time.time()), 1),
                 speaking=Voice.is_speaking)
         if now - self._st_t >= 60.0:
-            _vlog.info("wake stats %.0fs: max_score=%.2f vad_speech=%d/%d (vad-evaluated) rms>=%.0f=%d/%d chunks",
-                       now - self._st_t, self._st_max_score, self._st_vad_speech, self._st_vad_total,
-                       self.vad.energy_threshold, self._st_loud, self._st_chunks)
+            v_total, v_speech = self.vad.take_stats()
+            _vlog.info("wake stats %.0fs: max_score=%.2f noise_floor=%.0f gate=%.0f (energy_floor=%.0f) "
+                       "speech=%d/%d chunks (%.1f%%) rms>=gate=%d/%d",
+                       now - self._st_t, self._st_max_score, self.vad.noise_floor, self.vad.gate(),
+                       self.vad.energy_threshold, v_speech, v_total, 100.0 * v_speech / max(1, v_total),
+                       self._st_loud, self._st_chunks)
             self._st_t = now
             self._st_max_score = 0.0
-            self._st_vad_speech = self._st_vad_total = self._st_loud = self._st_chunks = 0
+            self._st_loud = self._st_chunks = 0
+        return flat_new
 
     def _init_model(self):
         try:
@@ -943,11 +1272,14 @@ class WakeWordDetector(threading.Thread):
         chunk_samples: int = 1280,
         sample_rate: int = 16000,
         trigger: str = "vad",
+        pre_speech_chunks: int = 0,
     ) -> bytes:
         """
         Record with VAD: streams chunks while continuously updating Voice._latest_rms.
         End on ~700 ms silence or 8 s max -> return raw PCM bytes.
         If 5 s silence with no speech -> trigger no-speech callback, return None.
+        A recording with fewer than MIN_SPEECH_CHUNKS speech chunks is dropped (insufficient_speech).
+        pre_speech_chunks: speech chunks already counted by the caller (the chunk that triggered capture).
         """
         self.is_recording = True
         chunk_duration = chunk_samples / sample_rate
@@ -959,7 +1291,7 @@ class WakeWordDetector(threading.Thread):
         # diagnostics only
         reason = "stop"
         uid = None
-        speech_chunks = 0
+        speech_chunks = int(pre_speech_chunks)
         total_chunks = 0
         rms_list = []
 
@@ -971,13 +1303,17 @@ class WakeWordDetector(threading.Thread):
 
                 data = None
                 if stream is not None:
-                    try:
-                        data = stream.read(chunk_samples, exception_on_overflow=False)
-                    except Exception:
-                        reason = "stream_error"
+                    data, fault = self._read_chunk(stream, chunk_samples)
+                    if fault == "stop":
+                        reason = "stop"
+                        break
+                    if fault:
+                        reason = fault
+                        self._stream_fault = fault
                         break
                 if not data:
                     reason = "stream_error"
+                    self._stream_fault = "stream_error"
                     break
 
                 arr = np.frombuffer(data, dtype=np.int16)
@@ -985,7 +1321,10 @@ class WakeWordDetector(threading.Thread):
                 Voice._latest_rms = rms
                 Voice._latest_time = time.time()
                 recorded_frames.append(data)
-                self._diag_chunk(rms)
+                if self._diag_chunk(rms):
+                    reason = "flatline"
+                    self._stream_fault = "flatline"
+                    break
 
                 now = time.time()
                 elapsed = now - start_time
@@ -1032,6 +1371,10 @@ class WakeWordDetector(threading.Thread):
                 except Exception:
                     pass
             if not speech_detected or len(recorded_frames) < 3:
+                return None
+            if speech_chunks < MIN_SPEECH_CHUNKS:
+                jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="insufficient_speech",
+                                           speech_chunks=speech_chunks)
                 return None
 
             raw_bytes = b"".join(recorded_frames)
@@ -1084,15 +1427,19 @@ class WakeWordDetector(threading.Thread):
 
     def reconnect_stream(self, sample_rate: int = 16000, chunk_samples: int = 1280):
         """
-        Auto-recovery backoff loop (1s, 2s, 4s) when audio stream encounters error/unplug.
-        Cleans up broken stream, resets PortAudio topology, probes for working physical mic,
-        and re-establishes stream automatically without restarting the app.
+        Auto-recovery backoff loop (1s, 2s, 4s) when audio stream encounters error/unplug/stall.
+        The caller has already closed the broken stream, so no stream of ours is open when the shared
+        PyAudio instance is reset. Only candidates that pass a 16 kHz mono open + read are considered
+        (MME, then DirectSound; never WASAPI or WDM-KS); every candidate result is logged.
         """
         import pyaudio
         delays = [1.0, 2.0, 4.0]
         delay_idx = 0
         print("[voice] Audio stream disconnected. Entering backoff retry loop (1s, 2s, 4s)...")
-        _vlog.warning("reconnect_stream: entering backoff loop")
+        _vlog.warning("reconnect_stream: entering backoff loop (device was [%s] %s)", self.device_index,
+                      Voice.current_mic_name)
+        self._set_state("reconnecting", "audio stream lost; backoff loop")
+        attempt = 0
 
         while not self.stop.is_set():
             delay = delays[delay_idx]
@@ -1101,15 +1448,17 @@ class WakeWordDetector(threading.Thread):
             if self.stop.wait(delay):
                 return None
 
+            attempt += 1
             reset_shared_pyaudio()
             p = get_shared_pyaudio()
-            best_idx, best_name = find_best_microphone(self.cfg, probe_working=True)
+            best_idx, best_name = find_best_microphone(self.cfg, require_16k=True)
             if best_idx is None:
+                _vlog.warning("reconnect_stream: attempt %d: no microphone opened at 16 kHz; retrying", attempt)
                 continue
 
             try:
                 with _PORTAUDIO_LOCK:
-                    test_stream = p.open(
+                    test_stream = _shared_open(p, 
                         format=pyaudio.paInt16,
                         channels=1,
                         rate=sample_rate,
@@ -1124,15 +1473,14 @@ class WakeWordDetector(threading.Thread):
                     self.device_index = best_idx
                     Voice.current_mic_index = best_idx
                     Voice.current_mic_name = best_name
+                    self._set_state("ok", "")
                     print(f"[voice] Microphone auto-recovered successfully to [{best_idx}] {best_name}.")
+                    _vlog.info("reconnect_stream: recovered on attempt %d: idx=%s name=%r", attempt, best_idx, best_name)
                     return test_stream
-                else:
-                    try:
-                        with _PORTAUDIO_LOCK:
-                            test_stream.stop_stream()
-                            test_stream.close()
-                    except Exception:
-                        pass
+                _vlog.warning("reconnect_stream: attempt %d: idx=%s opened but read returned no data", attempt, best_idx)
+                with _PORTAUDIO_LOCK:
+                    test_stream.stop_stream()
+                    _shared_close(test_stream)
             except Exception as exc:
                 _log_mic_open(p, best_idx, sample_rate, 1, chunk_samples, repr(exc), "reconnect_stream")
         return None
@@ -1142,29 +1490,33 @@ class WakeWordDetector(threading.Thread):
         try:
             self._run_body()
         except BaseException as e:
+            self._set_state("down", f"{type(e).__name__}: {e}")
             jarvis_log.thread_exited("WakeWordDetector", e)
             raise
         else:
+            self._set_state("down", "stopped")
             jarvis_log.thread_exited("WakeWordDetector")
 
     def _run_body(self):
         import pyaudio
-        p = get_shared_pyaudio()
 
         sample_rate = 16000
         chunk_samples = 1280  # 80 ms chunks
 
         while not self.stop.is_set():
+            # Re-fetch every pass: reconnect_stream() resets the shared PyAudio instance.
+            p = get_shared_pyaudio()
             cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
             active_idx = cfg_idx if cfg_idx is not None else self.device_index
             if active_idx is None:
-                active_idx, _ = find_best_microphone(self.cfg)
+                active_idx, _ = find_best_microphone(self.cfg, require_16k=True)
             self.device_index = active_idx
 
             stream = None
+            self._stream_fault = None
             try:
                 with _PORTAUDIO_LOCK:
-                    stream = p.open(
+                    stream = _shared_open(p, 
                         format=pyaudio.paInt16,
                         channels=1,
                         rate=sample_rate,
@@ -1173,6 +1525,7 @@ class WakeWordDetector(threading.Thread):
                         frames_per_buffer=chunk_samples,
                     )
                 _log_mic_open(p, active_idx, sample_rate, 1, chunk_samples, "OK", "WakeWordDetector.run")
+                self._set_state("ok", "")
             except Exception as exc:
                 _log_mic_open(p, active_idx, sample_rate, 1, chunk_samples, repr(exc), "WakeWordDetector.run")
                 print(f"[voice] WakeWordDetector failed to open mic [{active_idx}]: {exc}")
@@ -1188,10 +1541,11 @@ class WakeWordDetector(threading.Thread):
                     if new_cfg_idx is not None and new_cfg_idx != self.device_index:
                         break
 
-                    try:
-                        data = stream.read(chunk_samples, exception_on_overflow=False)
-                    except Exception as stream_exc:
-                        print(f"[voice] Microphone stream read error: {stream_exc}. Unplug / disconnect detected.")
+                    data, fault = self._read_chunk(stream, chunk_samples)
+                    if fault == "stop":
+                        break
+                    if fault:
+                        self._stream_fault = fault
                         stream_error = True
                         break
 
@@ -1202,7 +1556,11 @@ class WakeWordDetector(threading.Thread):
                     rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
                     Voice._latest_rms = rms
                     Voice._latest_time = time.time()
-                    self._diag_chunk(rms)
+                    if self._diag_chunk(rms):
+                        # All-zero input for 5 s straight: stale stream (e.g. after resume). Reconnect once.
+                        self._stream_fault = "flatline"
+                        stream_error = True
+                        break
 
                     # Suppress wake word if assistant is speaking
                     if Voice.is_speaking:
@@ -1221,9 +1579,12 @@ class WakeWordDetector(threading.Thread):
                             except Exception as ns_err:
                                 print(f"[voice] on_no_speech error: {ns_err}")
 
+                    # One VAD evaluation per chunk (Silero is stateful; also feeds the noise floor).
+                    chunk_speech = self.vad.is_speech(arr, rms)
+
                     # In follow-up window? Check if user started speaking directly
                     in_followup = now < self.listening_until
-                    if in_followup and self.vad.is_speech(arr, rms):
+                    if in_followup and chunk_speech:
                         pre_roll.append(data)
                         raw = self.record_utterance_with_vad(
                             stream=stream,
@@ -1231,10 +1592,14 @@ class WakeWordDetector(threading.Thread):
                             chunk_samples=chunk_samples,
                             sample_rate=sample_rate,
                             trigger="followup",
+                            pre_speech_chunks=1,
                         )
                         pre_roll.clear()
                         if raw:
                             self._dispatch_utterance(raw, is_command=True)
+                        if self._stream_fault:
+                            stream_error = True
+                            break
                         continue
 
                     pre_roll.append(data)
@@ -1268,60 +1633,67 @@ class WakeWordDetector(threading.Thread):
                                 sample_rate=sample_rate,
                                 timeout_no_speech=min(self.followup_window, 3.5),
                                 trigger="wake",
+                                pre_speech_chunks=1 if chunk_speech else 0,
                             )
                             pre_roll.clear()
                             if raw:
                                 self._dispatch_utterance(raw, is_command=True)
-                            else:
+                            elif not self._stream_fault:
                                 if self.on_wake_idle:
                                     try:
                                         self.on_wake_idle()
                                     except Exception as idle_err:
                                         print(f"[voice] on_wake_idle error: {idle_err}")
                                 self.listening_until = time.time() + self.followup_window
+                            if self._stream_fault:
+                                stream_error = True
+                                break
 
                     # 2. Continuous VAD speech capture:
                     # Captures direct voice commands (e.g. "Jarvis open Chrome" or "Jarvis")
                     # even if openWakeWord did not trigger on "hey_jarvis".
                     # _recognition_worker and _process verify wake_aliases in passive standby,
                     # ensuring zero false activations from random background speech.
-                    vad_speech = False
-                    if not wake_triggered:
-                        vad_speech = self.vad.is_speech(arr, rms)
-                        self._st_vad_total += 1
-                        if vad_speech:
-                            self._st_vad_speech += 1
-                    if vad_speech:
+                    if chunk_speech and not wake_triggered:
                         raw = self.record_utterance_with_vad(
                             stream=stream,
                             pre_roll=list(pre_roll),
                             chunk_samples=chunk_samples,
                             sample_rate=sample_rate,
+                            pre_speech_chunks=1,
                         )
                         pre_roll.clear()
                         if raw:
                             self._dispatch_utterance(raw, is_command=in_followup)
+                        if self._stream_fault:
+                            stream_error = True
+                            break
             finally:
                 if stream is not None:
                     try:
                         with _PORTAUDIO_LOCK:
                             if hasattr(stream, "is_stopped") and not stream.is_stopped():
                                 stream.stop_stream()
-                            stream.close()
-                    except Exception:
-                        pass
+                            _shared_close(stream)
+                    except Exception as close_exc:
+                        _vlog.warning("closing mic stream failed: %r", close_exc)
                     stream = None
 
             if stream_error and not self.stop.is_set():
+                fault = self._stream_fault or "stream_error"
+                self._set_state("stalled" if fault == "stream_stall" else "reconnecting", fault)
+                _vlog.warning("mic stream fault reason=%s device=[%s] %s: closed, reconnecting",
+                              fault, self.device_index, Voice.current_mic_name)
+                self._stream_fault = None
                 self.device_index = None
                 recovered_stream = self.reconnect_stream(sample_rate, chunk_samples)
                 if recovered_stream is not None:
                     try:
                         with _PORTAUDIO_LOCK:
                             recovered_stream.stop_stream()
-                            recovered_stream.close()
-                    except Exception:
-                        pass
+                            _shared_close(recovered_stream)
+                    except Exception as close_exc:
+                        _vlog.warning("closing recovered mic stream failed: %r", close_exc)
 
     def listen(self, timeout_no_speech: float = 5.0) -> bytes:
         """
@@ -1338,7 +1710,7 @@ class WakeWordDetector(threading.Thread):
         stream = None
         try:
             with _PORTAUDIO_LOCK:
-                stream = p.open(
+                stream = _shared_open(p, 
                     format=pyaudio.paInt16,
                     channels=1,
                     rate=16000,
@@ -1358,7 +1730,7 @@ class WakeWordDetector(threading.Thread):
                 try:
                     with _PORTAUDIO_LOCK:
                         stream.stop_stream()
-                        stream.close()
+                        _shared_close(stream)
                 except Exception:
                     pass
 
@@ -1378,12 +1750,17 @@ class Voice(threading.Thread):
     _latest_time = 0.0
     _last_raw_audio = None
     is_speaking = False
+    current_mic_index = None      # class-level so WakeWordDetector diagnostics never hit a missing attribute
+    current_mic_name = "Auto"
 
     def __init__(self, cfg, ctx, stop_event):
         super().__init__(name="Voice", daemon=True)
         self.cfg = cfg
         self.ctx = ctx
         self.stop = stop_event
+        # Private per-instance stop: set when this Voice exits (for any reason) so its STT worker and
+        # wake detector never outlive it and a restarted Voice never competes with an old one.
+        self._own_stop = threading.Event()
         self._groq_cd_logged = 0.0
         self.listening_until = 0.0
         self.audio_q = queue.Queue(maxsize=3)
@@ -1393,6 +1770,12 @@ class Voice(threading.Thread):
         self.sensitivity = getattr(cfg, "wake_sensitivity", "balanced") if cfg else "balanced"
         self.followup_window = float(getattr(cfg, "wake_followup_window", getattr(cfg, "command_window", 6.0))) if cfg else 6.0
         self.wake_detector = None
+
+    def mic_state(self):
+        """("ok"|"reconnecting"|"stalled"|"flatline"|"down", reason) for the supervisor health summary."""
+        if self.wake_detector is None:
+            return "down", "WakeWordDetector not started"
+        return self.wake_detector.mic_state()
 
     def listen(self, timeout: float = None) -> str:
         """
@@ -1512,6 +1895,8 @@ class Voice(threading.Thread):
             raise
         else:
             jarvis_log.thread_exited("Voice")
+        finally:
+            self._own_stop.set()
 
     def _run_body(self):
         try:
@@ -1528,10 +1913,14 @@ class Voice(threading.Thread):
         recognizer.non_speaking_duration = 0.5
 
         # Probed microphone
-        dev_idx, dev_name = find_best_microphone(self.cfg)
+        dev_idx, dev_name = find_best_microphone(self.cfg, require_16k=True)
         self.current_mic_index = dev_idx
         self.current_mic_name = dev_name
+        Voice.current_mic_index = dev_idx
+        Voice.current_mic_name = dev_name
         print(f"[voice] Connecting to microphone [{dev_idx}]: {dev_name}")
+        _vlog.info("Voice: microphone chosen idx=%s name=%r (configured idx=%s)", dev_idx, dev_name,
+                   getattr(self.cfg, "mic_device_index", None))
 
         # STT background worker
         worker = threading.Thread(target=jarvis_log.run_logged,
@@ -1546,7 +1935,7 @@ class Voice(threading.Thread):
             on_utterance=self._on_utterance_recorded,
             on_no_speech=self._on_no_speech_detected,
             on_wake_idle=self._on_wake_idle,
-            stop_event=self.stop,
+            stop_event=self._own_stop,
             sensitivity=self.sensitivity,
             followup_window=self.followup_window,
             device_index=dev_idx,
@@ -1555,6 +1944,10 @@ class Voice(threading.Thread):
 
         while not self.stop.is_set():
             jarvis_log.heartbeat("Voice")
+            if not self.wake_detector.is_alive() and not self.stop.is_set():
+                _vlog.error("WakeWordDetector thread died (mic_state=%s); Voice exiting so the supervisor "
+                            "restarts it", self.wake_detector.mic_state())
+                raise RuntimeError("WakeWordDetector thread died")
             configured_idx = getattr(self.cfg, "mic_device_index", None)
             if configured_idx is not None and configured_idx != self.wake_detector.device_index:
                 print(f"[voice] Switching microphone to [{configured_idx}]...")
@@ -1608,7 +2001,7 @@ class Voice(threading.Thread):
     def _recognition_worker(self, recognizer, sr):
         vp = get_voice_profile()
 
-        while not self.stop.is_set():
+        while not self.stop.is_set() and not self._own_stop.is_set():
             jarvis_log.heartbeat("STTWorker", q=self.audio_q.qsize())
             try:
                 item = self.audio_q.get(timeout=0.5)
@@ -1751,6 +2144,13 @@ class Voice(threading.Thread):
                 except TypeError:
                     self._process(text)
 
+    def _rearm_followup(self):
+        """Keep the follow-up window open. Called only after a command produced a (non-None) reply."""
+        followup_sec = float(getattr(self.cfg, "wake_followup_window", getattr(self.cfg, "command_window", 6.0)))
+        self.listening_until = time.time() + followup_sec
+        if self.wake_detector:
+            self.wake_detector.listening_until = self.listening_until
+
     def _process(self, text, is_command: bool = False):
         t = text.lower().strip()
         now = time.time()
@@ -1772,6 +2172,15 @@ class Voice(threading.Thread):
                         command = ""
                     break
             jarvis_log.utterance_event(jarvis_log.WAKE_GATE, active=True, matched=matched_alias, command=command)
+            # Follow-up speech without a wake word: Whisper routinely hallucinates these on noise.
+            if matched_alias is None and _normalize_noise_text(t) in _WHISPER_NOISE_NORMALIZED:
+                jarvis_log.utterance_event(jarvis_log.DROPPED, reason="hallucination")
+                if now >= self.listening_until and hasattr(self.ctx, "overlay") and self.ctx.overlay:
+                    try:
+                        self.ctx.overlay.post("listening_done")
+                    except Exception:
+                        pass
+                return
         else:
             for alias in getattr(self.cfg, "wake_aliases", ["jarvis"]):
                 pattern = r"\b" + re.escape(alias) + r"\b"
@@ -1812,12 +2221,6 @@ class Voice(threading.Thread):
             jarvis_log.utterance_event(jarvis_log.RESULT, step="wake_ack", ok=True)
             return
 
-        # Keep follow-up window open after executing command
-        followup_sec = float(getattr(self.cfg, "wake_followup_window", getattr(self.cfg, "command_window", 6.0)))
-        self.listening_until = time.time() + followup_sec
-        if self.wake_detector:
-            self.wake_detector.listening_until = self.listening_until
-
         # Continuously adapt voice profile on confirmed commands
         if Voice._last_raw_audio:
             try:
@@ -1855,6 +2258,7 @@ class Voice(threading.Thread):
             if island_reply:
                 self.ctx.say(island_reply)
                 jarvis_log.utterance_event(jarvis_log.RESULT, step="reply", ok=True, via="island")
+                self._rearm_followup()
                 return
 
             try:
@@ -1866,6 +2270,8 @@ class Voice(threading.Thread):
             if reply:
                 self.ctx.say(reply)
             jarvis_log.utterance_event(jarvis_log.RESULT, step="reply", ok=reply is not None)
+            if reply is not None:
+                self._rearm_followup()
         finally:
             if hasattr(self.ctx, "overlay") and self.ctx.overlay:
                 try:

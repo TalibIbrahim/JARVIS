@@ -100,7 +100,6 @@ class _StubVad:
         return 0.01
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-V1: VAD RMS fallback overrides Silero (rms>=threshold -> speech even when prob~0)")
 def test_v1_vad_fallback_ignores_silero(monkeypatch):
     monkeypatch.setattr(voice.VADDetector, "_init_vad", lambda self: None)
     det = voice.VADDetector()
@@ -112,7 +111,6 @@ def test_v1_vad_fallback_ignores_silero(monkeypatch):
     assert det.is_speech(chunk, rms) is False
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-V1b: WakeWordDetector builds VADDetector() with default 42.0, ignoring cfg.mic_energy_threshold")
 def test_v1b_mic_energy_threshold_ignored(monkeypatch):
     monkeypatch.setattr(voice.WakeWordDetector, "_init_model", lambda self: None)
     monkeypatch.setattr(voice.VADDetector, "_init_vad", lambda self: None)
@@ -208,7 +206,6 @@ def test_t3_silent_thread_death_is_restarted():
 
 
 # --------------------------------------------------------------------------- T1
-@pytest.mark.xfail(strict=True, reason="BUG-T1: list_cameras(force_refresh=True) opens a device held by an active FrameGrabber")
 def test_t1_list_cameras_must_not_probe_active_grabber(monkeypatch):
     import numpy as _np
     import tracker

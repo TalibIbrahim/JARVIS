@@ -9,12 +9,31 @@ import numpy as np
 import jarvis_log
 from gestures import Hand, Action
 
+try:
+    from config import mark_runtime_override
+except ImportError:  # older config without runtime-override tracking
+    mark_runtime_override = None
+
 _tlog = jarvis_log.get_logger("tracker")
+
+
+def _fallback_camera_index(cfg, idx):
+    """Camera fallback: use idx for this process only (not persisted by save_config)."""
+    cfg.camera_index = idx
+    if mark_runtime_override is not None:
+        mark_runtime_override(cfg, "camera_index")
 
 mp = None
 
-# Read-only (logging-only for now): index of the camera currently held by an open FrameGrabber.
+# Index of the camera currently held by an open FrameGrabber (or the non-threaded Tracker path).
 _ACTIVE_GRABBER_IDX = None
+
+# Serializes every cv2.VideoCapture construction / .set during open / first .read / .release.
+# NOT held during the steady-state cap.read() loop. Concurrent DSHOW open/release corrupts the heap.
+_CAMERA_IO_LOCK = threading.RLock()
+# Set (under _CAMERA_IO_LOCK) while a FrameGrabber open is in progress, with the indices it will try.
+_OPENING = False
+_OPENING_CANDS = ()
 
 
 def _backend_name(backend):
@@ -93,9 +112,13 @@ def list_cameras(force_refresh=False):
                    _site, threading.current_thread().name, force_refresh, _hit)
         if _hit:
             return list(_CAMERA_CACHE)
-        if _ACTIVE_GRABBER_IDX is not None:
-            _tlog.warning("list_cameras: probing while FrameGrabber holds camera idx=%s (caller=%s thread=%s)",
-                          _ACTIVE_GRABBER_IDX, _site, threading.current_thread().name)
+        def _busy_idxs():
+            busy = set()
+            if _ACTIVE_GRABBER_IDX is not None:
+                busy.add(_ACTIVE_GRABBER_IDX)
+            if _OPENING:
+                busy.update(_OPENING_CANDS)
+            return busy
 
         qt_cams = []
         try:
@@ -115,18 +138,27 @@ def list_cameras(force_refresh=False):
             if any(w in name.lower() for w in (" ir ", "ir camera", "infrared", "windows hello")):
                 continue
 
-            _t_probe = time.perf_counter()
-            cap = cv2.VideoCapture(idx, backend)
-            opened = cap.isOpened()
-            working = False
-            if opened:
-                ret, frame = cap.read()
-                working = bool(ret and frame is not None and frame.size > 0)
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-            else:
+            # A camera held (or being opened) by a FrameGrabber must never be probed: a second
+            # DSHOW open of the same device kills the stream and can corrupt the heap.
+            if idx in _busy_idxs():
+                _tlog.info("list_cameras probe: idx=%s name=%r in_use (grabber active/opening), not opened", idx, name)
+                cams.append({"index": idx, "name": name, "working": True, "in_use": True})
+                continue
+
+            with _CAMERA_IO_LOCK:
+                # Re-check under the lock: an open may have started while we waited for it.
+                if idx in _busy_idxs():
+                    _tlog.info("list_cameras probe: idx=%s name=%r in_use (grabber active/opening), not opened",
+                               idx, name)
+                    cams.append({"index": idx, "name": name, "working": True, "in_use": True})
+                    continue
+                _t_probe = time.perf_counter()
+                cap = cv2.VideoCapture(idx, backend)
+                opened = cap.isOpened()
+                working = False
+                if opened:
+                    ret, frame = cap.read()
+                    working = bool(ret and frame is not None and frame.size > 0)
                 try:
                     cap.release()
                 except Exception:
@@ -161,6 +193,8 @@ class FrameGrabber(threading.Thread):
         self.opened = False
 
         self.reconnecting = False
+        self._opening = False
+        self._switch_requested = False
 
         # Double-buffer preallocated frames to eliminate per-frame allocations
         h = int(getattr(cfg, "frame_height", 720))
@@ -174,9 +208,24 @@ class FrameGrabber(threading.Thread):
         self._has_frame = False
 
     def open_camera(self):
-        backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
+        global _OPENING, _OPENING_CANDS
         preferred = getattr(self.cfg, "camera_index", 0)
         candidates = [preferred] + [i for i in (0, 1, 2) if i != preferred]
+        with _CAMERA_IO_LOCK:
+            # Flag set under the lock, before any device access, so list_cameras() never probes
+            # a camera this grabber is about to open.
+            _OPENING = True
+            _OPENING_CANDS = tuple(candidates)
+            self._opening = True
+            try:
+                return self._open_camera_locked(preferred, candidates)
+            finally:
+                _OPENING = False
+                _OPENING_CANDS = ()
+                self._opening = False
+
+    def _open_camera_locked(self, preferred, candidates):
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
         w = int(getattr(self.cfg, "frame_width", 1280))
         h = int(getattr(self.cfg, "frame_height", 720))
 
@@ -208,7 +257,7 @@ class FrameGrabber(threading.Thread):
                 if is_valid:
                     if idx != preferred:
                         print(f"[tracker] Camera [{preferred}] unavailable. Auto-recovered to working camera [{idx}].")
-                        self.cfg.camera_index = idx
+                        _fallback_camera_index(self.cfg, idx)
                     self.cap = cap
                     self.opened = True
                     self._active_cam_idx = idx
@@ -289,7 +338,10 @@ class FrameGrabber(threading.Thread):
         active_cam = getattr(self, "_active_cam_idx", None)
         if active_cam is not None and active_cam != target_cam:
             print(f"[tracker] Live camera switch requested: {active_cam} -> {target_cam}")
-            self.release()
+            _tlog.info("camera switch requested: %s -> %s (release deferred to the grabber thread)",
+                       active_cam, target_cam)
+            # Never release from the caller's thread: the grabber thread owns the capture.
+            self._switch_requested = True
 
     def run(self):
         jarvis_log.thread_started("FrameGrabber")
@@ -315,6 +367,17 @@ class FrameGrabber(threading.Thread):
                 hb_next = _pc + 1.0
                 jarvis_log.heartbeat("FrameGrabber", fps=round(self.fps, 1), failures=self.failures,
                                      opened=self.opened)
+            if self._switch_requested:
+                self._switch_requested = False
+                _tlog.info("camera switch: releasing capture idx=%s on grabber thread",
+                           getattr(self, "_active_cam_idx", None))
+                with _CAMERA_IO_LOCK:
+                    self.release()
+                _ok = self.open_camera()
+                _tlog.info("camera switch: reopen result=%s idx=%s", "OK" if _ok else "FAIL",
+                           getattr(self, "_active_cam_idx", None))
+                last_t = time.perf_counter()
+                continue
             if not self.cap or not self.opened:
                 if not self.reconnect_loop():
                     continue
@@ -364,14 +427,41 @@ class FrameGrabber(threading.Thread):
 
     def release(self):
         global _ACTIVE_GRABBER_IDX
-        if self.cap:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-        self.cap = None
-        self.opened = False
-        _ACTIVE_GRABBER_IDX = None
+        with _CAMERA_IO_LOCK:
+            if self.cap:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+            self.cap = None
+            self.opened = False
+            _ACTIVE_GRABBER_IDX = None
+
+    STALL_AFTER_S = 3.0
+
+    def stalled_for(self) -> float:
+        """Seconds without a new frame while the grabber is alive, open and read-failure-free.
+        Non-zero only in the DSHOW "read blocked" signature (no failures, no frames)."""
+        if not (self.is_alive() and self.opened and self.failures == 0 and self._has_frame):
+            return 0.0
+        return max(0.0, time.perf_counter() - self.latest_t)
+
+    def camera_state(self):
+        """("ok"|"opening"|"reconnecting"|"stalled"|"down", reason) for the supervisor health summary."""
+        if self.ident is not None and not self.is_alive():
+            return "down", "FrameGrabber thread not running"
+        if self.reconnecting:
+            return "reconnecting", f"read failures={self.failures}"
+        if self._opening:
+            return "opening", ""
+        if not self.opened:
+            if self.ident is None:
+                return "opening", "camera not opened yet"
+            return "reconnecting", "camera released"
+        stalled = self.stalled_for()
+        if stalled >= self.STALL_AFTER_S:
+            return "stalled", f"no frame for {stalled:.1f}s: DSHOW read blocked"
+        return "ok", ""
 
 
 class Tracker(threading.Thread):
@@ -405,12 +495,32 @@ class Tracker(threading.Thread):
                 return self._latest_raw_frame.copy() if unmirrored else cv2.flip(self._latest_raw_frame, 1)
         return None
 
+    def camera_state(self):
+        """("ok"|"opening"|"reconnecting"|"stalled"|"down", reason) for the supervisor health summary."""
+        if self._grabber is not None:
+            return self._grabber.camera_state()
+        if self.ident is not None and not self.is_alive():
+            return "down", "Tracker thread not running"
+        if self.ident is None:
+            return "opening", "tracker not started"
+        return "ok", "non-threaded capture"
+
     def reload_config(self, cfg=None):
         """Live updates tracking settings (preview, camera switch, etc.) without restart."""
         if cfg:
             self.cfg = cfg
         if self._grabber and hasattr(self._grabber, "reload_config"):
             self._grabber.reload_config(self.cfg)
+
+    def _release_dead_grabber(self):
+        """Release the grabber's capture and clear _ACTIVE_GRABBER_IDX, but ONLY if its thread is not
+        alive (never release a capture another thread may be reading), so a restarted Tracker does
+        not find the device still held by an orphaned VideoCapture."""
+        g = self._grabber
+        if g is not None and not g.is_alive():
+            with _CAMERA_IO_LOCK:
+                g.release()
+            _tlog.info("released capture of dead/stopped FrameGrabber (thread not alive); active idx cleared")
 
     def run(self):
         jarvis_log.thread_started("Tracker")
@@ -421,8 +531,11 @@ class Tracker(threading.Thread):
             raise
         else:
             jarvis_log.thread_exited("Tracker")
+        finally:
+            self._release_dead_grabber()
 
     def _run_body(self):
+        global _ACTIVE_GRABBER_IDX
         cfg = self.cfg
         use_threaded = getattr(cfg, "threaded_capture", True)
 
@@ -438,29 +551,31 @@ class Tracker(threading.Thread):
             candidates = [preferred] + [i for i in (0, 1, 2) if i != preferred]
             cap = None
             for idx in candidates:
-                _t_open = time.perf_counter()
-                cand_cap = cv2.VideoCapture(idx, backend)
-                if getattr(cfg, "camera_mjpg", True):
+                with _CAMERA_IO_LOCK:
+                    _t_open = time.perf_counter()
+                    cand_cap = cv2.VideoCapture(idx, backend)
+                    if getattr(cfg, "camera_mjpg", True):
+                        try:
+                            cand_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                        except Exception:
+                            pass
+                    cand_cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
+                    cand_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
+                    cand_cap.set(cv2.CAP_PROP_FPS, getattr(cfg, "camera_fps", 30))
+                    _log_cam_open(idx, cand_cap, backend, cfg.frame_width, cfg.frame_height,
+                                  getattr(cfg, "camera_fps", 30), "n/a",
+                                  int((time.perf_counter() - _t_open) * 1000), "Tracker.nonthreaded")
+                    if cand_cap.isOpened():
+                        cap = cand_cap
+                        _ACTIVE_GRABBER_IDX = idx
+                        if idx != preferred:
+                            print(f"[tracker] Camera [{preferred}] unavailable. Auto-recovered to working camera [{idx}].")
+                            _fallback_camera_index(cfg, idx)
+                        break
                     try:
-                        cand_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                        cand_cap.release()
                     except Exception:
                         pass
-                cand_cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
-                cand_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
-                cand_cap.set(cv2.CAP_PROP_FPS, getattr(cfg, "camera_fps", 30))
-                _log_cam_open(idx, cand_cap, backend, cfg.frame_width, cfg.frame_height,
-                              getattr(cfg, "camera_fps", 30), "n/a",
-                              int((time.perf_counter() - _t_open) * 1000), "Tracker.nonthreaded")
-                if cand_cap.isOpened():
-                    cap = cand_cap
-                    if idx != preferred:
-                        print(f"[tracker] Camera [{preferred}] unavailable. Auto-recovered to working camera [{idx}].")
-                        cfg.camera_index = idx
-                    break
-                try:
-                    cand_cap.release()
-                except Exception:
-                    pass
 
             if not cap or not cap.isOpened():
                 self.ctx.say("I can't open the camera, sir.")
@@ -497,6 +612,7 @@ class Tracker(threading.Thread):
         last_frame_pc = time.perf_counter()
         n_hands = 0
         prev_active = bool(getattr(self.engine, "active", False))
+        cam_stalled = False
         while not self.stop.is_set():
             now_loop = time.perf_counter()
             if now_loop >= hb_next:
@@ -515,8 +631,24 @@ class Tracker(threading.Thread):
                 time.sleep(0.06)
 
             if use_threaded:
+                if not self._grabber.is_alive() and not self.stop.is_set():
+                    _tlog.error("FrameGrabber thread died (opened=%s failures=%s); Tracker exiting for restart",
+                                self._grabber.opened, self._grabber.failures)
+                    self.controller.handle(Action("lost"))  # failsafe: mouseUp + keyUp("ctrl")
+                    hands.close()
+                    # The grabber thread is dead, so releasing its capture cannot race a read.
+                    self._release_dead_grabber()
+                    raise RuntimeError("FrameGrabber thread died")
                 raw_frame, frame_t = self._grabber.get_latest()
                 if raw_frame is None or frame_t <= last_processed_t:
+                    _stalled_s = self._grabber.stalled_for()
+                    if _stalled_s >= FrameGrabber.STALL_AFTER_S and not cam_stalled:
+                        # The DSHOW read is blocked inside the grabber thread. Do NOT release the
+                        # capture from here: concurrent DSHOW access is what corrupts the heap.
+                        cam_stalled = True
+                        _tlog.error("camera not delivering frames for %.1fs: DSHOW read blocked", _stalled_s)
+                        self.overlay.post("error", text="CAMERA STALLED")
+                        self.controller.handle(Action("lost"))  # failsafe: mouseUp + keyUp("ctrl")
                     if (self._grabber.failures >= 30 or not self._grabber.opened) and failures < 30:
                         failures = 30
                         _tlog.warning("camera feed lost (grabber failures=%s opened=%s)",
@@ -536,6 +668,9 @@ class Tracker(threading.Thread):
                     self._rgb_buf = None
                     self._preview_overlay_buf = None
 
+                if cam_stalled:
+                    cam_stalled = False
+                    _tlog.info("camera frames resumed after stall")
                 failures = 0
                 last_processed_t = frame_t
                 last_frame_pc = frame_t
@@ -554,26 +689,29 @@ class Tracker(threading.Thread):
                         if self.stop.wait(delays[delay_idx]):
                             break
                         clear_camera_cache()
-                        try:
-                            cap.release()
-                        except Exception:
-                            pass
-                        for c_idx in candidates:
-                            cand_cap = cv2.VideoCapture(c_idx, backend)
-                            if cand_cap.isOpened():
-                                ret, tf = cand_cap.read()
-                                if ret and tf is not None and getattr(tf, "size", 0) > 0:
-                                    cap = cand_cap
-                                    failures = 0
-                                    self._flip_buf = None
-                                    self._rgb_buf = None
-                                    self._preview_overlay_buf = None
-                                    self.controller._reset_filters()
-                                    break
-                                try:
-                                    cand_cap.release()
-                                except Exception:
-                                    pass
+                        with _CAMERA_IO_LOCK:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            _ACTIVE_GRABBER_IDX = None
+                            for c_idx in candidates:
+                                cand_cap = cv2.VideoCapture(c_idx, backend)
+                                if cand_cap.isOpened():
+                                    ret, tf = cand_cap.read()
+                                    if ret and tf is not None and getattr(tf, "size", 0) > 0:
+                                        cap = cand_cap
+                                        _ACTIVE_GRABBER_IDX = c_idx
+                                        failures = 0
+                                        self._flip_buf = None
+                                        self._rgb_buf = None
+                                        self._preview_overlay_buf = None
+                                        self.controller._reset_filters()
+                                        break
+                                    try:
+                                        cand_cap.release()
+                                    except Exception:
+                                        pass
                         continue
                 if failures >= 30:
                     _tlog.info("camera feed recovered (non-threaded)")
@@ -674,7 +812,9 @@ class Tracker(threading.Thread):
         if use_threaded and self._grabber:
             self._grabber.release()
         elif not use_threaded:
-            cap.release()
+            with _CAMERA_IO_LOCK:
+                cap.release()
+                _ACTIVE_GRABBER_IDX = None
 
         if preview_window_open:
             try:

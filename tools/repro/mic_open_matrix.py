@@ -34,6 +34,8 @@ def main():
     print("find_best_microphone(cfg)                      ->", voice.find_best_microphone(cfg))
     print("find_best_microphone(cfg, probe_working=True)  ->",
           voice.find_best_microphone(cfg, probe_working=True))
+    print("find_best_microphone(cfg, require_16k=True)    ->",
+          voice.find_best_microphone(cfg, require_16k=True), " (what the pipeline uses)")
 
 
 if __name__ == "__main__":
