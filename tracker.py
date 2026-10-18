@@ -320,6 +320,13 @@ class Tracker(threading.Thread):
                 return self._latest_raw_frame.copy() if unmirrored else cv2.flip(self._latest_raw_frame, 1)
         return None
 
+    def reload_config(self, cfg=None):
+        """Live updates tracking settings (preview, camera switch, etc.) without restart."""
+        if cfg:
+            self.cfg = cfg
+        if self._grabber and hasattr(self._grabber, "reload_config"):
+            self._grabber.reload_config(self.cfg)
+
     def run(self):
         cfg = self.cfg
         use_threaded = getattr(cfg, "threaded_capture", True)
@@ -376,6 +383,7 @@ class Tracker(threading.Thread):
         failures = 0
         last_processed_t = 0.0
         win_name = "JARVIS // VISION  (q to quit)"
+        preview_window_open = False
 
         hand_visible = False
         last_hand_seen_t = 0.0
@@ -385,7 +393,7 @@ class Tracker(threading.Thread):
             # jump to full 30 FPS rate instantly the moment a hand is detected,
             # with zero missed first gestures.
             hand_recent = (now_loop - last_hand_seen_t) < 0.5
-            if not self.engine.active and not cfg.show_preview and not hand_recent:
+            if not self.engine.active and not getattr(self.cfg, "show_preview", False) and not hand_recent:
                 time.sleep(0.06)
 
             if use_threaded:
@@ -495,17 +503,35 @@ class Tracker(threading.Thread):
             st["inference_ms"] = self._inference_ms
             self.overlay.post("state", **st)
 
-            if cfg.show_preview:
+            if getattr(self.cfg, "show_preview", False):
                 self._preview(self._flip_buf, found, connections, st, win_name)
+                preview_window_open = True
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q") or key == 27:             # q or Esc
-                    self.stop.set()
+                if key == ord("q") or key == 27:             # q or Esc toggles off preview
+                    self.cfg.show_preview = False
+                    try:
+                        cv2.destroyWindow(win_name)
+                    except Exception:
+                        pass
+                    preview_window_open = False
+                else:
+                    try:
+                        # If user closed window with X, gracefully close preview without killing the app
+                        if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                            self.cfg.show_preview = False
+                            try:
+                                cv2.destroyWindow(win_name)
+                            except Exception:
+                                pass
+                            preview_window_open = False
+                    except Exception:
+                        pass
+            elif preview_window_open:
                 try:
-                    # Closing window via 'X' button triggers clean shutdown
-                    if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
-                        self.stop.set()
+                    cv2.destroyWindow(win_name)
                 except Exception:
                     pass
+                preview_window_open = False
 
         hands.close()
         if use_threaded and self._grabber:
@@ -513,7 +539,7 @@ class Tracker(threading.Thread):
         elif not use_threaded:
             cap.release()
 
-        if cfg.show_preview:
+        if preview_window_open:
             try:
                 cv2.destroyAllWindows()
             except Exception:

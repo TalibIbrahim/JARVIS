@@ -1089,11 +1089,13 @@ class WakeWordDetector(threading.Thread):
 
                     pre_roll.append(data)
 
-                    # openWakeWord prediction
+                    # 1. openWakeWord prediction for instant "Hey Jarvis" wake chime
+                    wake_triggered = False
                     if getattr(self.cfg, "wake_word_enabled", True) and self.model is not None:
                         pred = self.model.predict(arr)
                         score = pred.get("hey_jarvis", 0.0)
                         if self.guard.evaluate(score, is_speaking=Voice.is_speaking, now=now):
+                            wake_triggered = True
                             # WAKE DETECTED!
                             # 1. Fire wake callback immediately
                             if self.on_wake:
@@ -1123,19 +1125,22 @@ class WakeWordDetector(threading.Thread):
                                     except Exception as idle_err:
                                         print(f"[voice] on_wake_idle error: {idle_err}")
                                 self.listening_until = time.time() + self.followup_window
-                    elif not getattr(self.cfg, "wake_word_enabled", True):
-                        # Wake word disabled: continuous VAD voice command capture
-                        if self.vad.is_speech(arr, rms):
-                            pre_roll.append(data)
-                            raw = self.record_utterance_with_vad(
-                                stream=stream,
-                                pre_roll=list(pre_roll),
-                                chunk_samples=chunk_samples,
-                                sample_rate=sample_rate,
-                            )
-                            pre_roll.clear()
-                            if raw:
-                                self._dispatch_utterance(raw, is_command=True)
+
+                    # 2. Continuous VAD speech capture:
+                    # Captures direct voice commands (e.g. "Jarvis open Chrome" or "Jarvis")
+                    # even if openWakeWord did not trigger on "hey_jarvis".
+                    # _recognition_worker and _process verify wake_aliases in passive standby,
+                    # ensuring zero false activations from random background speech.
+                    if not wake_triggered and self.vad.is_speech(arr, rms):
+                        raw = self.record_utterance_with_vad(
+                            stream=stream,
+                            pre_roll=list(pre_roll),
+                            chunk_samples=chunk_samples,
+                            sample_rate=sample_rate,
+                        )
+                        pre_roll.clear()
+                        if raw:
+                            self._dispatch_utterance(raw, is_command=in_followup)
             finally:
                 if stream is not None:
                     try:

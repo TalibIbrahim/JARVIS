@@ -156,7 +156,14 @@ class JarvisTray(QSystemTrayIcon):
 
     def _toggle_preview(self) -> None:
         if self.mgr.cfg:
-            self.mgr.cfg.show_preview = not self.mgr.cfg.show_preview
+            self.mgr.cfg.show_preview = not getattr(self.mgr.cfg, "show_preview", False)
+            try:
+                from config import save_config
+                save_config(self.mgr.cfg)
+            except Exception:
+                pass
+            if self.mgr.ctx and hasattr(self.mgr.ctx, "reload_config"):
+                self.mgr.ctx.reload_config(self.mgr.cfg)
 
     def _toggle_dwell(self) -> None:
         if self.mgr.cfg:

@@ -6,7 +6,9 @@ datas = [('assets', 'assets')]
 datas += collect_data_files('mediapipe')
 datas += collect_data_files('certifi')
 datas += collect_data_files('piper')
+datas += collect_data_files('openwakeword')
 datas += copy_metadata('mediapipe')
+datas += copy_metadata('openwakeword')
 
 
 a = Analysis(
@@ -14,7 +16,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['PySide6', 'speech_recognition', 'pyttsx3.drivers', 'pyttsx3.drivers.sapi5', 'keyring', 'keyring.backends.Windows', 'win32cred', 'pywintypes', 'certifi', 'requests', 'piper', 'sounddevice', '_sounddevice', 'onnxruntime', 'scipy', 'scipy.signal', 'psutil', 'pynvml', 'PIL', 'PIL.Image'],
+    hiddenimports=['PySide6', 'speech_recognition', 'pyttsx3.drivers', 'pyttsx3.drivers.sapi5', 'keyring', 'keyring.backends.Windows', 'win32cred', 'pywintypes', 'certifi', 'requests', 'piper', 'sounddevice', '_sounddevice', 'onnxruntime', 'scipy', 'scipy.signal', 'psutil', 'pynvml', 'PIL', 'PIL.Image', 'openwakeword', 'openwakeword.model', 'openwakeword.vad'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

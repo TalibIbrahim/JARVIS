@@ -37,6 +37,11 @@ def build():
         "--hidden-import", "scipy.signal",
         "--collect-data", "certifi",
         "--collect-data", "piper",
+        "--collect-data", "openwakeword",
+        "--copy-metadata", "openwakeword",
+        "--hidden-import", "openwakeword",
+        "--hidden-import", "openwakeword.model",
+        "--hidden-import", "openwakeword.vad",
         "main.py"
     ]
 

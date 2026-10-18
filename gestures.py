@@ -217,6 +217,7 @@ class GestureEngine:
         if not hands:
             self.progress = 0.0
             self.palm_since = None
+            self.palm_latched = False
             self.thumbs_up_since = None
             self.last_pose = None
             self.last_closing = False
@@ -328,7 +329,7 @@ class GestureEngine:
         # 2. Wake & Standby Rules
         if not self.active:
             # ONLY Open Palm wakes from standby! Fist or Neutral must never wake.
-            is_wake_palm = (cur_pose == "OPEN" and p.palm) or (p.palm and p.openness >= 0.50)
+            is_wake_palm = bool(p.palm or (cur_pose == "OPEN" and openness >= 0.45))
             if is_wake_palm:
                 self.palm_last_seen = now
                 if not self.palm_latched:
@@ -346,8 +347,7 @@ class GestureEngine:
                 if self.palm_since is not None and (now - getattr(self, "palm_last_seen", now)) <= palm_grace:
                     pass
                 else:
-                    if not is_wake_palm and cur_pose != "OPEN":
-                        self.palm_latched = False
+                    self.palm_latched = False
                     self.palm_since = None
                     self.progress = 0.0
             return actions
@@ -902,6 +902,10 @@ class GestureEngine:
         self._end_pinch(actions)
         self._clear_motion()
         self.active = want
+        if not want:
+            self.palm_latched = False
+            self.palm_since = None
+            self.progress = 0.0
         actions.append(Action("activate" if want else "deactivate"))
 
     def _flash_label(self, text, now):

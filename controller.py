@@ -139,19 +139,6 @@ class Controller:
         self.last_landmark_y = None
         self.last_move_t = None
 
-    def reload_config(self, cfg=None):
-        """Live updates smoothing and deadzone parameters without restart."""
-        if cfg:
-            self.cfg = cfg
-        if hasattr(self, "fx") and hasattr(self.fx, "min_cutoff"):
-            self.fx.min_cutoff = getattr(self.cfg, "smooth_min_cutoff", 1.0)
-            self.fx.beta = getattr(self.cfg, "smooth_beta", 0.05)
-        if hasattr(self, "fy") and hasattr(self.fy, "min_cutoff"):
-            self.fy.min_cutoff = getattr(self.cfg, "smooth_min_cutoff", 1.0)
-            self.fy.beta = getattr(self.cfg, "smooth_beta", 0.05)
-        if hasattr(self, "deadzone") and hasattr(self.deadzone, "threshold"):
-            self.deadzone.threshold = getattr(self.cfg, "deadzone_px", 1.5)
-
         # State flags
         self.button_down = False
         self.ctrl_down = False
@@ -173,6 +160,21 @@ class Controller:
             atexit.register(self.failsafe_release)
         except Exception:
             pass
+
+    def reload_config(self, cfg=None):
+        """Live updates smoothing and deadzone parameters without restart."""
+        if cfg:
+            self.cfg = cfg
+        if hasattr(self, "fx") and hasattr(self.fx, "min_cutoff"):
+            self.fx.min_cutoff = getattr(self.cfg, "smooth_min_cutoff", 1.0)
+            self.fx.beta = getattr(self.cfg, "smooth_beta", 0.05)
+        if hasattr(self, "fy") and hasattr(self.fy, "min_cutoff"):
+            self.fy.min_cutoff = getattr(self.cfg, "smooth_min_cutoff", 1.0)
+            self.fy.beta = getattr(self.cfg, "smooth_beta", 0.05)
+        if hasattr(self, "deadzone") and hasattr(self.deadzone, "threshold"):
+            self.deadzone.threshold = getattr(self.cfg, "deadzone_px", 1.5)
+        if hasattr(self, "dwell") and hasattr(self.dwell, "reload_config"):
+            self.dwell.reload_config(self.cfg)
 
     def set_overlay(self, overlay):
         self.overlay = overlay
