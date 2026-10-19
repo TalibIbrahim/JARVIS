@@ -24,3 +24,6 @@ onnxruntime>=1.17.0
 scipy>=1.10.0
 pycaw>=20240000
 comtypes>=1.2.0
+# Optional voice-over-music echo cancellation: WebRTC APM (BSD-3) + WASAPI loopback (Apache-2.0); pinned
+aec-audio-processing==1.0.1
+PyAudioWPatch==0.2.12.9
