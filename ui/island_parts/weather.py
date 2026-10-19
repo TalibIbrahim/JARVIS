@@ -1,17 +1,118 @@
-"""ui/island_parts/weather.py - Weather card renderer, vector weather glyphs and temperature formatting (verbatim move from island.py)."""
+"""ui/island_parts/weather.py - Weather card renderer (MEASUREMENT_SHEET_v2 section 3.3) and temperature formatting.
+
+The whole card content (city, vector condition icon, temperature, condition, divider, three metric tiles) is rendered
+once into a pixmap keyed by the displayed strings (+ dpr, size scale) and blitted; it is rebuilt only when the data
+changes. Real data only: wind / humidity / feels-like show "--" until the weather feed delivered them.
+"""
 
 from __future__ import annotations
 
 import math
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen
+import time
+from typing import Optional
+
 from PySide6.QtCore import QPointF, QRectF, Qt
-from ui.tokens import TYPE, qfont
-from ui.island_parts.common import create_cached_squircle_path
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from ui.tokens import ISLAND, TYPE
+from ui.island_parts.common import cached_page, draw_text, fill_round, paint_icon, with_alpha
+from ui.island_parts.compact import glyph_kind
+
+_L = ISLAND.weather
+_C = ISLAND.color
+
+
+def _paint_big_cloud(p: QPainter, x: float, y: float, w: float, h: float, color: QColor) -> None:
+    """Three-lobe flat-bottom cloud filling the box (x, y, w, h) as one solid shape."""
+    path = QPainterPath()
+    path.setFillRule(Qt.FillRule.WindingFill)
+    path.addRoundedRect(QRectF(x, y + h * 0.40, w, h * 0.60), h * 0.30, h * 0.30)
+    path.addEllipse(QPointF(x + w * 0.27, y + h * 0.56), h * 0.30, h * 0.30)
+    path.addEllipse(QPointF(x + w * 0.52, y + h * 0.43), h * 0.43, h * 0.43)
+    path.addEllipse(QPointF(x + w * 0.76, y + h * 0.60), h * 0.27, h * 0.27)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    p.drawPath(path)
+
+
+def _paint_big_sun(p: QPainter, cx: float, cy: float, d: float, color: QColor, rays: tuple) -> None:
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    p.drawEllipse(QPointF(cx, cy), d / 2.0, d / 2.0)
+    p.setPen(QPen(color, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    r0, r1 = d / 2.0 + 3.0, d / 2.0 + 7.4
+    for deg in rays:
+        a = math.radians(deg)
+        p.drawLine(QPointF(cx + math.cos(a) * r0, cy + math.sin(a) * r0),
+                   QPointF(cx + math.cos(a) * r1, cy + math.sin(a) * r1))
+
+
+def paint_condition_icon(p: QPainter, kind: str, color: QColor) -> None:
+    """Large vector condition icon in the weather icon box (own drawing; one accent colour as in the reference)."""
+    ix, iy = _L.icon_x, _L.icon_y
+    cx, cy, cw, ch = _L.cloud_x, _L.cloud_y, _L.cloud_w, _L.cloud_h
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    sun_cx, sun_cy = ix + _L.sun_d / 2.0, iy + _L.sun_d / 2.0 + 0.4
+    if kind == "partly":
+        _paint_big_sun(p, sun_cx, sun_cy, _L.sun_d, color, (180.0, 225.0, 270.0, 315.0))
+        _paint_big_cloud(p, cx, cy, cw, ch, color)
+    elif kind == "sun":
+        _paint_big_sun(p, ix + 27.0, iy + 17.0, 20.0, color, tuple(range(0, 360, 45)))
+    elif kind == "night":
+        moon = QPainterPath()
+        moon.addEllipse(QPointF(ix + 27.0, iy + 17.2), 14.0, 14.0)
+        cut = QPainterPath()
+        cut.addEllipse(QPointF(ix + 34.0, iy + 12.0), 12.0, 12.0)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawPath(moon.subtracted(cut))
+    elif kind == "fog":
+        p.setPen(QPen(color, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        for yy, x0, x1 in ((iy + 6.0, 6.0, 48.0), (iy + 17.0, 1.5, 53.0), (iy + 28.0, 10.0, 44.0)):
+            p.drawLine(QPointF(ix + x0, yy), QPointF(ix + x1, yy))
+    else:
+        top = cy - 7.0 if kind in ("rain", "snow", "storm") else cy - 3.0
+        _paint_big_cloud(p, ix + 7.0, top - 4.0, 41.0, 25.0, color)
+        if kind == "rain":
+            p.setPen(QPen(color, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for x in (ix + 18.0, ix + 28.0, ix + 38.0):
+                p.drawLine(QPointF(x, iy + 28.0), QPointF(x - 3.0, iy + 34.0))
+        elif kind == "snow":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            for x in (ix + 18.0, ix + 28.0, ix + 38.0):
+                p.drawEllipse(QPointF(x, iy + 31.0), 2.2, 2.2)
+        elif kind == "storm":
+            bolt = QPainterPath()
+            bolt.moveTo(ix + 30.0, iy + 23.0)
+            bolt.lineTo(ix + 22.0, iy + 31.0)
+            bolt.lineTo(ix + 27.0, iy + 31.0)
+            bolt.lineTo(ix + 24.0, iy + 38.0)
+            bolt.lineTo(ix + 34.0, iy + 28.5)
+            bolt.lineTo(ix + 29.0, iy + 28.5)
+            bolt.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            p.drawPath(bolt)
+    p.restore()
+
+
+def format_updated_ago(updated_at: Optional[float], now: float) -> str:
+    """'Updated 2h ago' style age of the weather sample ('' when unknown)."""
+    if updated_at is None:
+        return ""
+    age = max(0.0, now - float(updated_at))
+    if age < 90.0:
+        return "Updated just now"
+    if age < 3600.0:
+        return f"Updated {int(age // 60)}m ago"
+    if age < 86400.0:
+        return f"Updated {int(age // 3600)}h ago"
+    return f"Updated {int(age // 86400)}d ago"
 
 
 class WeatherPageMixin:
-    """Weather card renderer, vector weather glyphs and temperature formatting (verbatim move from island.py).
-    Methods only; all state lives on the AppleDynamicIsland instance."""
+    """Weather card renderer and temperature formatting. Methods only; all state lives on the island instance."""
 
     def format_temp(self, temp_val: float) -> str:
         cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
@@ -30,228 +131,69 @@ class WeatherPageMixin:
 
         return f"{int(round(temp_val))}°"
 
-    def _draw_weather_tile_icon(self, p: QPainter, icon_type: str, cx: float, cy: float, size: float, color: QColor) -> None:
-        """Renders muted vector icon for weather metric tiles (wind, feels like, humidity)."""
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    def _wind_uses_mph(self) -> bool:
+        """island_weather_units: celsius -> km/h, fahrenheit -> mph, auto -> follow the temperature symbol."""
+        cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        units = str(getattr(cfg, "island_weather_units", "auto")).lower()
+        if units == "fahrenheit":
+            return True
+        if units == "celsius":
+            return False
+        return getattr(self, "weather_unit_symbol", None) == "°F"
 
-        if icon_type == "wind":
-            # Stylized wind gust streaks
-            pen = QPen(color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-            p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawLine(QPointF(cx - 6.0, cy - 3.0), QPointF(cx + 3.0, cy - 3.0))
-            p.drawLine(QPointF(cx - 4.0, cy + 2.5), QPointF(cx + 6.0, cy + 2.5))
-            p.drawArc(QRectF(cx + 1.0, cy - 6.0, 5.0, 5.0), 0, 180 * 16)
-        elif icon_type == "feels_like":
-            # Thermometer glyph
-            pen = QPen(color, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-            p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(QRectF(cx - 2.0, cy - 6.0, 4.0, 7.5), 1.5, 1.5)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(color))
-            p.drawEllipse(QPointF(cx, cy + 3.5), 3.2, 3.2)
-        elif icon_type == "humidity":
-            # Droplet glyph
-            path = QPainterPath()
-            path.moveTo(cx, cy - 6.0)
-            path.cubicTo(cx - 4.5, cy - 1.0, cx - 4.0, cy + 4.5, cx, cy + 4.5)
-            path.cubicTo(cx + 4.0, cy + 4.5, cx + 4.5, cy - 1.0, cx, cy - 6.0)
-            path.closeSubpath()
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(color))
-            p.drawPath(path)
+    def _weather_strings(self, now: float) -> tuple:
+        """Displayed strings (also the cache key): (city, temp, condition, kind, wind, wind_deg, feels, hum, updated)."""
+        kmh = getattr(self, "weather_wind_kmh", None)
+        if kmh is None:
+            wind = "--"
+        elif self._wind_uses_mph():
+            wind = f"{int(round(float(kmh) / 1.609344))} mph"
+        else:
+            wind = f"{int(round(float(kmh)))} km/h"
+        deg = getattr(self, "weather_wind_dir_deg", None)
+        deg = None if (kmh is None or deg is None) else int(round(float(deg))) % 360
+        feels = getattr(self, "weather_feels_like", None)
+        hum = getattr(self, "weather_humidity", None)
+        updated = ""
+        if getattr(self, "weather_stale", False):
+            updated = format_updated_ago(getattr(self, "weather_updated_at", None), now)
+        return (str(self.weather_city or ""), self.format_temp(self.weather_temp), str(self.weather_condition or ""),
+                glyph_kind(self.weather_icon), wind, deg,
+                "--" if feels is None else self.format_temp(feels),
+                "--" if hum is None else f"{int(round(float(hum)))}%", updated)
 
-        p.restore()
+    @staticmethod
+    def _paint_weather_content(p: QPainter, s: tuple) -> None:
+        city, temp, cond, kind, wind, deg, feels, hum, updated = s
+        draw_text(p, city, _L.city_x, _L.city_baseline, TYPE.weather_city, _C.label)
+        paint_condition_icon(p, kind, _C.accent)
+        draw_text(p, temp, _L.temp_x, _L.temp_baseline, TYPE.weather_temp, _C.value)
+        draw_text(p, cond, _L.cond_x, _L.cond_baseline, TYPE.weather_cond, _C.value, max_w=_L.div_cx - _L.cond_x - 10.0)
+        if updated:
+            draw_text(p, updated, _L.cond_x, _L.updated_baseline, TYPE.weather_city, _C.label)
+        p.fillRect(QRectF(_L.div_cx - _L.div_w / 2.0, _L.div_y, _L.div_w, _L.div_h), _C.divider)
+
+        icon_col = with_alpha(_C.accent, _L.tile_icon_alpha)
+        tiles = (("Wind", "wind", wind), ("Feels Like", "thermo", feels), ("Humidity", "drop", hum))
+        for (label, icon, value), ty in zip(tiles, _L.tile_ys):
+            fill_round(p, QRectF(_L.tile_x, ty, _L.tile_w, _L.tile_h), _L.tile_radius, _C.tile_fill)
+            cy = ty + (_L.tile_wind_cy if icon == "wind" else _L.tile_icon_cy)
+            paint_icon(p, icon, _L.tile_x + _L.tile_icon_x + 6.5, cy, 14.0, icon_col, stroke=1.7)
+            tx = _L.tile_x + _L.tile_text_x
+            avail = _L.tile_w - _L.tile_text_x - 10.0
+            draw_text(p, label, tx, ty + _L.tile_label_baseline, TYPE.tile_label, _C.label)
+            adv = draw_text(p, value, tx, ty + _L.tile_value_baseline, TYPE.weather_value, _C.value, max_w=avail)
+            if icon == "wind" and deg is not None:
+                a = _L.arrow_size
+                paint_icon(p, "arrow_up", tx + adv + _L.arrow_gap + a / 2.0, ty + _L.tile_value_baseline - 4.6, a,
+                           _C.value, stroke=1.9, rotate_deg=float(deg))
 
     def _draw_weather_card(self, p: QPainter, w: float, h: float,
-                          now: float, t: float, dark: bool,
-                          primary: QColor, secondary: QColor, accent: QColor) -> None:
-        """
-        Expanded Weather Card (390x188 px):
-        - Left side: City name in uppercase gray (#8E9094, e.g. "AHMEDABAD"), clean weather vector icon
-          + large temperature (heavy numerals #F5F5F7), condition text (semibold).
-        - Vertical hairline divider.
-        - Right side: Three stacked tiles (radius ~17px, fill #FFFFFF17, border 1px #FFFFFF0A):
-          1. Wind: speed + direction arrow, label "WIND", muted icon.
-          2. Feels Like: temperature, label "FEELS LIKE", muted icon.
-          3. Humidity: percentage, label "HUMIDITY", muted icon.
-        - Attribution footnote at bottom: "Weather data by Open-Meteo.com" (9 pt, #55585C).
-        """
+                           now: float, t: float, dark: bool,
+                           primary: QColor, secondary: QColor, accent: QColor) -> None:
+        """Expanded Weather card (390 x 188): cached content layer, one drawPixmap per frame."""
         scale = self._get_size_scale()
-
-        # ── 1. Left Side: Hero City & Temp ────────────────────────────────
-        lx = 22.0 * scale
-        left_w = 172.0 * scale
-
-        # City name in uppercase gray (#8E9094)
-        city_str = (self.weather_city or "AHMEDABAD").upper()
-        city_font = qfont(TYPE.footnote)
-        city_font.setPointSize(int(11 * scale))
-        city_font.setWeight(QFont.Weight.DemiBold)
-        p.setFont(city_font)
-        p.setPen(QColor("#8E9094"))
-        p.drawText(QRectF(lx, 22.0 * scale, left_w, 18.0 * scale), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, city_str)
-
-        # Weather Vector Icon + Large Heavy Temperature Numerals
-        icon_cx = lx + 22.0 * scale
-        icon_cy = 68.0 * scale
-        self._draw_weather_glyph(p, self.weather_icon, icon_cx, icon_cy, 36.0 * scale, dark)
-
-        temp_str = self.format_temp(self.weather_temp)
-        temp_font = QFont("Segoe UI Variable Display", int(36 * scale), QFont.Weight.Bold)
-        temp_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        p.setFont(temp_font)
-        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-        p.drawText(QRectF(lx + 48.0 * scale, 44.0 * scale, left_w - 48.0 * scale, 48.0 * scale),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, temp_str)
-
-        # Condition text (semibold)
-        cond_font = qfont(TYPE.body)
-        cond_font.setPointSize(int(13 * scale))
-        cond_font.setWeight(QFont.Weight.DemiBold)
-        p.setFont(cond_font)
-        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-        p.drawText(QRectF(lx, 98.0 * scale, left_w, 20.0 * scale),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.weather_condition)
-
-        # Attribution footnote at bottom: "Weather data by Open-Meteo.com" (9 pt, #55585C)
-        foot_font = qfont(TYPE.caption_2)
-        foot_font.setPointSize(int(8.5 * scale))
-        p.setFont(foot_font)
-        p.setPen(QColor("#55585C"))
-        p.drawText(QRectF(lx, 150.0 * scale, w - lx - 30.0 * scale, 18.0 * scale),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "Weather data by Open-Meteo.com")
-
-        # ── 2. Vertical Hairline Divider ──────────────────────────────────
-        div_x = lx + left_w + 10.0 * scale
-        p.setPen(QPen(QColor(255, 255, 255, 18 if dark else 35), 1.0))
-        p.drawLine(QPointF(div_x, 22.0 * scale), QPointF(div_x, 142.0 * scale))
-
-        # ── 3. Right Side: Three Stacked Tiles ────────────────────────────
-        rx = div_x + 12.0 * scale
-        rw = (w - 28.0 * scale) - rx  # Leave space before page dots
-        tile_h = 36.0 * scale
-        tile_gap = 6.0 * scale
-        tile_r = 17.0 * scale
-
-        tiles = [
-            ("wind", "WIND", f"{int(round(getattr(self, 'weather_wind_speed', 12.0)))} mph {getattr(self, 'weather_wind_direction', 'NW')} ↖"),
-            ("feels_like", "FEELS LIKE", self.format_temp(self.weather_feels_like)),
-            ("humidity", "HUMIDITY", f"{int(round(getattr(self, 'weather_humidity', 48)))}%"),
-        ]
-
-        label_font = qfont(TYPE.caption_2)
-        label_font.setPointSize(int(8 * scale))
-        label_font.setWeight(QFont.Weight.DemiBold)
-
-        val_font = qfont(TYPE.subheadline)
-        val_font.setPointSize(int(11 * scale))
-        val_font.setWeight(QFont.Weight.Bold)
-
-        for idx, (icon_type, label, val_text) in enumerate(tiles):
-            ty = 20.0 * scale + idx * (tile_h + tile_gap)
-            tr = QRectF(rx, ty, rw, tile_h)
-            t_path = create_cached_squircle_path(tr, tile_r)
-
-            # Inset tile fill #FFFFFF17 and border 1px #FFFFFF0A
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(255, 255, 255, 23 if dark else 55)))
-            p.drawPath(t_path)
-            p.strokePath(t_path, QPen(QColor(255, 255, 255, 10 if dark else 25), 1.0))
-
-            # Muted icon on left
-            icx = rx + 15.0 * scale
-            icy = ty + tile_h / 2.0
-            self._draw_weather_tile_icon(p, icon_type, icx, icy, 14.0 * scale, QColor("#8E9094"))
-
-            # Label (e.g. "WIND", "FEELS LIKE", "HUMIDITY")
-            p.setFont(label_font)
-            p.setPen(QColor("#8E9094"))
-            p.drawText(QRectF(rx + 28.0 * scale, ty + 4.0 * scale, rw - 32.0 * scale, 12.0 * scale),
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
-
-            # Value text
-            p.setFont(val_font)
-            p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-            p.drawText(QRectF(rx + 28.0 * scale, ty + 16.0 * scale, rw - 32.0 * scale, 16.0 * scale),
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, val_text)
-
-    def _draw_weather_glyph(self, p: QPainter, icon_name: str, cx: float, cy: float, size: float, dark: bool) -> None:
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        if icon_name in ("sunny", "clear"):
-            # Golden sun disc + radiating rays
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor("#FF9F0A")))
-            p.drawEllipse(QPointF(cx, cy), size * 0.30, size * 0.30)
-            p.setPen(QPen(QColor("#FF9F0A"), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            for i in range(8):
-                ang = i * (math.pi / 4.0)
-                r0 = size * 0.38
-                r1 = size * 0.50
-                p.drawLine(QPointF(cx + math.cos(ang) * r0, cy + math.sin(ang) * r0),
-                           QPointF(cx + math.cos(ang) * r1, cy + math.sin(ang) * r1))
-
-        elif icon_name in ("cloudy", "overcast"):
-            # Clean Apple cloud squircle
-            self._draw_cloud_shape(p, cx, cy, size * 0.9, QColor("#8E8E93" if dark else "#AEAEB2"))
-
-        elif icon_name in ("partly_cloudy", "cloud_sun"):
-            # Sun peeking out behind top-right of cloud
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor("#FF9F0A")))
-            p.drawEllipse(QPointF(cx + size * 0.20, cy - size * 0.20), size * 0.24, size * 0.24)
-            self._draw_cloud_shape(p, cx - size * 0.08, cy + size * 0.08, size * 0.82,
-                                   QColor("#E5E5EA" if dark else "#8E8E93"))
-
-        elif icon_name in ("rain", "drizzle"):
-            # Cloud + 3 diagonal rain streaks
-            self._draw_cloud_shape(p, cx, cy - size * 0.12, size * 0.80, QColor("#8E8E93"))
-            p.setPen(QPen(QColor("#64D2FF"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            for dx in [-size * 0.22, 0.0, size * 0.22]:
-                p.drawLine(QPointF(cx + dx, cy + size * 0.14),
-                           QPointF(cx + dx - size * 0.10, cy + size * 0.38))
-
-        elif icon_name in ("snow", "flurries"):
-            # Cloud + 3 snow dots
-            self._draw_cloud_shape(p, cx, cy - size * 0.12, size * 0.80, QColor("#8E8E93"))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor("#E0F7FA")))
-            for dx in [-size * 0.22, 0.0, size * 0.22]:
-                p.drawEllipse(QPointF(cx + dx, cy + size * 0.26), size * 0.08, size * 0.08)
-
-        elif icon_name in ("thunderstorm", "storm"):
-            # Storm cloud + golden lightning bolt
-            self._draw_cloud_shape(p, cx, cy - size * 0.14, size * 0.80, QColor("#636366"))
-            bolt = QPainterPath()
-            bolt.moveTo(cx + size * 0.04, cy + size * 0.02)
-            bolt.lineTo(cx - size * 0.08, cy + size * 0.20)
-            bolt.lineTo(cx + size * 0.02, cy + size * 0.20)
-            bolt.lineTo(cx - size * 0.06, cy + size * 0.44)
-            bolt.lineTo(cx + size * 0.10, cy + size * 0.18)
-            bolt.lineTo(cx, cy + size * 0.18)
-            bolt.closeSubpath()
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor("#FFD60A")))
-            p.drawPath(bolt)
-
-        else:
-            self._draw_cloud_shape(p, cx, cy, size * 0.9, QColor("#8E8E93"))
-
-        p.restore()
-
-    def _draw_cloud_shape(self, p: QPainter, cx: float, cy: float, size: float, color: QColor) -> None:
-        """Renders an Apple-grade multi-lobe vector cloud."""
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(color))
-        w = size * 0.88
-        h = size * 0.44
-        # Base pill
-        p.drawRoundedRect(QRectF(cx - w / 2.0, cy - h / 4.0, w, h), h / 2.0, h / 2.0)
-        # Left lobe
-        p.drawEllipse(QPointF(cx - w * 0.20, cy - h * 0.35), h * 0.65, h * 0.65)
-        # Main center-right lobe
-        p.drawEllipse(QPointF(cx + w * 0.12, cy - h * 0.45), h * 0.85, h * 0.85)
+        s = self._weather_strings(now)
+        pix = cached_page(self, "weather", s, _L.w, _L.h, getattr(self, "_paint_dpr", 1.0), scale,
+                          lambda cp: self._paint_weather_content(cp, s))
+        p.drawPixmap(QPointF(0.0, 0.0), pix)

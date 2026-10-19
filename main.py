@@ -227,6 +227,7 @@ def post_worker_health(overlay, state, reason=""):
 
 
 HARDWARE_PAGES = ("hardware", "hardware_grid", "hardware_strip")
+FPS_ONLY_PAGES = ("jarvis", "jarvis_card")  # island passes "jarvis"; card alias kept for safety
 
 
 def tracking_fps(tracker):
@@ -247,8 +248,14 @@ def compact_shows_hardware(cfg):
     return False
 
 
+def _bits(bytes_per_sec):
+    """Bytes/s -> true bits/s (x8); None passes through."""
+    return None if bytes_per_sec is None else bytes_per_sec * 8
+
+
 class HardwareFeed:
-    """Runs the HardwareAdapter only while hardware data is visible and posts overlay 'hardware_state' once per sample."""
+    """Runs the HardwareAdapter only while hardware data is visible and posts overlay 'hardware_state' once per sample.
+    Contract: net_up_bps / net_down_bps are BITS per second (adapter bytes/s x 8). On the JARVIS page only fps is posted (1 Hz)."""
 
     def __init__(self, ctx, overlay, adapter=None):
         from hardware_adapter import get_hardware_adapter
@@ -256,6 +263,14 @@ class HardwareFeed:
         self.overlay = overlay
         self.adapter = adapter or get_hardware_adapter()
         self._log = _jlog.get_logger("hardware")
+        self._fps_stop = threading.Event()
+        self._fps_thread = None
+
+    def _fps_loop(self):
+        """1 Hz hardware_state with ONLY fps while the JARVIS page is visible (no psutil/NVML sampling)."""
+        while not self._fps_stop.wait(1.0):
+            if self.ctx.visible_page() in FPS_ONLY_PAGES and self.adapter.is_paused():
+                self.overlay.post("hardware_state", fps=tracking_fps(self.ctx.tracker))
 
     def wanted(self):
         return (self.ctx.visible_page() in HARDWARE_PAGES) or compact_shows_hardware(self.ctx.cfg)
@@ -265,6 +280,8 @@ class HardwareFeed:
         self.adapter.add_listener(self._on_metrics)
         self.adapter.start()
         self.ctx.add_page_listener(lambda _page: self.update())
+        self._fps_thread = threading.Thread(target=self._fps_loop, name="HardwareFpsFeed", daemon=True)
+        self._fps_thread.start()
         self.update()
 
     def update(self):
@@ -277,6 +294,7 @@ class HardwareFeed:
             self.adapter.pause()
 
     def stop(self):
+        self._fps_stop.set()
         self.adapter.remove_listener(self._on_metrics)
         self.adapter.stop(timeout=1.0)
 
@@ -286,7 +304,7 @@ class HardwareFeed:
         self.overlay.post(
             "hardware_state",
             cpu=m.cpu_percent, ram_used_gb=m.ram_used_gb, ram_total_gb=m.ram_total_gb, ram_pct=m.ram_percent,
-            gpu=m.gpu_percent, net_up_bps=m.net_up_bytes_sec, net_down_bps=m.net_down_bytes_sec,
+            gpu=m.gpu_percent, net_up_bps=_bits(m.net_up_bytes_sec), net_down_bps=_bits(m.net_down_bytes_sec),
             disk_pct=m.disk_percent, fps=tracking_fps(self.ctx.tracker),
         )
 

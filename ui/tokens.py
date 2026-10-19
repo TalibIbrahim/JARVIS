@@ -791,6 +791,74 @@ class CalendarLayout:
     today_dy = 1.4              # reference circle centre sits 1.4 px below the digit centre
 
 
+class WeatherLayout:
+    """Weather card (sheet 3.3). Baselines derive from cap tops + cap heights; all in card-origin 1x px."""
+    w, h = 390.0, 188.0
+    city_x, city_baseline = 26.7, 39.1
+    icon_x, icon_y, icon_w, icon_h = 25.7, 59.6, 54.5, 34.4
+    sun_d = 17.5                                  # sun disc diameter (rays extend outside the icon box)
+    cloud_x, cloud_y, cloud_w, cloud_h = 40.4, 69.4, 40.1, 24.6
+    temp_x, temp_baseline = 81.7, 95.7
+    cond_x, cond_baseline = 27.2, 135.3
+    updated_baseline = 151.4                      # "Updated 2h ago" (stale only)
+    div_cx, div_y, div_w, div_h = 206.3, 35.0, 1.0, 118.8
+    tile_x, tile_w, tile_h, tile_radius = 220.0, 148.0, 41.1, 9.4
+    tile_ys = (25.7, 74.0, 122.3)
+    tile_icon_x = 10.0                            # icon box left (12 wide)
+    tile_icon_cy = 14.8                           # icon centre from the tile top (wind sits on the label row)
+    tile_wind_cy = 11.4
+    tile_text_x = 30.8
+    tile_label_baseline, tile_value_baseline = 15.1, 31.8
+    tile_icon_alpha = 0.55
+    arrow_size = 10.5                             # wind direction arrow box
+    arrow_gap = 4.0
+
+
+class HardwareGridLayout:
+    """Hardware 2 x 3 grid (sheet 3.5)."""
+    w, h = 390.0, 188.0
+    title_x, title_baseline = 25.0, 27.6
+    tile_w, tile_h, tile_radius = 165.5, 38.9, 8.8
+    col_x = (24.4, 199.4)
+    row_y0, row_pitch = 38.9, 45.1
+    area_bottom = 168.3                           # tile area bottom (19.7 pad) used when rows are hidden
+    icon_cx, icon_cy, icon_d = 15.7, 14.8, 17.5   # icon centre from the tile top-left
+    text_x = 30.7
+    label_baseline, value_baseline = 11.3, 27.0
+    bar_x, bar_w, bar_h, bar_bottom = 30.7, 125.0, 3.0, 3.8
+
+
+class HardwareStripLayout:
+    """Hardware strip (sheet 3.6): stadium, FPS tile + CPU / RAM / GPU / DISK tiles."""
+    w, h = 446.0, 69.0
+    pad_l = 12.5
+    tile_y, tile_h, tile_radius = 12.0, 47.0, 9.3
+    fps_w, tile_w, gap = 90.3, 75.9, 7.0
+    icon_cx, icon_cy, icon_d = 15.5, 15.4, 16.0
+    text_x = 28.8
+    label_baseline, value_baseline, fps_value_baseline = 12.1, 31.3, 35.0
+    bar_x, bar_right_pad, bar_h, bar_bottom = 12.5, 7.0, 3.0, 5.0
+
+
+class JarvisLayout:
+    """JARVIS page in the weather family. Pause control is >= 46 px tall (dwell target)."""
+    w, h = 390.0, 188.0
+    pause_h = 48.0                                # drawn and hit-tested control height
+    # glyph + word, divider, right column
+    b_ring_cx, b_ring_cy, b_ring_d = 43.0, 76.0, 34.0
+    b_word_x, b_word_baseline = 68.0, 87.0
+    b_cap_x, b_cap_baseline = 26.7, 39.1          # "Assistant" caption (city slot)
+    b_sub_x, b_sub_baseline = 27.2, 135.3
+    div_x = 206.3
+    # shared right column
+    col_x, col_w, tile_h, tile_radius = 220.0, 148.0, 41.1, 9.4
+    col_gap = 7.2
+    tile_text_x = 30.8
+    tile_label_baseline, tile_value_baseline = 15.1, 31.8
+    word_b = TypeToken(_ISLAND_DISPLAY, 28, 700)
+    result_alpha = 0.7
+
+
 class DotsLayout:
     d, d_active = 5.0, 5.6
     pitch = 8.2
@@ -806,6 +874,10 @@ class IslandTokens:
     pill = PillLayout
     media = MediaLayout
     calendar = CalendarLayout
+    weather = WeatherLayout
+    hardware = HardwareGridLayout
+    strip = HardwareStripLayout
+    jarvis = JarvisLayout
     dots = DotsLayout
     corner_smoothing = CORNER_SMOOTHING
     shell_pad = SHELL_PAD

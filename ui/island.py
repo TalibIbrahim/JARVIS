@@ -231,7 +231,7 @@ class AppleDynamicIsland(
         self.weather_city: str = "Ahmedabad"
         self.weather_wind_speed: float = 12.0
         self.weather_wind_direction: str = "NW"
-        self.weather_humidity: int = 48
+        self.weather_humidity: Optional[int] = None         # real data (weather_state); None -> "--"
         self.weather_wind_kmh: Optional[float] = None       # real data (weather_state); None = not received yet
         self.weather_wind_dir_deg: Optional[float] = None
         self.weather_stale: bool = False
@@ -1632,15 +1632,7 @@ class AppleDynamicIsland(
         scale = self._get_size_scale()
 
         if self.expanded_card in ("jarvis", "jarvis_card"):
-            lx = 22.0 * scale
-            content_w = (w - 28.0 * scale) - lx
-            ty1 = 38.0 * scale
-            th1 = 66.0 * scale
-            gap = 8.0 * scale
-            status_w = 202.0 * scale
-            btn_w = content_w - status_w - gap
-            btn_x = lx + status_w + gap
-            if QRectF(btn_x, ty1, btn_w, th1).contains(pos):
+            if self._jarvis_pause_rect().contains(pos):
                 return "jarvis_toggle_tracking"
             return None
 
@@ -1893,7 +1885,7 @@ class AppleDynamicIsland(
                      IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS):
             tok = float(RADIUS.expanded_card)
         elif state == IslandState.CARD_HARDWARE_STRIP:
-            tok = float(RADIUS.hardware_strip)
+            tok = h / 2.0 / max(0.1, scale)        # sheet 3.6: the strip is a full stadium (r = H / 2)
         elif state in (IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER):
             tok = 36.0
         elif state == IslandState.IDLE:
@@ -1950,12 +1942,9 @@ class AppleDynamicIsland(
         else:
             squircle = create_cached_squircle_path(QRectF(0.5, -16.0, w - 1.0, h + 15.5), max(0.0, r - 0.5))
 
-        # 2. Soft edge glow pulse in WAKE or CARD_SENDING / CARD_JARVIS
+        # 2. Soft edge glow pulse in WAKE or CARD_SENDING (the JARVIS page uses the plain shell like its sibling pages)
         glow_val = self.spring_glow.value
-        if state == IslandState.CARD_JARVIS:
-            glow_pen = QPen(QColor(0, 229, 255, 75 if dark else 90), 2.0)
-            p.strokePath(squircle, glow_pen)
-        elif state == IslandState.CARD_SENDING and not reduce:
+        if state == IslandState.CARD_SENDING and not reduce:
             pulse_a = int(60 + 50 * math.sin(t * 6.0))
             glow_pen = QPen(QColor(0, 229, 255, pulse_a), 2.2)
             p.strokePath(squircle, glow_pen)
@@ -2053,35 +2042,38 @@ class AppleDynamicIsland(
 
         CYAN = COLOR.HUD_ONLY.neon_cyan
         GOLD = COLOR.HUD_ONLY.stark_gold
+        # Assistant-state text: primary = white (#FAFAFA), secondary / meta = label grey (never blue)
+        WHITE = ISLAND.color.value
+        GREY = ISLAND.color.label
 
         # ── State content routing ─────────────────────────────────────────
 
         if state == IslandState.WAKE:
-            self._draw_wake(p, w, h, cy, t, dark, primary, accent, CYAN)
+            self._draw_wake(p, w, h, cy, t, dark, WHITE, accent, CYAN)
 
         elif state == IslandState.LISTENING:
-            self._draw_listening(p, w, h, cy, t, now, dark, primary, accent, reduce)
+            self._draw_listening(p, w, h, cy, t, now, dark, WHITE, accent, reduce)
 
         elif state == IslandState.THINKING:
-            self._draw_thinking(p, w, h, cy, t, dark, primary, accent, CYAN, now=now)
+            self._draw_thinking(p, w, h, cy, t, dark, WHITE, accent, CYAN, now=now)
 
         elif state == IslandState.CARD_SENDING:
-            self._draw_sending_indicator(p, w, h, cy, t, dark, primary, accent, CYAN)
+            self._draw_sending_indicator(p, w, h, cy, t, dark, WHITE, accent, CYAN)
 
         elif state in (IslandState.RESULT, IslandState.CARD_RESULT):
-            self._draw_result(p, w, h, cy, dark, primary)
+            self._draw_result(p, w, h, cy, dark, WHITE)
 
         elif state == IslandState.ERROR:
-            self._draw_error(p, cy, primary, dark)
+            self._draw_error(p, cy, WHITE, dark)
 
         elif state in (IslandState.PROMPT, IslandState.SPEAKING):
-            self._draw_prompt_speaking(p, w, h, cy, t, now, state, dark, primary, accent, CYAN)
+            self._draw_prompt_speaking(p, w, h, cy, t, now, state, dark, WHITE, accent, CYAN)
 
         elif state == IslandState.GESTURE:
-            self._draw_gesture(p, cy, primary, GOLD)
+            self._draw_gesture(p, cy, WHITE, GOLD)
 
         elif state == IslandState.TRACKING:
-            self._draw_tracking(p, w, h, cy, dark, primary, secondary, accent, state)
+            self._draw_tracking(p, w, h, cy, dark, WHITE, GREY, accent, state)
 
         elif state == IslandState.CARD_DISAMBIGUATE:
             self._draw_disambiguation_card(p, w, h, now, t, dark, primary, secondary, accent)
@@ -2421,7 +2413,7 @@ class AppleDynamicIsland(
         sub_font = qfont(TYPE.caption_1)
         sub_font.setWeight(QFont.Weight.Medium)
         p.setFont(sub_font)
-        p.setPen(CYAN)
+        p.setPen(ISLAND.color.label)
         p.drawText(int(text_x), int(cy + 11), "Ready for directive")
 
     def _draw_listening(self, p: QPainter, w: float, h: float, cy: float,
@@ -2435,7 +2427,7 @@ class AppleDynamicIsland(
         title_font = qfont(TYPE.caption_1)
         title_font.setWeight(QFont.Weight.DemiBold)
         p.setFont(title_font)
-        p.setPen(accent)
+        p.setPen(ISLAND.color.label)
         title = "Processing..." if self.is_transcribing else "Listening..."
         p.drawText(int(text_x), int(cy - 3), title)
 
@@ -2446,7 +2438,7 @@ class AppleDynamicIsland(
         if ui_cancel_hint and elapsed > 3.0:
             hint_font = qfont(TYPE.caption_2)
             p.setFont(hint_font)
-            hint_col = QColor(T.color.secondary_label.resolve(dark))
+            hint_col = QColor(ISLAND.color.label)
             if not reduce:
                 hint_col.setAlphaF(min(1.0, (elapsed - 3.0) / 0.35))
             p.setPen(hint_col)
@@ -2615,7 +2607,7 @@ class AppleDynamicIsland(
     def _draw_partial_transcript(self, p: QPainter, x: float, y: float, max_w: float,
                                  now: float, dark: bool, primary: QColor, reduce: bool) -> None:
         if not self._transcript_words:
-            p.setPen(T.color.secondary_label.resolve(dark))
+            p.setPen(ISLAND.color.label)
             p.drawText(int(x), int(y), "Jarvis is ready")
             return
 
@@ -2669,7 +2661,7 @@ class AppleDynamicIsland(
         top_font = qfont(TYPE.callout)
         top_font.setWeight(QFont.Weight.DemiBold)
         p.setFont(top_font)
-        p.setPen(accent)
+        p.setPen(primary)
         p.drawText(int(text_x), int(cy - 2), "Jarvis")
 
         cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
@@ -2687,14 +2679,14 @@ class AppleDynamicIsland(
 
         sub_font = qfont(TYPE.caption_1)
         p.setFont(sub_font)
-        p.setPen(primary)
+        p.setPen(ISLAND.color.label)
         p.drawText(int(text_x), int(cy + 11), thinking_label)
 
         # Cancellation Hint (> 3.0s): footnote/caption style
         if ui_cancel_hint and elapsed > 3.0:
             hint_font = qfont(TYPE.caption_2)
             p.setFont(hint_font)
-            hint_col = QColor(T.color.secondary_label.resolve(dark))
+            hint_col = QColor(ISLAND.color.label)
             if not reduce:
                 hint_col.setAlphaF(min(1.0, (elapsed - 3.0) / 0.35))
             p.setPen(hint_col)
@@ -2845,7 +2837,7 @@ class AppleDynamicIsland(
         top_font = qfont(TYPE.caption_1)
         top_font.setWeight(QFont.Weight.DemiBold)
         p.setFont(top_font)
-        p.setPen(CYAN if dark else accent)
+        p.setPen(primary)
 
         prompt_disp = self.user_prompt.strip()
         is_typing = (self.prompt_type_index < len(self.target_prompt)) or self.is_live_speech

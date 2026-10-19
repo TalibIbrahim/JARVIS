@@ -193,12 +193,6 @@ class PagingMixin:
             if state == IslandState.CARD_MEDIA:
                 for _bid, tid, bcx, bcy, hit_r in self._media_button_geometry():
                     add(bcx - hit_r, bcy - hit_r, 2 * hit_r, 2 * hit_r, tid)
-            elif state == IslandState.CARD_JARVIS:
-                lx = 22.0 * scale
-                content_w = (w - 28.0 * scale) - lx
-                gap = 8.0 * scale
-                status_w = 202.0 * scale
-                add(lx + status_w + gap, 38.0 * scale, content_w - status_w - gap, 66.0 * scale, "jarvis_pause")
             elif state == IslandState.CARD_TIMER:
                 cy_btn, bw, bh = 126.0 * scale, 70.0 * scale, 22.0 * scale
                 add(w / 2.0 - 44.0 * scale - bw / 2.0, cy_btn - bh / 2.0, bw, bh, "timer_cancel")

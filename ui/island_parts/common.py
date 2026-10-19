@@ -10,11 +10,12 @@ from collections import OrderedDict
 from enum import auto, Enum
 from typing import Optional
 
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import (QBrush, QColor, QFontMetricsF, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+                           QRadialGradient)
 
 from ui.components import continuous_path_cached, quantize_half
-from ui.tokens import ISLAND
+from ui.tokens import ISLAND, qfont
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Continuous-corner path cache (keys quantized to 0.5 px so spring frames still hit)
@@ -327,3 +328,206 @@ _SIZE: dict[IslandState, tuple[float, float]] = {
 # damping ~0.7:   c = 2 * 0.7 * omega = 21.99
 SPRING_K_RESP04: float = 246.74
 SPRING_C_DAMP07: float = 22.00
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Page-content cache + text helpers (static layers are rendered once per content key / size / dpr and blitted)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def cached_page(owner, name: str, key: tuple, w: float, h: float, dpr: float, scale: float, paint) -> QPixmap:
+    """Pixmap of a page's content, painted by `paint(painter)` in 1x logical coords, cached on `owner` under `name`.
+
+    The cache holds one entry per page name and is rebuilt only when `key` (content + size + dpr) changes,
+    so steady-state paints are a single drawPixmap."""
+    store = owner.__dict__.setdefault("_page_pix", {})
+    full = (key, round(dpr, 3), round(scale, 3), round(w, 1), round(h, 1))
+    ent = store.get(name)
+    if ent is not None and ent[0] == full:
+        return ent[1]
+    pix = QPixmap(max(1, int(round(w * scale * dpr))), max(1, int(round(h * scale * dpr))))
+    pix.setDevicePixelRatio(dpr)
+    pix.fill(Qt.GlobalColor.transparent)
+    cp = QPainter(pix)
+    cp.setRenderHint(QPainter.RenderHint.Antialiasing)
+    cp.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    cp.scale(scale, scale)
+    paint(cp)
+    cp.end()
+    store[name] = (full, pix)
+    return pix
+
+
+def draw_text(p: QPainter, text: str, x: float, baseline: float, token, color: QColor,
+              max_w: Optional[float] = None, align: str = "left") -> float:
+    """Draw `text` at a baseline with a type token; elide to `max_w`; align left / center (x = centre) / right
+    (x = right edge). Returns the drawn advance."""
+    font = qfont(token)
+    fm = QFontMetricsF(font)
+    if max_w is not None:
+        text = fm.elidedText(text, Qt.TextElideMode.ElideRight, max_w)
+    adv = fm.horizontalAdvance(text)
+    if align == "center":
+        x -= adv / 2.0
+    elif align == "right":
+        x -= adv
+    p.setFont(font)
+    p.setPen(color)
+    p.drawText(QPointF(x, baseline), text)
+    return adv
+
+
+def fill_round(p: QPainter, rect: QRectF, radius: float, color: QColor) -> None:
+    """Continuous-corner filled rounded tile (no stroke)."""
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    p.drawPath(create_cached_squircle_path(rect, radius))
+
+
+def draw_bar(p: QPainter, x: float, y: float, w: float, h: float, ratio: float, fill: QColor,
+             track: QColor = ISLAND.color.track) -> None:
+    """Round-capped progress bar: track then fill (`ratio` 0..1)."""
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(track)
+    p.drawRoundedRect(QRectF(x, y, w, h), h / 2.0, h / 2.0)
+    fw = w * min(1.0, max(0.0, ratio))
+    if fw > 0.0:
+        fw = max(fw, h)
+        p.setBrush(fill)
+        p.drawRoundedRect(QRectF(x, y, fw, h), h / 2.0, h / 2.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Own vector icon set (Lucide / Phosphor style: 16 x 16 grid, round caps and joins, ~1.5 stroke)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _ln(path: QPainterPath, x0: float, y0: float, x1: float, y1: float) -> None:
+    path.moveTo(x0, y0)
+    path.lineTo(x1, y1)
+
+
+def _icon_path(name: str) -> tuple:
+    """(stroke path, filled path) on the 16 x 16 grid for icon `name`."""
+    s, f = QPainterPath(), QPainterPath()
+    if name == "cpu":
+        s.addRoundedRect(QRectF(3.4, 3.4, 9.2, 9.2), 2.2, 2.2)
+        s.addRoundedRect(QRectF(6.1, 6.1, 3.8, 3.8), 0.9, 0.9)
+        for k in (6.2, 9.8):
+            _ln(s, k, 1.3, k, 3.4)
+            _ln(s, k, 12.6, k, 14.7)
+            _ln(s, 1.3, k, 3.4, k)
+            _ln(s, 12.6, k, 14.7, k)
+    elif name == "ram":
+        s.addRoundedRect(QRectF(1.4, 3.6, 13.2, 7.4), 1.6, 1.6)
+        for k in (4.6, 7.0, 9.4, 11.8):
+            _ln(s, k, 11.0, k, 13.0)
+        for k in (4.6, 8.0, 11.4):
+            _ln(s, k, 6.0, k, 8.6)
+    elif name == "gpu":
+        s.addRoundedRect(QRectF(1.3, 3.8, 13.4, 8.2), 1.8, 1.8)
+        s.addEllipse(QPointF(5.7, 7.9), 2.2, 2.2)
+        _ln(s, 9.6, 6.7, 12.4, 6.7)
+        _ln(s, 9.6, 9.1, 12.4, 9.1)
+        _ln(s, 3.2, 12.0, 3.2, 13.7)
+    elif name == "disk":
+        s.addEllipse(QPointF(8.0, 4.4), 5.3, 2.2)
+        s.moveTo(2.7, 4.4)
+        s.lineTo(2.7, 11.6)
+        s.moveTo(13.3, 4.4)
+        s.lineTo(13.3, 11.6)
+        s.moveTo(2.7, 8.0)
+        s.arcTo(QRectF(2.7, 5.9, 10.6, 4.2), 180.0, 180.0)
+        s.moveTo(2.7, 11.6)
+        s.arcTo(QRectF(2.7, 9.5, 10.6, 4.2), 180.0, 180.0)
+    elif name == "net_up":
+        _ln(s, 8.0, 13.2, 8.0, 3.2)
+        s.moveTo(4.4, 6.7)
+        s.lineTo(8.0, 3.2)
+        s.lineTo(11.6, 6.7)
+    elif name == "net_down":
+        _ln(s, 8.0, 2.8, 8.0, 12.8)
+        s.moveTo(4.4, 9.3)
+        s.lineTo(8.0, 12.8)
+        s.lineTo(11.6, 9.3)
+    elif name == "gauge":
+        s.addEllipse(QPointF(8.0, 8.0), 6.3, 6.3)
+        _ln(s, 8.0, 8.0, 10.9, 5.1)
+        for ang in (200.0, 250.0, 290.0, 340.0):
+            a = math.radians(ang)
+            _ln(s, 8.0 + math.cos(a) * 4.5, 8.0 + math.sin(a) * 4.5, 8.0 + math.cos(a) * 5.2, 8.0 + math.sin(a) * 5.2)
+        f.addEllipse(QPointF(8.0, 8.0), 1.0, 1.0)
+    elif name == "wind":
+        _ln(s, 1.6, 4.6, 14.4, 4.6)
+        _ln(s, 1.6, 8.0, 11.0, 8.0)
+        _ln(s, 1.6, 11.4, 7.6, 11.4)
+    elif name == "thermo":
+        f.addRoundedRect(QRectF(6.5, 1.5, 3.0, 8.8), 1.5, 1.5)
+        f.addEllipse(QPointF(8.0, 11.7), 2.9, 2.9)
+    elif name == "drop":
+        f.moveTo(8.0, 1.4)
+        f.cubicTo(8.0, 1.4, 3.3, 6.1, 3.3, 9.7)
+        f.arcTo(QRectF(3.3, 5.3, 9.4, 9.4), 180.0, 180.0)
+        f.cubicTo(12.7, 6.1, 8.0, 1.4, 8.0, 1.4)
+        f.closeSubpath()
+    elif name == "check":
+        s.moveTo(3.2, 8.6)
+        s.lineTo(6.6, 12.0)
+        s.lineTo(12.8, 4.4)
+    elif name == "cross":
+        _ln(s, 4.0, 4.0, 12.0, 12.0)
+        _ln(s, 12.0, 4.0, 4.0, 12.0)
+    elif name == "pause":
+        f.addRoundedRect(QRectF(3.6, 2.8, 3.1, 10.4), 1.2, 1.2)
+        f.addRoundedRect(QRectF(9.3, 2.8, 3.1, 10.4), 1.2, 1.2)
+    elif name == "play":
+        f.moveTo(4.6, 3.2)
+        f.lineTo(12.4, 8.0)
+        f.lineTo(4.6, 12.8)
+        f.closeSubpath()
+    elif name == "command":
+        s.moveTo(3.2, 4.4)
+        s.lineTo(7.4, 8.0)
+        s.lineTo(3.2, 11.6)
+        _ln(s, 8.8, 12.0, 13.0, 12.0)
+    elif name == "camera":
+        s.addRoundedRect(QRectF(1.5, 4.6, 13.0, 8.6), 2.0, 2.0)
+        s.addEllipse(QPointF(8.0, 8.9), 2.4, 2.4)
+        s.moveTo(5.4, 4.6)
+        s.lineTo(6.5, 2.8)
+        s.lineTo(9.5, 2.8)
+        s.lineTo(10.6, 4.6)
+    elif name == "arrow_up":
+        # wind direction arrow (north = up; the caller rotates it)
+        _ln(s, 8.0, 14.0, 8.0, 2.4)
+        s.moveTo(3.6, 6.6)
+        s.lineTo(8.0, 2.4)
+        s.lineTo(12.4, 6.6)
+    return s, f
+
+
+_ICON_PATHS: dict = {}
+
+
+def paint_icon(p: QPainter, name: str, cx: float, cy: float, size: float, color: QColor,
+               stroke: float = 1.5, rotate_deg: float = 0.0) -> None:
+    """Draw icon `name` centred on (cx, cy) in a `size` x `size` box. Used while rendering cached page layers."""
+    paths = _ICON_PATHS.get(name)
+    if paths is None:
+        paths = _ICON_PATHS[name] = _icon_path(name)
+    s, f = paths
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.translate(cx, cy)
+    if rotate_deg:
+        p.rotate(rotate_deg)
+    k = size / 16.0
+    p.scale(k, k)
+    p.translate(-8.0, -8.0)
+    if not f.isEmpty():
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawPath(f)
+    if not s.isEmpty():
+        p.setPen(QPen(color, stroke, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(s)
+    p.restore()
