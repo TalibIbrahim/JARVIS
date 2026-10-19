@@ -82,6 +82,7 @@ class Config:
     smooth_d_cutoff: float = 1.0
     cursor_rate_hz: int = 120           # decoupled cursor update rate (120+ Hz)
     cursor_lookback_ms: float = 200.0   # position lookback buffer to eliminate click drift
+    cursor_glide: bool = True           # predict hand motion between camera frames for a smoother cursor; clicks unaffected
 
     # --- dwell click ---
     dwell_mode: str = "click"           # "off", "click", "radial"

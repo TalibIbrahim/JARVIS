@@ -180,6 +180,14 @@ class Controller:
         self.history.append_fast(time.perf_counter(), self.cur_x, self.cur_y)
         self._last_dwell_active = False
 
+        # Cursor glide (velocity prediction between hand updates; relative mode only)
+        self._gv_vx = 0.0
+        self._gv_vy = 0.0
+        self._gv_t = 0.0
+        self._gv_int = 0.05
+        self._gv_block_until = 0.0
+        self._gv_bounds = (0.0, 0.0, float(self.sw - 1), float(self.sh - 1))
+
         # Relative tracking state
         self.last_landmark_x = None
         self.last_landmark_y = None
@@ -315,8 +323,20 @@ class Controller:
             while not self._stop_thread.is_set():
                 # Smoothly interpolate towards target position
                 # Critically damped exponential approach
-                dx = (self.target_x - self.cur_x) * alpha
-                dy = (self.target_y - self.cur_y) * alpha
+                now_g = time.perf_counter()
+                tgt_x = self.target_x
+                tgt_y = self.target_y
+                if ((self._gv_vx or self._gv_vy) and now_g >= self._gv_block_until
+                        and self.active and self.hand_present
+                        and getattr(self.cfg, "cursor_glide", True)):
+                    # Lead capped at one update interval; held (not grown) if updates stop.
+                    t_lead = min(now_g - self._gv_t, self._gv_int)
+                    if t_lead > 0.0:
+                        bx0, by0, bx1, by1 = self._gv_bounds
+                        tgt_x = min(max(tgt_x + self._gv_vx * t_lead, bx0), bx1)
+                        tgt_y = min(max(tgt_y + self._gv_vy * t_lead, by0), by1)
+                dx = (tgt_x - self.cur_x) * alpha
+                dy = (tgt_y - self.cur_y) * alpha
 
                 if abs(dx) > 0.02 or abs(dy) > 0.02:
                     self.cur_x += dx
@@ -642,6 +662,28 @@ class Controller:
             except Exception:
                 pass
 
+    def _glide_stop(self, now, block_s=0.0):
+        self._gv_vx = self._gv_vy = 0.0
+        if block_s:
+            self._gv_block_until = now + block_s
+
+    def _update_glide(self, now, raw_dt, ddx, ddy, fine, bounds):
+        """Estimate target velocity (px/s) from real arrival times for between-update prediction."""
+        self._gv_bounds = (float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3]))
+        if 0.008 <= raw_dt <= 0.2:
+            self._gv_int += 0.3 * (raw_dt - self._gv_int)
+        if fine or (ddx == 0.0 and ddy == 0.0) or raw_dt > 0.2 or raw_dt < 0.008:
+            self._glide_stop(now)
+            self._gv_t = now
+            return
+        ix, iy = ddx / raw_dt, ddy / raw_dt
+        px, py = self._gv_vx, self._gv_vy
+        if (px or py) and math.hypot(ix, iy) >= math.hypot(px, py):
+            ix, iy = 0.5 * (ix + px), 0.5 * (iy + py)   # speeding up / steady: smooth
+        # decelerating: take the lower instantaneous speed immediately (no overshoot)
+        self._gv_vx, self._gv_vy = ix, iy
+        self._gv_t = now
+
     def _get_lookback_position(self, lookback_ms):
         """Returns the cursor position from lookback_ms before now."""
         target_t = time.perf_counter() - (lookback_ms / 1000.0)
@@ -733,10 +775,15 @@ class Controller:
                 if self.scroll_mode_active and abs(px_dy) > 4.0:
                     notch = 1 if px_dy < 0 else -1
                     pyautogui.scroll(120 * notch, _pause=False)
+                    self._glide_stop(now)
                     return
 
+                old_tx, old_ty = self.target_x, self.target_y
                 self.target_x = min(max(self.target_x + px_dx, min_x), max_x)
                 self.target_y = min(max(self.target_y + px_dy, min_y), max_y)
+                self._update_glide(now, raw_dt, self.target_x - old_tx, self.target_y - old_ty,
+                                   a.precision or velocity < getattr(self.cfg, "precision_threshold", 0.015) * span_w,
+                                   (min_x, min_y, max_x, max_y))
 
             else:
                 # Absolute mapping
@@ -748,12 +795,14 @@ class Controller:
                 out_x, out_y = self.deadzone(fx, fy)
                 self.target_x = out_x
                 self.target_y = out_y
+                self._gv_vx = self._gv_vy = 0.0
 
         elif k == "click":
             # Eliminate click drift with position lookback
             lookback_ms = getattr(self.cfg, "cursor_lookback_ms", 200.0)
             lb_x, lb_y = self._get_lookback_position(lookback_ms)
 
+            self._glide_stop(now, 0.15)
             # Snap cursor to exact pre-click lookback position (0 px pre-click drift invariant)
             self.target_x, self.target_y = lb_x, lb_y
             self.cur_x, self.cur_y = lb_x, lb_y
@@ -773,6 +822,7 @@ class Controller:
 
         elif k == "rewind":
             # A shortcut flick began a.age seconds ago: put the cursor back where it was then.
+            self._glide_stop(now, 0.15)
             lb_x, lb_y = self.history.get_lookback(now - a.age, self.cur_x, self.cur_y)
             self.target_x, self.target_y = lb_x, lb_y
             self.cur_x, self.cur_y = lb_x, lb_y
@@ -786,6 +836,7 @@ class Controller:
             self.pinching = False
 
         elif k == "drag_start":
+            self._glide_stop(now, 0.15)
             self.pinching = True
             self.dragging = True
             pyautogui.mouseDown(_pause=False)
