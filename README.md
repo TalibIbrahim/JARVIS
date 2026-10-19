@@ -178,12 +178,16 @@ Measured on an Intel Core i7-8665U laptop (4 cores / 8 threads), Windows 10, bui
 
 | Metric | Measured |
 |---|---|
-| **System 1 intent decision** | p50 ≈ 0.3 ms, p99 < 1 ms on an idle machine |
+| **Startup to island visible** | about 0.35 s in-process (about 0.55 s including Python start-up); camera and voice start after the first frame |
+| **System 1 intent decision** | p50 0.19 ms, p99 0.46 ms |
+| **Wake word → island animation** | p99 14 ms |
+| **Speech transcript → action** | p99 3 ms warm, about 23 ms for the very first command |
 | **Hand inference (MediaPipe)** | 22–37 ms per frame with no other load |
-| **Cursor engine** | 121 Hz, decoupled from the 30 FPS camera; 0.0 px pre-click drift (200 ms lookback) |
-| **Island rendering** | 0.2–1.5 ms per frame (budget 16.7 ms) |
-| **Speech reply (Piper TTS)** | first sentence in 66–129 ms |
-| **Idle CPU (JARVIS running, standby)** | about 0.6 of one core |
+| **Cursor engine** | 121 Hz with glide between camera frames (2–3× smoother motion, about half the lag); 0.0 px pre-click drift (200 ms lookback) |
+| **Island rendering** | 0.2–1.5 ms per frame (budget 16.7 ms); repaints only when something visible changes |
+| **Settings window** | first build about 0.15 s; other tabs build when first opened |
+| **Standby hand scanning** | about a quarter of one CPU core |
+| **Memory** | plateaus around 150 MB with no growth over time |
 
 ---
 
