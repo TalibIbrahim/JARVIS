@@ -19,7 +19,7 @@ from typing import Any, Callable, List, Optional, Tuple
 import jarvis_log as _jlog
 
 try:
-    from updater import APP_VERSION  # single source of truth for the app version
+    from version import APP_VERSION  # single source of truth for the app version
 except Exception:  # pragma: no cover - updater import is optional in stripped test environments
     APP_VERSION = "unknown"
 USER_AGENT = f"JARVIS/{APP_VERSION} (https://github.com/TalibIbrahim/JARVIS)"

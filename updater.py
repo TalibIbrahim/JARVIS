@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 
-APP_VERSION = "2.6.0"
+from version import APP_VERSION  # noqa: F401  (re-exported; defined in version.py)
 GITHUB_REPO = "TalibIbrahim/JARVIS"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 

@@ -54,7 +54,7 @@ except ImportError:
 # imported lazily at the point of use so the island can come up without them.
 def _app_version():
     try:
-        from updater import APP_VERSION
+        from version import APP_VERSION
         return APP_VERSION
     except ImportError:
         return "2.6.0"

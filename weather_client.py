@@ -19,8 +19,7 @@ import locale
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
-import urllib.parse
-import urllib.request
+import urllib.parse  # urllib.request is imported lazily: it pulls in http/ssl/email (~57 ms at startup)
 
 
 CACHE_TTL_SECONDS = 1200.0  # 20 minutes
@@ -156,6 +155,7 @@ def default_http_fetcher(url: str, timeout: float = 6.0) -> Dict[str, Any]:
         resp.raise_for_status()
         return resp.json()
     except ImportError:
+        import urllib.request
         req = urllib.request.Request(url, headers={"User-Agent": "JARVIS-Assistant/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as response:
             data = response.read().decode("utf-8")

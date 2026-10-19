@@ -209,7 +209,7 @@ def _resolve_dir(log_dir: Optional[str]) -> str:
 
 def _version() -> str:
     try:
-        from updater import APP_VERSION
+        from version import APP_VERSION
         return str(APP_VERSION)
     except Exception:
         return "unknown"

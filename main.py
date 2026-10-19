@@ -452,10 +452,11 @@ def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstanc
     # Create session-local mutex to prevent multi-instance runs
     handle = kernel32.CreateMutexW(None, False, app_id)
     last_error = kernel32.GetLastError()
-    _jlog.get_logger("main").info(
-        "single-instance mutex: %s (GetLastError=%d) census=%s",
-        "already-exists" if last_error == ERROR_ALREADY_EXISTS else "acquired",
-        last_error, _jlog.process_census())
+    if last_error == ERROR_ALREADY_EXISTS:
+        _jlog.get_logger("main").info(
+            "single-instance mutex: already-exists (GetLastError=%d) census=%s", last_error, _jlog.process_census())
+    else:   # the process census walks every process (0.2-1.8 s); logged after the first paint by log_census_later()
+        _jlog.get_logger("main").info("single-instance mutex: acquired (GetLastError=%d)", last_error)
 
     if last_error == ERROR_ALREADY_EXISTS:
         if handle:
@@ -511,6 +512,20 @@ def _start_workers_after_first_frame(fn):
 
 
 WARM_DELAY_S = 5.0
+
+
+def log_census_later(stop, delay=WARM_DELAY_S):
+    """Diagnostic only: log the JARVIS process census off the startup path (it iterates every process)."""
+    def _run():
+        if stop.wait(delay):
+            return
+        log = _jlog.get_logger("main")
+        t0 = time.perf_counter()
+        log.info("process census (deferred): %s (%.0f ms)", _jlog.process_census(), (time.perf_counter() - t0) * 1000)
+
+    t = threading.Thread(target=_run, name="Census", daemon=True)
+    t.start()
+    return t
 # Modules the first voice command would otherwise import lazily (60-115 ms each). Import only: no devices, no network.
 WARM_MODULES = ("comtypes", "pycaw.pycaw", "winrt.windows.media.control", "winrt.windows.storage.streams",
                 "winreg", "window_resolver", "requests")
@@ -548,6 +563,37 @@ def warm_first_use_imports(stop, delay=WARM_DELAY_S, modules=WARM_MODULES, lower
                 sys.modules["requests"].Session().close()   # builds adapters/ssl context; opens no connection
             except Exception as exc:
                 log.warning("requests session warm failed: %s: %s", type(exc).__name__, exc)
+        if stop.is_set():
+            return
+        t0 = time.perf_counter()
+        try:   # first-ever decision-engine call builds/loads its index; classify() on a dummy phrase, no action runs
+            from decision_engine import get_decision_engine
+            get_decision_engine().classify("warm up")
+        except Exception as exc:
+            log.warning("decision engine warm failed: %s: %s", type(exc).__name__, exc)
+        log.debug("decision engine warm %.0f ms", (time.perf_counter() - t0) * 1000)
+        t0 = time.perf_counter()
+        try:   # the command pipeline's lazy imports and regex compiles; pure predicates only (no ctx, no actions)
+            import chained_commands, commands, context_resolver, math_parser, quick_answers, screen_awareness
+            screen_awareness.is_screen_query("warm up")
+            quick_answers.is_unsafe_shell_command("warm up")
+            quick_answers.is_timezone_query("warm up")
+            chained_commands.split_chained_commands("warm up")
+            math_parser.parse_math_or_unit_query("warm up")
+            context_resolver.extract_entities_from_text("warm up")
+            commands.strip_wake_prefix("warm up")
+        except Exception as exc:
+            log.warning("command pipeline warm failed: %s: %s", type(exc).__name__, exc)
+        log.debug("command pipeline warm %.0f ms", (time.perf_counter() - t0) * 1000)
+        if sys.platform == "win32" and "comtypes" in sys.modules:
+            t0 = time.perf_counter()
+            try:   # first COM init in the process; no device, endpoint or volume call
+                com = sys.modules["comtypes"]
+                com.CoInitialize()
+                com.CoUninitialize()
+            except Exception as exc:
+                log.warning("COM warm failed: %s: %s", type(exc).__name__, exc)
+            log.debug("COM warm %.0f ms", (time.perf_counter() - t0) * 1000)
         log.info("first-use imports warmed in %.0f ms", (time.perf_counter() - t_all) * 1000)
 
     t = threading.Thread(target=_run, name="WarmImports", daemon=True)
@@ -909,6 +955,7 @@ def main():
 
     _start_workers_after_first_frame(_start_workers)
     warm_first_use_imports(stop)
+    log_census_later(stop)
 
     try:
         overlay.run()
