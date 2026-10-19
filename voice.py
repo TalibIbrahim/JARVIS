@@ -2034,6 +2034,10 @@ class Voice(threading.Thread):
     def mic_state(self):
         """("ok"|"reconnecting"|"stalled"|"flatline"|"down", reason) for the supervisor health summary."""
         if self.wake_detector is None:
+            # Voice.run is still probing the microphone (~1 s at startup): a normal startup state, not a
+            # failure (the island dot would otherwise flash red). A Voice thread that died is still "down".
+            if self.is_alive():
+                return "opening", "Mic starting"
             return "down", "WakeWordDetector not started"
         return self.wake_detector.mic_state()
 
