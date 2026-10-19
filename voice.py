@@ -2037,6 +2037,24 @@ class Voice(threading.Thread):
 
             self.stop.wait(timeout=0.5)
 
+    _STT_OFFLINE_NOTICE_INTERVAL = 60.0
+
+    def _notify_stt_offline(self, uid=None):
+        """Post a rate-limited 'no internet' error (once per 60 s) when all STT engines failed on the network."""
+        now = time.monotonic()
+        last = getattr(self, "_stt_offline_notified_at", None)
+        if last is not None and now - last < self._STT_OFFLINE_NOTICE_INTERVAL:
+            return
+        self._stt_offline_notified_at = now
+        _vlog.warning("All STT engines failed with network errors; posting offline notice")
+        jarvis_log.utterance_event(jarvis_log.RESULT, uid, step="stt_offline", ok=False)
+        ov = getattr(self.ctx, "overlay", None)
+        if ov:
+            try:
+                ov.post("error", text="No internet - speech unavailable")
+            except Exception:
+                _vlog.warning("offline notice post failed", exc_info=True)
+
     def _fallback_google(self, recognizer, audio, sr):
         """Falls back to Google SpeechRecognition if Groq is unavailable."""
         t0 = time.monotonic()
@@ -2060,6 +2078,7 @@ class Voice(threading.Thread):
             return None
         except sr.RequestError as re_err:
             print(f"[voice] Google speech service error: {re_err}")
+            self._google_net_err = True
             jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", ok=False, err=type(re_err).__name__,
                                        ms=int((time.monotonic() - t0) * 1000))
             self.ctx.say("The speech service is unreachable, sir.")
@@ -2143,6 +2162,8 @@ class Voice(threading.Thread):
                     pass
 
             text = None
+            groq_net_fail = False
+            self._google_net_err = False
             key = get_api_key(self.cfg)
             ai_enabled = getattr(self.cfg, "ai_enabled", False)
             use_groq = bool(ai_enabled and key and now >= self.groq_cooldown_until)
@@ -2197,6 +2218,7 @@ class Voice(threading.Thread):
                                                err=type(net_err).__name__, ms=int((time.monotonic() - t_groq) * 1000))
                     print(f"[voice] Groq network offline/timeout: {net_err}")
                     self.groq_cooldown_until = time.time() + 15.0
+                    groq_net_fail = True
                     if hasattr(self.ctx, "overlay") and self.ctx.overlay:
                         try:
                             self.ctx.overlay.post("ai_error", text="Groq Offline")
@@ -2210,6 +2232,10 @@ class Voice(threading.Thread):
                     text = self._fallback_google(recognizer, audio, sr)
             else:
                 text = self._fallback_google(recognizer, audio, sr)
+
+            # Every STT engine tried failed on the network: tell the user once per interval.
+            if not text and self._google_net_err and (groq_net_fail or not use_groq):
+                self._notify_stt_offline(uid)
 
             if text:
                 try:
