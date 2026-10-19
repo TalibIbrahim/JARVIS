@@ -756,7 +756,12 @@ class Tracker(threading.Thread):
             gesture_toggled = False
             for action in self.engine.update(found, now):
                 self.controller.handle(action)
-                if action.kind == "activate":
+                if action.kind == "listen":
+                    # 🤙 listen gesture: push-to-talk on the voice engine (thread-safe; runs on its detector thread)
+                    voice = getattr(self.ctx, "voice", None)
+                    if voice is not None and hasattr(voice, "request_listen"):
+                        voice.request_listen("gesture")
+                elif action.kind == "activate":
                     gesture_toggled = True
                     _tlog.info("engine.active -> True source=gesture")
                     self.ctx.chirp(True)

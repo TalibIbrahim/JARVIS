@@ -211,7 +211,7 @@ class VADDetector:
             self._noise.popleft()
         self.noise_floor = float(np.percentile([r for _, r in self._noise], self.NOISE_PERCENTILE))
 
-    def is_speech(self, chunk: np.ndarray, rms: float) -> bool:
+    def is_speech(self, chunk: np.ndarray, rms: float, gate_override: float = None) -> bool:
         prob = None
         if self._vad is not None:
             try:
@@ -220,7 +220,7 @@ class VADDetector:
                 self._warn_fallback(f"Silero predict raised: {exc!r}")
         self.last_prob = prob
 
-        gate = self.gate()  # decided from history before this chunk is folded in
+        gate = self.gate() if gate_override is None else float(gate_override)  # from history, before this chunk
         if prob is None:
             result = rms >= gate
         else:
@@ -1143,9 +1143,15 @@ class WakeWordDetector(threading.Thread):
         followup_window=6.0,
         device_index=None,
         on_speech_end=None,
+        on_push_to_talk=None,
+        on_push_to_talk_done=None,
     ):
         super().__init__(name="WakeWordDetector", daemon=True)
         self.on_speech_end = on_speech_end
+        self.on_push_to_talk = on_push_to_talk
+        self.on_push_to_talk_done = on_push_to_talk_done
+        self._ptt_event = threading.Event()   # set by request_listen(); consumed on this thread only
+        self._ptt_source = ""
         self._was_speaking = False
         self.cfg = cfg  # property: also keeps self.vad.cfg in sync (live mic_energy_threshold)
         self.on_wake = on_wake
@@ -1160,6 +1166,13 @@ class WakeWordDetector(threading.Thread):
         self.guard = WakeWordGuard(threshold=self.threshold)
         self.vad = VADDetector(cfg=cfg)
         self.model = None
+        # Voice Over Music (experimental): echo canceller + a second model/VAD for the AEC path.
+        # Owned and touched only by this thread (created/closed in _sync_aec).
+        self._aec = None
+        self._aec_model = None
+        self._aec_vad = None
+        self._aec_failed = False      # start() failed this enable cycle; not retried until the setting toggles
+        self._aec_active = False      # last chunk was actually echo-cancelled (playback present)
         self.listening_until = 0.0
         self.is_recording = False
         # diagnostics state (logging only)
@@ -1187,9 +1200,119 @@ class WakeWordDetector(threading.Thread):
         vad = getattr(self, "vad", None)
         if vad is not None:
             vad.cfg = value
+        avad = getattr(self, "_aec_vad", None)
+        if avad is not None:
+            avad.cfg = value
 
     def _set_state(self, state, reason=""):
         self._mic_state = (state, reason)
+
+    PTT_TIMEOUT_NO_SPEECH_S = 5.0
+    LISTEN_OFF_POLL_S = 0.25
+
+    def _listen_off(self):
+        """Live 'Listen for Jarvis' setting (cfg is reloaded in place, so poll every pass)."""
+        return not getattr(self.cfg, "listen_for_jarvis", True) if self.cfg else False
+
+    def _sync_aec(self):
+        """Live 'Voice Over Music' setting: create/start or close the canceller on this thread."""
+        want = bool(getattr(self.cfg, "voice_over_music", False)) if self.cfg else False
+        if not want:
+            self._aec_failed = False
+            if self._aec is not None:
+                self._close_aec("setting off")
+            return
+        if self._aec is not None or self._aec_failed:
+            return
+        try:
+            from echo_canceller import EchoCanceller
+            aec = EchoCanceller()
+            if not aec.start():
+                self._aec_failed = True
+                return
+            self._aec = aec
+            self._aec_vad = VADDetector(cfg=self.cfg)
+            if self.model is not None:
+                from openwakeword.model import Model
+                self._aec_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+            _vlog.info("voice over music: echo canceller started")
+        except Exception as exc:
+            self._aec_failed = True
+            _vlog.warning("voice over music: could not start (%r); running without echo cancellation", exc)
+            self._close_aec("start failed")
+
+    def _close_aec(self, why):
+        aec, self._aec = self._aec, None
+        self._aec_model = None
+        self._aec_vad = None
+        self._aec_active = False
+        if aec is not None:
+            try:
+                aec.close()
+            except Exception as exc:
+                _vlog.warning("echo canceller close failed: %r", exc)
+            _vlog.info("voice over music: echo canceller closed (%s)", why)
+
+    def _aec_chunk(self, arr):
+        """AEC output for this mic chunk, or None when AEC is off/idle (playback silent). The raw mic
+        is never replaced: callers use the result only as a second opinion for wake/VAD."""
+        if self._aec is None:
+            self._aec_active = False
+            return None
+        out = self._aec.process(arr)
+        active = out is not arr
+        if active and not self._aec_active and self._aec_model is not None \
+                and hasattr(self._aec_model, "reset"):
+            self._aec_model.reset()   # stale feature buffer from before the idle gap
+        self._aec_active = active
+        return out if active else None
+
+    def _vad_dual(self, arr, rms, aec_arr):
+        """VAD on raw OR aec. While AEC is active both use the aec path's gate (its noise floor is
+        music-free, so music does not inflate the raw gate)."""
+        if aec_arr is None:
+            return self.vad.is_speech(arr, rms)
+        a_rms = float(np.sqrt(np.mean(aec_arr.astype(float) ** 2)))
+        a_speech = self._aec_vad.is_speech(aec_arr, a_rms)
+        r_speech = self.vad.is_speech(arr, rms, gate_override=self._aec_vad.gate())
+        return r_speech or a_speech
+
+    def request_listen(self, source: str = "") -> bool:
+        """Thread-safe push-to-talk request (gesture / hotkey). The detector thread does the work.
+        Dropped (False) while a listen is in progress or pending, or while JARVIS is speaking."""
+        if self._ptt_event.is_set() or self.is_recording or Voice.is_speaking:
+            _vlog.info("push_to_talk dropped (source=%s): busy", source)
+            return False
+        if not self.is_alive() or self.stop.is_set():
+            return False
+        self._ptt_source = str(source)
+        self._ptt_event.set()
+        return True
+
+    def _do_push_to_talk(self, stream, chunk_samples, sample_rate):
+        """Record ONE utterance on the open stream and dispatch it as a command (no wake word needed)."""
+        source = self._ptt_source
+        self._ptt_event.clear()
+        _vlog.info("push_to_talk start (source=%s)", source)
+        if self.on_push_to_talk:
+            try:
+                self.on_push_to_talk(source)
+            except Exception as cb_err:
+                print(f"[voice] on_push_to_talk error: {cb_err}")
+        raw = self.record_utterance_with_vad(
+            stream=stream,
+            chunk_samples=chunk_samples,
+            sample_rate=sample_rate,
+            timeout_no_speech=self.PTT_TIMEOUT_NO_SPEECH_S,
+            trigger="push_to_talk",
+        )
+        if raw:
+            self._dispatch_utterance(raw, is_command=True)
+        elif self.on_push_to_talk_done:
+            try:
+                self.on_push_to_talk_done(source)
+            except Exception as cb_err:
+                print(f"[voice] on_push_to_talk_done error: {cb_err}")
 
     def mic_state(self):
         """("ok"|"reconnecting"|"stalled"|"flatline"|"down", reason)."""
@@ -1249,25 +1372,38 @@ class WakeWordDetector(threading.Thread):
             self._flat_since = None
             self._flat_flagged = False
         self._st_chunks += 1
-        if rms >= self.vad.gate():
+        gate_vad = self._aec_vad if (self._aec_active and self._aec_vad is not None) else self.vad
+        if rms >= gate_vad.gate():
             self._st_loud += 1
         if now - self._hb_t >= 1.0:
             self._hb_t = now
             jarvis_log.heartbeat(
                 "WakeWordDetector", rms=int(round(rms)), rec=self.is_recording,
                 follow=round(max(0.0, self.listening_until - time.time()), 1),
-                speaking=Voice.is_speaking)
+                speaking=Voice.is_speaking, **self._aec_hb())
         if now - self._st_t >= 60.0:
             v_total, v_speech = self.vad.take_stats()
+            aec_txt = ""
+            if self._aec is not None:
+                if self._aec_vad is not None:
+                    self._aec_vad.take_stats()
+                aec_txt = f" aec={self._aec.stats()}"
             _vlog.info("wake stats %.0fs: max_score=%.2f noise_floor=%.0f gate=%.0f (energy_floor=%.0f) "
-                       "speech=%d/%d chunks (%.1f%%) rms>=gate=%d/%d",
+                       "speech=%d/%d chunks (%.1f%%) rms>=gate=%d/%d%s",
                        now - self._st_t, self._st_max_score, self.vad.noise_floor, self.vad.gate(),
                        self.vad.energy_threshold, v_speech, v_total, 100.0 * v_speech / max(1, v_total),
-                       self._st_loud, self._st_chunks)
+                       self._st_loud, self._st_chunks, aec_txt)
             self._st_t = now
             self._st_max_score = 0.0
             self._st_loud = self._st_chunks = 0
         return flat_new
+
+    def _aec_hb(self):
+        if not (getattr(self.cfg, "voice_over_music", False) if self.cfg else False):
+            return {}
+        if self._aec is None:
+            return {"aec": "off"}
+        return {"aec": "on" if self._aec_active else "idle"}
 
     def _init_model(self):
         try:
@@ -1357,7 +1493,7 @@ class WakeWordDetector(threading.Thread):
 
                 now = time.time()
                 elapsed = now - start_time
-                chunk_has_speech = self.vad.is_speech(arr, rms)
+                chunk_has_speech = self._vad_dual(arr, rms, self._aec_chunk(arr))
                 total_chunks += 1
                 rms_list.append(rms)
                 if chunk_has_speech:
@@ -1519,10 +1655,12 @@ class WakeWordDetector(threading.Thread):
         try:
             self._run_body()
         except BaseException as e:
+            self._close_aec("thread exit")
             self._set_state("down", f"{type(e).__name__}: {e}")
             jarvis_log.thread_exited("WakeWordDetector", e)
             raise
         else:
+            self._close_aec("thread exit")
             self._set_state("down", "stopped")
             jarvis_log.thread_exited("WakeWordDetector")
 
@@ -1533,6 +1671,17 @@ class WakeWordDetector(threading.Thread):
         chunk_samples = 1280  # 80 ms chunks
 
         while not self.stop.is_set():
+            if self._listen_off() and not self._ptt_event.is_set():
+                # Listen for Jarvis is OFF: no stream is open (mic-in-use indicator off), no reads, no
+                # wake model, no VAD, no STT. Idle until the setting flips or a push-to-talk arrives.
+                self._set_state("ok", "Listening off")
+                self._flat_since = None
+                self._flat_flagged = False
+                self.listening_until = 0.0
+                jarvis_log.heartbeat("WakeWordDetector", listening="off")
+                self._ptt_event.wait(self.LISTEN_OFF_POLL_S)
+                continue
+
             # Re-fetch every pass: reconnect_stream() resets the shared PyAudio instance.
             p = get_shared_pyaudio()
             cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
@@ -1569,6 +1718,16 @@ class WakeWordDetector(threading.Thread):
                     new_cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
                     if new_cfg_idx is not None and new_cfg_idx != self.device_index:
                         break
+
+                    if self._ptt_event.is_set():
+                        pre_roll.clear()
+                        self._do_push_to_talk(stream, chunk_samples, sample_rate)
+                        if self._stream_fault:
+                            stream_error = True
+                            break
+                        continue
+                    if self._listen_off():
+                        break   # finally: closes the stream; the outer loop then idles
 
                     data, fault = self._read_chunk(stream, chunk_samples)
                     if fault == "stop":
@@ -1615,7 +1774,9 @@ class WakeWordDetector(threading.Thread):
                                 print(f"[voice] on_no_speech error: {ns_err}")
 
                     # One VAD evaluation per chunk (Silero is stateful; also feeds the noise floor).
-                    chunk_speech = self.vad.is_speech(arr, rms)
+                    self._sync_aec()
+                    aec_arr = self._aec_chunk(arr)
+                    chunk_speech = self._vad_dual(arr, rms, aec_arr)
 
                     # In follow-up window? Check if user started speaking directly
                     in_followup = now < self.listening_until
@@ -1644,6 +1805,9 @@ class WakeWordDetector(threading.Thread):
                     if getattr(self.cfg, "wake_word_enabled", True) and self.model is not None:
                         pred = self.model.predict(arr)
                         score = pred.get("hey_jarvis", 0.0)
+                        if aec_arr is not None and self._aec_model is not None:
+                            # Dual path: the AEC path only ever adds a chance to hear the wake word.
+                            score = max(score, self._aec_model.predict(aec_arr).get("hey_jarvis", 0.0))
                         if score > self._st_max_score:
                             self._st_max_score = float(score)
                         if self.guard.evaluate(score, is_speaking=Voice.is_speaking, now=now):
@@ -1704,6 +1868,7 @@ class WakeWordDetector(threading.Thread):
                             stream_error = True
                             break
             finally:
+                self._close_aec("mic stream closed")
                 if stream is not None:
                     try:
                         with _PORTAUDIO_LOCK:
@@ -1907,6 +2072,36 @@ class Voice(threading.Thread):
             except Exception:
                 pass
 
+    def request_listen(self, source: str = "") -> bool:
+        """Push-to-talk (e.g. the call-me gesture). Thread-safe. Returns False if dropped (no detector,
+        already listening, or JARVIS speaking). At most one request is held; extras are dropped."""
+        wd = self.wake_detector
+        if wd is None or Voice.is_speaking:
+            return False
+        return wd.request_listen(source)
+
+    def _on_push_to_talk_start(self, source):
+        self._duck_media("push_to_talk")
+        until = time.time() + WakeWordDetector.PTT_TIMEOUT_NO_SPEECH_S
+        if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+            try:
+                self.ctx.overlay.post("wake", duration=0.6)
+                self.ctx.overlay.post("wake_detected")
+                self.ctx.overlay.post("listening", until=until)
+            except Exception:
+                pass
+        if getattr(self.cfg, "chime_enabled", True):
+            play_chime(non_blocking=True)
+
+    def _on_push_to_talk_done(self, source):
+        """No usable utterance was captured: restore media and close the listening pill."""
+        self._restore_media("push_to_talk_done")
+        if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+            try:
+                self.ctx.overlay.post("listening_done")
+            except Exception:
+                pass
+
     def _on_wake_idle(self):
         """User triggered wake word and paused; prompt confirmation and open follow-up window."""
         now = time.time()
@@ -2008,6 +2203,8 @@ class Voice(threading.Thread):
             on_no_speech=self._on_no_speech_detected,
             on_wake_idle=self._on_wake_idle,
             on_speech_end=self._on_speech_finished,
+            on_push_to_talk=self._on_push_to_talk_start,
+            on_push_to_talk_done=self._on_push_to_talk_done,
             stop_event=self._own_stop,
             sensitivity=self.sensitivity,
             followup_window=self.followup_window,

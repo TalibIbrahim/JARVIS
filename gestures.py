@@ -220,6 +220,8 @@ class GestureEngine:
             self.palm_since = None
             self.palm_latched = False
             self.thumbs_up_since = None
+            self.cm_down = False
+            self.cm_fired = False
             self.last_pose = None
             self.last_closing = False
             self.last_openness = 0.0
@@ -373,6 +375,10 @@ class GestureEngine:
             if not (cur_pose == "OPEN" and self.palm_since is not None):
                 self.progress = 0.0
 
+        # Listen: "call me" (thumb + pinky out, index/middle/ring curled). Active-only.
+        if self._call_me_update(p, now, actions):
+            return actions
+
         # Scroll: peace sign
         if p.peace:
             self._mode = "SCROLL"
@@ -493,6 +499,53 @@ class GestureEngine:
         actions.extend(flick_actions)
         return actions
 
+    def _call_me_update(self, p, now, actions) -> bool:
+        """Call-me pose tracker. Returns True while the pose is held (caller freezes the cursor).
+
+        Enter: thumb out, pinky straight, index/middle/ring folded. Exit uses looser thresholds
+        (hysteresis). Fires one Action("listen") after listen_gesture_hold (0.5 s); re-arms on release.
+        """
+        cfg = self.cfg
+        if not getattr(cfg, "listen_gesture_enabled", True) or self.dragging:
+            self._call_me_release()
+            return False
+        if self.cm_down:
+            raw = (p.idx < 1.42 and p.mid < 1.42 and p.ring < 1.42
+                   and p.pinky > 1.38 and p.thumb_out > 0.60)
+        else:
+            raw = (p.idx < FOLDED and p.mid < FOLDED and p.ring < FOLDED
+                   and p.pinky > 1.50 and p.thumb_out > 0.70)
+        if not raw:
+            self._call_me_release()
+            return False
+        self.cm_last_seen = now
+        if not self.cm_down:
+            self.cm_down = True
+            self.cm_since = now
+            self._palm_hist = []
+        self._mode = "LISTEN"
+        self.last_anchor = None
+        self.last_anchor_t = None
+        self.precision_active = False
+        self.clutched = False
+        hold = getattr(cfg, "listen_gesture_hold", 0.5)
+        if not self.cm_fired and now - self.cm_since >= hold:
+            self.cm_fired = True
+            lb_s = getattr(cfg, "cursor_lookback_ms", 200.0) / 1000.0
+            actions.append(Action("rewind", t=self.cm_since - lb_s, age=now - self.cm_since + lb_s))
+            actions.append(Action("listen"))
+            self._flash_label("LISTENING", now)
+        return True
+
+    def _call_me_release(self):
+        if self.cm_down:
+            self.cm_down = False
+            self.cm_fired = False
+            self.last_anchor = None
+            self.last_anchor_t = None
+            self.reopen_freeze_until = max(self.reopen_freeze_until, self.cm_last_seen
+                                           + getattr(self.cfg, "reopen_freeze_ms", 150.0) / 1000.0)
+
     def _on_pose_transition(self, prev_pose, new_pose, now, actions):
         cfg = self.cfg
 
@@ -519,7 +572,7 @@ class GestureEngine:
                 self.reopen_freeze_until = now + (reopen_freeze_ms / 1000.0)
             else:
                 max_click_hold = getattr(cfg, "fist_click_max_hold", 0.40)
-                if fist_duration <= max_click_hold:
+                if fist_duration <= max_click_hold and (now - self.cm_last_seen) > 0.3:
                     double_window = getattr(cfg, "fist_double_window", 0.65)
                     double = (now - self.last_click) <= double_window
                     actions.append(Action("click", double=double))
@@ -919,6 +972,10 @@ class GestureEngine:
         self.fist_active = False
         self.reopen_freeze_until = 0.0
         self.zp_down = False
+        self.cm_down = False
+        self.cm_fired = False
+        self.cm_since = 0.0
+        self.cm_last_seen = 0.0
         self.zp_since = 0.0
         self.zoom1_on = False
         self.zp_y = None

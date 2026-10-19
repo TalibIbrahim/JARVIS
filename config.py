@@ -96,7 +96,12 @@ class Config:
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
     config_version: int = 4            # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification)
+    # wake_word_enabled only toggles the openWakeWord model. listen_for_jarvis=False disables ALL
+    # passive listening (mic stays closed, nothing recorded) until the listen gesture.
     wake_word_enabled: bool = True      # openWakeWord / wake word detection toggle
+    listen_for_jarvis: bool = True      # like Siri's "Listen for Siri": when off, the microphone stays closed and nothing is recorded until the listen gesture
+    listen_gesture_enabled: bool = True # call-me gesture held 0.5 s ducks media and listens for one command
+    voice_over_music: bool = False      # experimental echo cancellation so "Jarvis" is heard over music playing from this PC
     wake_sensitivity: str = "balanced"  # "low", "balanced", "high"
     wake_followup_window: float = 6.0   # seconds Jarvis keeps listening after wake detection
     chime_enabled: bool = True          # play soft ascending two-note chime on wake

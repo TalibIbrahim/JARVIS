@@ -1894,6 +1894,27 @@ class SettingsWindow(QDialog):
 
         card = GroupedCard()
 
+        # ── Listening controls (top of the wake-word section) ──
+        self.listen_switch = AppleSwitch(bool(getattr(self.cfg, "listen_for_jarvis", True)))
+        self.listen_switch.toggled.connect(self._on_listen_toggled)
+        card.add_row("Listen for “Jarvis”",
+                     "When off, the microphone stays closed and nothing is recorded until you make the listen gesture.",
+                     self.listen_switch)
+
+        self.listen_gesture_switch = AppleSwitch(bool(getattr(self.cfg, "listen_gesture_enabled", True)))
+        self.listen_gesture_switch.toggled.connect(lambda v: self._save("listen_gesture_enabled", v))
+        card.add_row("Listen Gesture",
+                     "Hold \U0001F919 (thumb and pinky out) for half a second to talk to JARVIS without saying its name.",
+                     self.listen_gesture_switch)
+
+        self.voice_over_music_switch = AppleSwitch(bool(getattr(self.cfg, "voice_over_music", False)))
+        self.voice_over_music_switch.toggled.connect(lambda v: self._save("voice_over_music", v))
+        card.add_row("Voice Over Music (Experimental)",
+                     "Cancels this PC's own audio so commands get through over music. Uses about 15% of one CPU core, only while audio is playing.",
+                     self.voice_over_music_switch)
+
+        self._apply_listen_state(bool(getattr(self.cfg, "listen_for_jarvis", True)))
+
         sw_voice = AppleSwitch(self.cfg.voice_enabled)
         sw_voice.toggled.connect(lambda v: self._save("voice_enabled", v))
         card.add_row("Voice Commands",
@@ -3202,6 +3223,21 @@ class SettingsWindow(QDialog):
                     "Turn them on in Windows Settings > Personalization > Colors.")
         if getattr(card, "_footnote", "") != text:
             card.set_footnote(text)
+
+    def _on_listen_toggled(self, on: bool) -> None:
+        self._save("listen_for_jarvis", bool(on))
+        self._apply_listen_state(bool(on))
+
+    def _apply_listen_state(self, on: bool) -> None:
+        """Grey out the wake rows (whole row, not just the control) while 'Listen for Jarvis' is off."""
+        for name in ("wake_word_switch", "wake_sensitivity_combo", "followup_slider"):
+            w = getattr(self, name, None)
+            if w is None:
+                continue
+            w.setEnabled(on)
+            row = w.parentWidget()
+            if row is not None and row is not getattr(self, "assistant_card", None):
+                row.setEnabled(on)
 
     def _save(self, key: str, value) -> None:
         if key != "groq_api_key" and any(s in key.lower() for s in ("secret", "token", "password")):

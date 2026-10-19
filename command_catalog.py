@@ -173,6 +173,8 @@ _CATALOG: List[CommandSpec] = [
     # ------------------------------------------------------------- Gestures
     _g("Wake", ("Hold an open palm for half a second while on standby",),
        "Open palm hold wakes Jarvis.", "activate"),
+    _g("Listen for a command", ("Hold a \U0001F919 call-me hand (thumb and pinky out, other fingers curled) for half a second",),
+       "Ducks media and listens for one command, no wake word needed.", "listen"),
     _g("Standby", ("Hold a thumbs-up for about a second",), "Thumbs-up hold puts Jarvis on standby.", "deactivate"),
     _g("Move cursor", ("Keep your hand open and move it",), "An open palm moves the pointer.", "move"),
     _g("Click", ("Close your fist and reopen it quickly",), "Quick fist is a left click.", "click"),
