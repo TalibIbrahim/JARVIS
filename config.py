@@ -73,6 +73,8 @@ class Config:
     gesture_shortcuts_enabled: bool = True  # enable vertical slide & horizontal swipe shortcuts
     gesture_slide_volume: bool = True      # vertical slide adjusts volume (+/- 5%)
     gesture_swipe_switch: bool = True      # horizontal swipe switches windows (Alt+Tab)
+    gesture_one_hand_zoom: bool = True     # pinch-and-hold, then move the hand up/down to zoom
+    media_duck_on_wake: bool = True        # lower other apps' volume while JARVIS listens
 
     # --- cursor smoothing & decoupling ---
     smooth_min_cutoff: float = 0.6      # lower = smoother when slow, higher = more responsive
@@ -153,6 +155,8 @@ class Config:
     island_hardware_layout: str = "grid"           # "grid", "strip"
     island_size_scale: str = "medium"              # "medium", "small", "large"
     island_shape_style: str = "pill"               # "pill", "notch"
+    island_lyrics_enabled: bool = False             # show synced lyrics in the media card (fetched from LRCLIB)
+    island_lyrics_in_pill: bool = True              # when lyrics are on, show the current line in the compact pill while media plays
     island_pin_open: bool = False                  # suppress auto-collapse when pinned
     island_expand_trigger: str = "hover"           # "hover", "click", "dwell", "fist", "voice"
     island_hide_fullscreen: bool = True            # hide island when fullscreen app active
