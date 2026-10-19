@@ -240,7 +240,7 @@ class TestConfigMigrationV3(unittest.TestCase):
         self.assertEqual(cfg.island_weather_units, "celsius")
         self.assertFalse(cfg.island_show_weather)
         self.assertFalse(cfg.island_show_now_playing)
-        self.assertEqual(cfg.config_version, 3)
+        self.assertGreaterEqual(cfg.config_version, 3)
 
     def test_size_alias_values(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,7 +269,7 @@ class TestConfigMigrationV3(unittest.TestCase):
             self.assertEqual(cfg.island_clock_format, "24h")
             with open(path, encoding="utf-8") as f:
                 saved = json.load(f)
-            self.assertEqual(saved["config_version"], 3)
+            self.assertGreaterEqual(saved["config_version"], 3)
             # user later changes the canonical key; the alias is still on disk but must not win again
             saved["island_clock_format"] = "12h"
             saved["island_time_format"] = "24h"

@@ -93,7 +93,7 @@ class Config:
     tts_engine: str = "piper"           # "piper" (Paul Bettany MCU) or "system" (pyttsx3 SAPI5)
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
-    config_version: int = 3             # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification)
+    config_version: int = 4            # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification)
     wake_word_enabled: bool = True      # openWakeWord / wake word detection toggle
     wake_sensitivity: str = "balanced"  # "low", "balanced", "high"
     wake_followup_window: float = 6.0   # seconds Jarvis keeps listening after wake detection
@@ -115,7 +115,9 @@ class Config:
 
     # --- ui / apple hig appearance ---
     theme_mode: str = "auto"            # "auto" (follows Windows), "dark", "light"
-    glass_blur: bool = True             # Windows 11 Acrylic / Windows 10 blur behind
+    glass_blur: bool = True             # DEPRECATED alias (migrated to glass_mode/glass_transparency at config_version 4); kept so old files load
+    glass_mode: str = "tinted"          # "clear" | "tinted"
+    glass_transparency: float = 0.6     # 0.0 (solid) .. 1.0 (most transparent); clamped on load
     reduce_motion: bool = False         # reduce UI animations
     show_skeleton_mini: bool = True     # mini skeleton preview inside dynamic island
     ui_status_line_enabled: bool = True  # Subtle status line below thinking glyph for extended operations
@@ -497,6 +499,29 @@ def load_config(path=None):
         if _migrate_island_keys(cfg, data):
             migrated = True
         cfg.config_version = 3
+        migrated = True
+
+    # One-time migration (config_version 4): dead glass_blur bool -> glass_mode / glass_transparency.
+    if isinstance(data, dict) and _loaded_version(data) < 4:
+        import jarvis_log
+        if "glass_blur" in data and cfg.glass_blur is False:
+            cfg.glass_mode = "tinted"
+            cfg.glass_transparency = 0.0
+            jarvis_log.get_logger("config").info(
+                "migrated glass_blur=False -> glass_mode='tinted', glass_transparency=0.0")
+        cfg.config_version = 4
+        migrated = True
+
+    if cfg.glass_mode not in ("clear", "tinted"):
+        import jarvis_log
+        jarvis_log.get_logger("config").info("glass_mode %r -> tinted", cfg.glass_mode)
+        cfg.glass_mode = "tinted"
+        migrated = True
+    clamped = min(1.0, max(0.0, cfg.glass_transparency))
+    if clamped != cfg.glass_transparency or clamped != clamped:
+        import jarvis_log
+        jarvis_log.get_logger("config").info("glass_transparency %r -> clamped", cfg.glass_transparency)
+        cfg.glass_transparency = 0.6 if clamped != clamped else clamped
         migrated = True
 
     if cfg.island_idle_display not in ("off", "time", "time_weather"):
