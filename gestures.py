@@ -396,6 +396,46 @@ class GestureEngine:
             self._flash_label("RIGHT CLICK", now)
         self.rp_down = rp
 
+        # One-handed zoom: thumb+index pinch with middle/ring/pinky clearly NOT curled.
+        zp = False
+        if getattr(cfg, "gesture_one_hand_zoom", True) and not self.dragging and not rp:
+            others = (p.open_mid + p.open_ring + p.open_pinky) / 3.0
+            zp = (p.pinch_ti < (cfg.pinch_up if self.zp_down else cfg.pinch_down)
+                  and p.pinch_tm > p.pinch_ti and p.pinch_tm > cfg.pinch_down
+                  and others >= (0.45 if self.zp_down else 0.55)
+                  and cur_pose != "FIST")
+        if zp:
+            if not self.zp_down:
+                self.zp_down = True
+                self.zp_since = now
+                self._palm_hist = []
+            if not self.zoom1_on and now - self.zp_since >= getattr(cfg, "zoom_pinch_hold", 0.30):
+                self.zoom1_on = True
+                self.zp_y = None
+                self.zp_acc = 0.0
+                lb_s = getattr(cfg, "cursor_lookback_ms", 200.0) / 1000.0
+                actions.append(Action("rewind", t=self.zp_since - lb_s, age=now - self.zp_since + lb_s))
+            if self.zoom1_on:
+                self._mode = "ZOOM"
+                self._flash_label("ZOOM", now)
+                y = self._compute_palm_anchor(lm)[1]
+                if self.zp_y is not None:
+                    self.zp_acc += self.zp_y - y   # up = positive = zoom in
+                    while self.zp_acc >= cfg.zoom_step:
+                        actions.append(Action("zoom", n=1))
+                        self.zp_acc -= cfg.zoom_step
+                    while self.zp_acc <= -cfg.zoom_step:
+                        actions.append(Action("zoom", n=-1))
+                        self.zp_acc += cfg.zoom_step
+                self.zp_y = y
+            self.last_anchor = None
+            self.last_anchor_t = None
+            self.precision_active = False
+            self.clutched = False
+            return actions
+        if self.zp_down:
+            self._end_zoom_pinch(now)
+
         # Fist Hold -> Drag
         drag_hold = getattr(cfg, "fist_drag_min_hold", 0.35)
         if cur_pose == "FIST" and self.fist_active:
@@ -878,6 +918,11 @@ class GestureEngine:
         self.fist_start_t = 0.0
         self.fist_active = False
         self.reopen_freeze_until = 0.0
+        self.zp_down = False
+        self.zp_since = 0.0
+        self.zoom1_on = False
+        self.zp_y = None
+        self.zp_acc = 0.0
 
         # Shortcut state
         self._palm_hist = []
@@ -895,6 +940,17 @@ class GestureEngine:
         self.clutched = False
         self._palm_hist = []
 
+    def _end_zoom_pinch(self, now):
+        """Zoom pinch released (or aborted): hold the cursor still through the release twitch."""
+        self.zp_down = False
+        self.zoom1_on = False
+        self.zp_y = None
+        self.zp_acc = 0.0
+        self.zoom_acc = 0.0
+        self.last_anchor = None
+        self.last_anchor_t = None
+        self.reopen_freeze_until = now + getattr(self.cfg, "reopen_freeze_ms", 150.0) / 1000.0
+
     def _end_pinch(self, actions):
         if self.dragging:
             actions.append(Action("drag_end"))
@@ -902,6 +958,10 @@ class GestureEngine:
         self.dragging = False
         self.rp_down = False
         self.fist_active = False
+        self.zp_down = False
+        self.zoom1_on = False
+        self.zp_y = None
+        self.zp_acc = 0.0
 
     def _set_active(self, want, actions):
         self._end_pinch(actions)
