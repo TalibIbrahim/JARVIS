@@ -4,6 +4,7 @@ import ctypes
 import datetime
 import sys
 import threading
+import time
 
 import jarvis_log as _jlog
 
@@ -41,6 +42,107 @@ class Context:
         self.controller = controller
         self.voice = voice
         self.cfg = cfg
+        # Visible expanded island page (None = collapsed); drives hardware/weather polling.
+        self._visible_page = None
+        self._page_lock = threading.Lock()
+        self._page_listeners = []
+        # Assistant status observed from overlay events (see observe_overlay).
+        self._assist_lock = threading.Lock()
+        self._assist = {"listening_until": 0.0, "thinking_until": 0.0, "speaking_until": 0.0,
+                        "last_command": "", "last_result": ""}
+
+    # ---- visible island page (GUI thread calls this) ----
+    def set_visible_page(self, page):
+        """The GUI calls this whenever the visible expanded page changes, or with None when collapsed."""
+        page = str(page) if page else None
+        with self._page_lock:
+            old = self._visible_page
+            if old == page:
+                return
+            self._visible_page = page
+            listeners = list(self._page_listeners)
+        _jlog.get_logger("main").info("island visible page: %s -> %s", old, page)
+        for cb in listeners:
+            try:
+                cb(page)
+            except Exception:
+                _jlog.get_logger("main").exception("visible-page listener failed")
+
+    def visible_page(self):
+        return self._visible_page
+
+    def add_page_listener(self, cb):
+        with self._page_lock:
+            if cb not in self._page_listeners:
+                self._page_listeners.append(cb)
+
+    # ---- JARVIS pause tracking (engine standby) ----
+    def set_tracking_paused(self, paused):
+        """paused=True puts the gesture engine in standby; False wakes it. Applied on the next engine update."""
+        _jlog.get_logger("main").info("tracking %s via island", "paused" if paused else "resumed")
+        self.engine.request(not bool(paused))
+
+    def is_tracking_paused(self):
+        pending = getattr(self.engine, "_req", None)
+        if pending is not None and pending != "toggle":
+            return not pending
+        return not bool(getattr(self.engine, "active", True))
+
+    # ---- assistant status for the JARVIS page ----
+    def observe_overlay(self, overlay=None):
+        """Wrap overlay.post so assistant state/last action can be derived from the event stream."""
+        ov = overlay or self.overlay
+        orig = ov.post
+
+        def _post(kind, **data):
+            self._note_event(kind, data)
+            return orig(kind, **data)
+
+        ov.post = _post
+
+    def _note_event(self, kind, d):
+        now = time.monotonic()
+        with self._assist_lock:
+            a = self._assist
+            if kind == "listening":
+                a["listening_until"] = now + 5.0
+            elif kind == "wake_detected":
+                a["listening_until"] = now + float(getattr(self.cfg, "command_window", 7.0))
+            elif kind == "live_speech":
+                a["listening_until"] = now + 4.0
+            elif kind == "listening_done":
+                a["listening_until"] = 0.0
+            elif kind == "thinking":
+                a["thinking_until"] = (now + float(d.get("timeout", 8.0))) if d.get("active", True) else 0.0
+            elif kind == "say":
+                text = str(d.get("text", ""))
+                a["thinking_until"] = 0.0
+                if d.get("speak", True) and text:
+                    a["speaking_until"] = now + max(3.5, len(text) * 0.08)
+            elif kind == "ai_error":
+                a["thinking_until"] = 0.0
+            elif kind == "action_executed":
+                action = str(d.get("action", "") or "")
+                a["last_command"] = action.replace("_", " ")[:40]
+                a["last_result"] = "ok" if d.get("success", True) else "fail"
+                a["thinking_until"] = 0.0
+
+    def assistant_status(self):
+        """dict(state=idle|listening|thinking|speaking|standby, last_command=<short action name>, last_result=ok|fail|"")."""
+        now = time.monotonic()
+        with self._assist_lock:
+            a = dict(self._assist)
+        if a["speaking_until"] > now:
+            state = "speaking"
+        elif a["thinking_until"] > now:
+            state = "thinking"
+        elif a["listening_until"] > now:
+            state = "listening"
+        elif self.is_tracking_paused():
+            state = "standby"
+        else:
+            state = "idle"
+        return {"state": state, "last_command": a["last_command"], "last_result": a["last_result"]}
 
     def reload_config(self, new_cfg=None):
         if new_cfg is not None:
@@ -122,6 +224,103 @@ def post_worker_health(overlay, state, reason=""):
         log.info(msg, *args)
     overlay.post("worker_health", state=state, reason=reason)
     return True
+
+
+HARDWARE_PAGES = ("hardware", "hardware_grid", "hardware_strip")
+
+
+def tracking_fps(tracker):
+    """Tracking FPS (FrameGrabber) or None when tracking is not running."""
+    if tracker is None:
+        return None
+    grabber = getattr(tracker, "_grabber", None)
+    fps = getattr(grabber, "fps", None) if grabber is not None else getattr(tracker, "_fps", None)
+    try:
+        fps = float(fps)
+    except (TypeError, ValueError):
+        return None
+    return fps if fps > 0 else None
+
+
+def compact_shows_hardware(cfg):
+    """True when the collapsed pill is configured to display hardware data. No such compact mode exists yet."""
+    return False
+
+
+class HardwareFeed:
+    """Runs the HardwareAdapter only while hardware data is visible and posts overlay 'hardware_state' once per sample."""
+
+    def __init__(self, ctx, overlay, adapter=None):
+        from hardware_adapter import get_hardware_adapter
+        self.ctx = ctx
+        self.overlay = overlay
+        self.adapter = adapter or get_hardware_adapter()
+        self._log = _jlog.get_logger("hardware")
+
+    def wanted(self):
+        return (self.ctx.visible_page() in HARDWARE_PAGES) or compact_shows_hardware(self.ctx.cfg)
+
+    def start(self):
+        self.adapter.pause()  # idle until a hardware view is visible
+        self.adapter.add_listener(self._on_metrics)
+        self.adapter.start()
+        self.ctx.add_page_listener(lambda _page: self.update())
+        self.update()
+
+    def update(self):
+        want = self.wanted()
+        if want and self.adapter.is_paused():
+            self._log.info("hardware sampling resumed (page=%s)", self.ctx.visible_page())
+            self.adapter.resume()
+        elif not want and not self.adapter.is_paused():
+            self._log.info("hardware sampling paused (page=%s)", self.ctx.visible_page())
+            self.adapter.pause()
+
+    def stop(self):
+        self.adapter.remove_listener(self._on_metrics)
+        self.adapter.stop(timeout=1.0)
+
+    def _on_metrics(self, m):
+        if self.adapter.is_paused():
+            return
+        self.overlay.post(
+            "hardware_state",
+            cpu=m.cpu_percent, ram_used_gb=m.ram_used_gb, ram_total_gb=m.ram_total_gb, ram_pct=m.ram_percent,
+            gpu=m.gpu_percent, net_up_bps=m.net_up_bytes_sec, net_down_bps=m.net_down_bytes_sec,
+            disk_pct=m.disk_percent, fps=tracking_fps(self.ctx.tracker),
+        )
+
+
+def start_fullscreen_watcher(ctx, overlay, stop, interval=1.0, probe=None):
+    """1 s daemon poll of the foreground window; posts overlay 'fullscreen' (active=bool) on change.
+    Skips the Win32 calls entirely while island_hide_fullscreen is off."""
+    log = _jlog.get_logger("fullscreen")
+    if probe is None:
+        from fullscreen_detector import is_fullscreen_on_island_monitor as probe
+
+    def _loop():
+        last = False
+        logged = set()
+        while not stop.wait(interval):
+            enabled = bool(getattr(ctx.cfg, "island_hide_fullscreen", True))
+            active = last
+            if not enabled:
+                active = False
+            else:
+                try:
+                    active = bool(probe())
+                except Exception as exc:
+                    if repr(exc) not in logged:  # log each distinct failure once, keep last state
+                        logged.add(repr(exc))
+                        log.exception("fullscreen probe failed: %s", exc)
+            if active != last:
+                last = active
+                log.info("fullscreen %s", "entered" if active else "left")
+                overlay.post("fullscreen", active=active)
+
+    t = threading.Thread(target=_loop, name="FullscreenWatcher", daemon=True)
+    t.start()
+    return t
 
 
 def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstance_Mutex"):
@@ -266,6 +465,7 @@ def main():
     engine.set_overlay(overlay)
     ctx = Context(engine, overlay, speaker, stop, controller=controller, cfg=cfg)
     overlay.ctx = ctx
+    ctx.observe_overlay(overlay)
 
     try:
         import system_control
@@ -378,53 +578,83 @@ def main():
     )
     supervisor.start("MediaAdapter")
 
-    # Periodic Weather Poller (Auto-Geolocation & Live Conditions)
+    # Weather: cached value posted immediately, 15 min background poll, refresh when the weather
+    # page / collapsed pill becomes visible and the last success is older than 10 min.
     def _run_weather_poller():
-        from weather_client import get_weather_client
+        import time as _time
+        from weather_client import (get_weather_client, weather_state_payload, save_weather_cache,
+                                    load_weather_cache)
+        wlog = _jlog.get_logger("weather")
         client = get_weather_client()
+        wake = threading.Event()
+        state = {"last_ok": 0.0, "last_try": 0.0, "failing": False}
 
-        def _fetch_and_post():
-            city_cfg = getattr(cfg, "island_weather_city", None) or getattr(cfg, "weather_city", "auto")
-            w = client.get_weather_for_city(city_cfg, units=getattr(cfg, "weather_units", "auto"))
-            if w and overlay:
-                h_list = [
-                    {
-                        "time": h.time,
-                        "temp": h.temperature,
-                        "condition": h.condition,
-                    }
-                    for h in w.hourly
-                ]
-                overlay.post(
-                    "weather_state",
-                    temp=w.temperature,
-                    condition=w.condition,
-                    icon=w.condition,
-                    high=getattr(w, "high", w.temperature + 4.0),
-                    low=getattr(w, "low", w.temperature - 4.0),
-                    feels_like=w.apparent_temperature,
-                    city=w.city.split(",")[0],
-                    hourly=h_list,
-                    unit_symbol=w.unit_symbol,
-                )
+        def _city():
+            c = ctx.cfg
+            return getattr(c, "island_weather_city", None) or getattr(c, "weather_city", "auto")
 
+        def _units():
+            c = ctx.cfg
+            return getattr(c, "island_weather_units", None) or getattr(c, "weather_units", "auto")
+
+        def _post_cached():
+            cached = load_weather_cache(_city(), _units())
+            if cached:
+                overlay.post("weather_state", **cached["payload"], stale=cached["stale"], updated_at=cached["saved_at"])
+                wlog.info("posted cached weather (stale=%s)", cached["stale"])
+                if not cached["stale"]:
+                    state["last_ok"] = _time.monotonic() - (_time.time() - cached["saved_at"])
+
+        def _fetch_and_post(force=True):
+            state["last_try"] = _time.monotonic()
+            w = client.get_weather_for_city(_city(), units=_units(), force_refresh=force)
+            if w is None:
+                if not state["failing"]:
+                    state["failing"] = True
+                    wlog.warning("weather fetch failed; keeping last value")
+                return
+            payload = weather_state_payload(w)
+            overlay.post("weather_state", **payload, stale=bool(w.stale), updated_at=w.timestamp)
+            if w.stale:
+                if not state["failing"]:
+                    state["failing"] = True
+                    wlog.warning("weather offline; showing stale value")
+                return
+            state["failing"] = False
+            state["last_ok"] = _time.monotonic()
+            save_weather_cache(payload, _city(), _units())
+
+        def _on_page(page):
+            # weather page, or collapsed (compact pill shows weather): refresh only if stale
+            if page == "weather" or (page is None and getattr(ctx.cfg, "island_show_weather", True)
+                                     and getattr(ctx.cfg, "island_idle_display", "time_weather") == "time_weather"):
+                wake.set()
+
+        ctx.add_page_listener(_on_page)
         try:
             from weather_client import register_weather_refresh_callback
-            register_weather_refresh_callback(_fetch_and_post)
+            register_weather_refresh_callback(lambda: _fetch_and_post(force=True))
         except Exception:
-            pass
+            wlog.exception("could not register weather refresh callback")
 
         def _poller_loop():
+            _post_cached()
             if not stop.wait(2.0):
-                try:
-                    _fetch_and_post()
-                except Exception as e:
-                    print(f"[weather] Initial fetch note: {e}")
-            while not stop.wait(900.0):
-                try:
-                    _fetch_and_post()
-                except Exception as e:
-                    print(f"[weather] Periodic fetch note: {e}")
+                _fetch_and_post()
+            next_bg = _time.monotonic() + 900.0
+            while not stop.is_set():
+                wake.wait(max(1.0, next_bg - _time.monotonic()))
+                if stop.is_set():
+                    break
+                now = _time.monotonic()
+                if wake.is_set():
+                    wake.clear()
+                    if now - state["last_ok"] < 600.0 or now - state["last_try"] < 60.0:
+                        continue
+                elif now < next_bg:
+                    continue
+                _fetch_and_post()
+                next_bg = _time.monotonic() + 900.0
 
         t = threading.Thread(target=_poller_loop, name="WeatherPoller", daemon=True)
         t.start()
@@ -437,6 +667,11 @@ def main():
         backoff_base=5.0,
     )
     supervisor.start("WeatherPoller")
+
+    hardware_feed = HardwareFeed(ctx, overlay)
+    ctx.hardware_feed = hardware_feed
+    hardware_feed.start()
+    start_fullscreen_watcher(ctx, overlay, stop)
     _jlog.start_heartbeat_monitor()
 
     # 1 s worker-health poll (supervisor monitor thread); posts to the overlay only on change.
@@ -469,6 +704,10 @@ def main():
     finally:
         stop.set()
         supervisor.stop(timeout=2)
+        try:
+            hardware_feed.stop()
+        except Exception as exc:
+            _jlog.get_logger("main").warning("hardware feed stop failed: %s", exc)
         try:
             media_adapter.stop(timeout=1.0)
         except Exception:

@@ -89,3 +89,63 @@ def is_fullscreen_active(query_fn: Optional[Callable[[], int]] = None) -> bool:
     if query_fn is not None:
         return FullscreenDetector(query_fn).is_fullscreen()
     return get_fullscreen_detector().is_fullscreen()
+
+
+# --------------------------------------------------------------------------- foreground window vs monitor
+
+_SHELL_CLASSES = ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+
+
+def win32_foreground_covers_monitor() -> bool:
+    """True when the foreground window (not ours, not the shell) exactly covers the primary monitor,
+    i.e. exclusive or borderless fullscreen on the monitor the island lives on. Cheap Win32 calls only."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+    import os
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.MonitorFromPoint.restype = wintypes.HANDLE
+
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return False
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == os.getpid():
+        return False
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, cls, 64)
+    if cls.value in _SHELL_CLASSES:
+        return False
+
+    class _MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    primary = user32.MonitorFromPoint(wintypes.POINT(0, 0), 1)  # MONITOR_DEFAULTTOPRIMARY
+    mon = user32.MonitorFromWindow(hwnd, 0)                     # MONITOR_DEFAULTTONULL
+    if not mon or mon != primary:
+        return False
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(_MONITORINFO)
+    if not user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+        return False
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    m = info.rcMonitor
+    return (rect.left <= m.left and rect.top <= m.top and rect.right >= m.right and rect.bottom >= m.bottom)
+
+
+def is_fullscreen_on_island_monitor(
+    query_fn: Optional[Callable[[], int]] = None,
+    foreground_fn: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Exclusive/D3D/presentation fullscreen (shell notification state) OR a borderless window covering the monitor."""
+    if FullscreenDetector(query_fn).is_fullscreen():
+        return True
+    return bool((foreground_fn or win32_foreground_covers_monitor)())

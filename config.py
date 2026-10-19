@@ -93,7 +93,7 @@ class Config:
     tts_engine: str = "piper"           # "piper" (Paul Bettany MCU) or "system" (pyttsx3 SAPI5)
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
-    config_version: int = 2             # bumped by one-time migrations in load_config (2: prune risky wake aliases)
+    config_version: int = 3             # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification)
     wake_word_enabled: bool = True      # openWakeWord / wake word detection toggle
     wake_sensitivity: str = "balanced"  # "low", "balanced", "high"
     wake_followup_window: float = 6.0   # seconds Jarvis keeps listening after wake detection
@@ -124,17 +124,17 @@ class Config:
     show_health_panel: bool = True      # Diagnostic health card in Settings About tab
 
     # --- dynamic island & widgets ---
-    idle_display: str = "time_weather"  # "off", "time", "time_weather"
-    show_now_playing: bool = True       # display media now playing widget in island
-    show_weather: bool = True           # display weather information in island
-    weather_city: str = "New York"      # default location name
+    idle_display: str = "time_weather"  # deprecated alias -> island_idle_display
+    show_now_playing: bool = True       # deprecated alias -> island_show_now_playing
+    show_weather: bool = True           # deprecated alias -> island_show_weather
+    weather_city: str = "New York"      # deprecated alias -> island_weather_city
     weather_lat: float = 40.7128        # default latitude
     weather_lon: float = -74.0060       # default longitude
-    weather_units: str = "auto"         # "auto", "celsius", "fahrenheit"
-    time_format: str = "auto"           # "auto", "12h", "24h"
-    expand_trigger: str = "hover"       # "hover", "dwell", "click"
-    hide_fullscreen: bool = True        # hide island when fullscreen app or game active
-    island_size: str = "default"        # "compact", "default", "large"
+    weather_units: str = "auto"         # deprecated alias -> island_weather_units ("auto", "celsius", "fahrenheit")
+    time_format: str = "auto"           # deprecated alias -> island_clock_format
+    expand_trigger: str = "hover"       # deprecated alias -> island_expand_trigger
+    hide_fullscreen: bool = True        # deprecated alias -> island_hide_fullscreen
+    island_size: str = "default"        # deprecated alias -> island_size_scale
 
     # --- dynamic island pages & settings (Phase 1) ---
     island_pages: list[str] = field(default_factory=lambda: ["media", "calendar", "weather", "hardware", "jarvis"])
@@ -145,17 +145,27 @@ class Config:
         "hardware": True,
         "jarvis": True,
     })
-    island_compact_mode: str = "time_weather"       # "time_weather" or "media_aware"
-    island_time_format: str = "auto"               # "auto", "12h", "24h"
+    island_compact_mode: str = "time_weather"       # deprecated alias -> island_idle_display ("media_aware" collapses to time_weather)
+    island_time_format: str = "auto"               # deprecated alias -> island_clock_format
     island_first_weekday: str = "locale"           # "locale", "sunday", "monday"
     island_hardware_layout: str = "grid"           # "grid", "strip"
     island_size_scale: str = "medium"              # "medium", "small", "large"
     island_shape_style: str = "pill"               # "pill", "notch"
-    island_backdrop_blur: bool = False             # backdrop acrylic/blur
-    island_backdrop_opacity: float = 0.95          # background opacity (0.0 - 1.0)
     island_pin_open: bool = False                  # suppress auto-collapse when pinned
     island_expand_trigger: str = "hover"           # "hover", "click", "dwell", "fist", "voice"
     island_hide_fullscreen: bool = True            # hide island when fullscreen app active
+    # canonical keys (Phase 3 unification; old keys above kept as deprecated aliases)
+    island_clock_format: str = "auto"              # "auto", "12h", "24h"
+    island_idle_display: str = "time_weather"      # "off", "time", "time_weather"
+    island_show_now_playing: bool = True           # media takes over the compact pill while playing
+    island_show_weather: bool = True               # weather in the compact pill
+    island_weather_city: str = "New York"          # city name or "auto"
+    island_weather_units: str = "auto"             # "auto", "celsius", "fahrenheit"
+    island_hw_cpu: bool = True
+    island_hw_ram: bool = True
+    island_hw_gpu: bool = True
+    island_hw_net: bool = True
+    island_hw_disk: bool = True
     island_waveform_color: str = "blue"            # "blue" (default: blue only), "cyan", "green", "orange", "purple", "red", "pink", "monochrome", "multicolor", or hex "#RRGGBB"
 
     # --- updates ---
@@ -249,6 +259,51 @@ def clear_runtime_override(cfg, field_name: str) -> None:
 
 
 _DEPRECATED_WAKE_ALIASES = ("service", "harvest", "travis", "jar is")
+
+
+_REMOVED_KEYS = ("island_backdrop_blur", "island_backdrop_opacity")
+
+# (deprecated alias, canonical key). Copied when the user set the alias but not the canonical key.
+_ISLAND_KEY_ALIASES = (
+    ("time_format", "island_clock_format"),
+    ("island_time_format", "island_clock_format"),
+    ("idle_display", "island_idle_display"),
+    ("island_compact_mode", "island_idle_display"),
+    ("show_now_playing", "island_show_now_playing"),
+    ("show_weather", "island_show_weather"),
+    ("weather_city", "island_weather_city"),
+    ("weather_units", "island_weather_units"),
+    ("expand_trigger", "island_expand_trigger"),
+    ("hide_fullscreen", "island_hide_fullscreen"),
+    ("island_size", "island_size_scale"),
+)
+_SIZE_ALIAS_VALUES = {"compact": "small", "small": "small", "default": "medium", "medium": "medium", "large": "large"}
+
+
+def _migrate_island_keys(cfg, data: dict) -> bool:
+    """Copy deprecated alias values into canonical keys (config_version 3). Returns True if anything changed."""
+    import jarvis_log
+    log = jarvis_log.get_logger("config")
+    defaults = Config()
+    changed = False
+    for old, new in _ISLAND_KEY_ALIASES:
+        if old not in data:
+            continue
+        old_val = getattr(cfg, old)
+        if old_val == getattr(defaults, old):
+            continue  # alias left at default: nothing to carry over
+        # canonical wins when the user explicitly set it to a non-default value
+        if new in data and getattr(cfg, new) != getattr(defaults, new):
+            continue
+        if new == "island_size_scale":
+            old_val = _SIZE_ALIAS_VALUES.get(str(old_val).lower(), getattr(defaults, new))
+        if new == "island_idle_display" and old_val == "media_aware":
+            old_val = "time_weather"
+        if getattr(cfg, new) != old_val:
+            setattr(cfg, new, old_val)
+            log.info("config migration v3: %s -> %s", old, new)
+            changed = True
+    return changed
 
 
 def get_config_path(explicit_path=None):
@@ -436,6 +491,24 @@ def load_config(path=None):
             jarvis_log.get_logger("config").info("migrated wake_aliases: removed %s", removed)
         cfg.config_version = 2
         migrated = True
+
+    # One-time migration (config_version 3): unify duplicate island keys into canonical island_* keys.
+    if isinstance(data, dict) and _loaded_version(data) < 3:
+        if _migrate_island_keys(cfg, data):
+            migrated = True
+        cfg.config_version = 3
+        migrated = True
+
+    if cfg.island_idle_display not in ("off", "time", "time_weather"):
+        import jarvis_log
+        jarvis_log.get_logger("config").info("island_idle_display %r -> time_weather", cfg.island_idle_display)
+        cfg.island_idle_display = "time_weather"  # legacy "media_aware": media takeover is island_show_now_playing
+        migrated = True
+
+    dropped = [k for k in _REMOVED_KEYS if isinstance(data, dict) and k in data]
+    if dropped:
+        import jarvis_log
+        jarvis_log.get_logger("config").info("ignoring removed config keys: %s", dropped)
 
     if needs_repair or type_repaired or migrated:
         try:

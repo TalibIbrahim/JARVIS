@@ -544,3 +544,91 @@ def trigger_weather_refresh() -> None:
             threading.Thread(target=_WEATHER_REFRESH_CALLBACK, daemon=True).start()
         except Exception as exc:
             print(f"[weather_client] refresh trigger error: {exc}")
+
+
+# --------------------------------------------------------------------------- weather_state payload + disk cache
+
+STALE_AFTER_SECONDS = 3600.0  # cached value older than this is posted with stale=True
+
+
+def weather_state_payload(w: "WeatherData") -> Dict[str, Any]:
+    """Builds the kwargs of overlay.post("weather_state", ...). None = unavailable.
+
+    wind_kmh is always km/h (converted from mph when the client fetched imperial units).
+    """
+    wind = w.wind_speed
+    wind_kmh: Optional[float] = None
+    if wind is not None:
+        wind_kmh = float(wind) * (1.609344 if w.speed_unit == "mph" else 1.0)
+    return {
+        "temp": w.temperature,
+        "condition": w.condition,
+        "icon": w.condition,
+        "high": w.high,
+        "low": w.low,
+        "feels_like": w.apparent_temperature,
+        "city": w.city.split(",")[0],
+        "hourly": [{"time": h.time, "temp": h.temperature, "condition": h.condition} for h in w.hourly],
+        "unit_symbol": w.unit_symbol,
+        "wind_kmh": None if wind_kmh is None else round(wind_kmh, 1),
+        "wind_dir_deg": w.wind_direction,
+        "humidity": None if w.relative_humidity is None else float(w.relative_humidity),
+    }
+
+
+def weather_cache_path() -> str:
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(appdata, "JARVIS", "weather_cache.json")
+
+
+def save_weather_cache(payload: Dict[str, Any], config_city: str, units: str,
+                       now: Optional[float] = None, path: Optional[str] = None) -> bool:
+    """Atomically persists the last successful weather_state payload (tmp file + os.replace)."""
+    import jarvis_log
+    target = path or weather_cache_path()
+    doc = {
+        "saved_at": time.time() if now is None else float(now),
+        "config_city": str(config_city or ""),
+        "units": str(units or "auto"),
+        "payload": payload,
+    }
+    tmp = f"{target}.tmp"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        return True
+    except Exception as exc:
+        jarvis_log.get_logger("weather").warning("weather cache write failed: %s", exc)
+        return False
+
+
+def load_weather_cache(config_city: str, units: str, now: Optional[float] = None,
+                       path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Returns {"payload": {...}, "saved_at": float, "stale": bool} or None (missing/corrupt/other city/units)."""
+    import jarvis_log
+    log = jarvis_log.get_logger("weather")
+    target = path or weather_cache_path()
+    if not os.path.exists(target):
+        return None
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        payload = doc["payload"]
+        saved_at = float(doc["saved_at"])
+        if not isinstance(payload, dict):
+            raise ValueError("payload is not an object")
+    except Exception as exc:
+        log.warning("weather cache unreadable (%s): %s", target, exc)
+        return None
+    if str(doc.get("config_city", "")).strip().lower() != str(config_city or "").strip().lower():
+        log.info("weather cache ignored: configured city changed")
+        return None
+    if str(doc.get("units", "auto")) != str(units or "auto"):
+        log.info("weather cache ignored: units changed")
+        return None
+    age = (time.time() if now is None else float(now)) - saved_at
+    return {"payload": payload, "saved_at": saved_at, "stale": age > STALE_AFTER_SECONDS}

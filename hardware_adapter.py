@@ -1,13 +1,15 @@
 """
 hardware_adapter.py — J.A.R.V.I.S. System Hardware Metrics Adapter.
 
-Monitors system resources (CPU, RAM, GPU, Network I/O, Disk, FPS) using psutil
-and pynvml with zero background CPU overhead when paused.
+Monitors system resources (CPU, RAM, GPU, Network I/O, Disk, FPS) using psutil,
+NVML (nvidia-ml-py, imported as ``pynvml``) and, when NVML is absent, in-process
+Windows PDH "GPU Engine" counters, with zero background CPU overhead when paused.
 
 Features:
   - Background thread polling at ~1s intervals.
   - Lifecycle controls (pause, resume, is_paused): strictly pauses all metric collection
     when collapsed or hidden, preventing idle power drain.
+  - None means "unavailable" (the UI shows "--"); numbers are never invented.
   - Pure Python, 100% unit-testable with mock psutil/pynvml backends; strictly NO Qt imports.
   - Formatters: format_speed(), format_gb(), format_percent().
 """
@@ -19,13 +21,87 @@ import os
 import sys
 import threading
 import time
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import jarvis_log as _jlog
 
 try:
     import psutil
     _PSUTIL_AVAILABLE = True
 except ImportError:
     _PSUTIL_AVAILABLE = False
+
+_log = _jlog.get_logger("hardware")
+
+
+def _import_pynvml():
+    """Import pynvml (provided by the nvidia-ml-py package) without the legacy-package deprecation noise."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        import pynvml
+    return pynvml
+
+
+class _PdhGpuCounter:
+    """In-process GPU utilisation via Windows PDH 'GPU Engine' counters (win32pdh); no subprocess per sample.
+
+    Task-Manager style: sum the utilisation of every process instance per engine type, take the busiest type.
+    """
+
+    PATH = "\\GPU Engine(*)\\Utilization Percentage"
+    REEXPAND_EVERY = 10  # samples; process instances come and go
+
+    def __init__(self):
+        import win32pdh  # ImportError when pywin32 is missing
+        self._pdh = win32pdh
+        self._query = win32pdh.OpenQuery()
+        self._counters: Dict[str, Any] = {}
+        self._n = 0
+        self._primed = False
+        self._expand()
+
+    def _expand(self) -> None:
+        pdh = self._pdh
+        paths = pdh.ExpandCounterPath(self.PATH)
+        for p in list(self._counters):
+            if p not in paths:
+                try:
+                    pdh.RemoveCounter(self._counters.pop(p))
+                except Exception as exc:
+                    _log.debug("pdh remove counter failed: %s", exc)
+        for p in paths:
+            if p not in self._counters:
+                self._counters[p] = pdh.AddCounter(self._query, p)
+        if not self._counters:
+            raise RuntimeError("no GPU Engine PDH counters available")
+
+    def sample(self) -> Optional[float]:
+        pdh = self._pdh
+        if self._n and self._n % self.REEXPAND_EVERY == 0:
+            self._expand()
+        self._n += 1
+        pdh.CollectQueryData(self._query)
+        if not self._primed:  # rate counters need two collections
+            self._primed = True
+            return None
+        by_type: Dict[str, float] = {}
+        for path, handle in self._counters.items():
+            try:
+                _, val = pdh.GetFormattedCounterValue(handle, pdh.PDH_FMT_DOUBLE)
+            except Exception:
+                continue  # instance vanished between expand and collect
+            etype = path.rsplit("engtype_", 1)[-1].split(")")[0] if "engtype_" in path else "?"
+            by_type[etype] = by_type.get(etype, 0.0) + float(val)
+        if not by_type:
+            return None
+        return max(0.0, min(100.0, max(by_type.values())))
+
+    def close(self) -> None:
+        try:
+            self._pdh.CloseQuery(self._query)
+        except Exception as exc:
+            _log.debug("pdh close failed: %s", exc)
 
 
 def format_speed(bytes_per_sec: float) -> str:
@@ -55,17 +131,17 @@ def format_percent(val: Optional[float]) -> str:
 
 @dataclass
 class HardwareMetrics:
-    """Snapshot of system hardware utilization and telemetry."""
-    cpu_percent: float = 0.0
-    ram_used_gb: float = 0.0
-    ram_total_gb: float = 0.0
-    ram_percent: float = 0.0
+    """Snapshot of system hardware utilization and telemetry. None = unavailable."""
+    cpu_percent: Optional[float] = 0.0
+    ram_used_gb: Optional[float] = 0.0
+    ram_total_gb: Optional[float] = 0.0
+    ram_percent: Optional[float] = 0.0
     gpu_percent: Optional[float] = None
     gpu_name: Optional[str] = None
-    net_up_bytes_sec: float = 0.0
-    net_down_bytes_sec: float = 0.0
-    disk_percent: float = 0.0
-    fps: float = 0.0
+    net_up_bytes_sec: Optional[float] = 0.0
+    net_down_bytes_sec: Optional[float] = 0.0
+    disk_percent: Optional[float] = 0.0
+    fps: Optional[float] = 0.0
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -113,20 +189,25 @@ class HardwareAdapter:
         self._last_net_counters: Optional[Any] = None
         self._last_net_time: float = 0.0
 
-        # NVML state
+        # GPU sources
         self._nvml_initialized: bool = False
         self._nvml_failed: bool = False
+        self._pdh: Optional[_PdhGpuCounter] = None
+        self._pdh_failed: bool = False
+        self._failed_once: set = set()  # metric names whose failure has already been logged
 
-        # External FPS indicator
-        self._current_fps: float = 60.0
+        # External FPS indicator (None until a tracker reports one)
+        self._current_fps: Optional[float] = None
 
-        # Prime initial net counters if available
+        self._prime_net()
+
+    def _prime_net(self) -> None:
         if _PSUTIL_AVAILABLE:
             try:
                 self._last_net_counters = psutil.net_io_counters()
                 self._last_net_time = self._clock()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._fail("net", exc)
 
     def start(self) -> None:
         """Starts background monitoring thread."""
@@ -157,6 +238,9 @@ class HardwareAdapter:
 
     def resume(self) -> None:
         """Resumes active polling when the hardware page becomes visible."""
+        if self._is_paused:
+            # Net rates are deltas: re-prime so the first sample after a pause is not a huge average.
+            self._prime_net()
         self._is_paused = False
         self._resume_event.set()
 
@@ -164,10 +248,15 @@ class HardwareAdapter:
         """Returns True if telemetry collection is currently paused."""
         return self._is_paused
 
-    def set_fps(self, fps: float) -> None:
-        """Sets the current display or render loop FPS."""
+    def set_fps(self, fps: Optional[float]) -> None:
+        """Sets the current tracking FPS; None means tracking is not running."""
         with self._lock:
-            self._current_fps = max(0.0, float(fps))
+            self._current_fps = None if fps is None else max(0.0, float(fps))
+
+    def _fail(self, metric: str, exc: BaseException) -> None:
+        if metric not in self._failed_once:
+            self._failed_once.add(metric)
+            _log.warning("hardware metric %s unavailable: %s", metric, exc)
 
     def add_listener(self, callback: Callable[[HardwareMetrics], None]) -> None:
         """Registers a listener for updated hardware metrics."""
@@ -188,44 +277,33 @@ class HardwareAdapter:
 
     def sample(self) -> HardwareMetrics:
         """
-        Samples hardware metrics directly using psutil and NVML.
-        Updates internal cache and notifies listeners.
+        Samples hardware metrics directly using psutil and NVML/PDH.
+        Updates internal cache and notifies listeners. Unavailable metrics are None.
         """
         now = self._clock()
 
-        cpu_pct = 0.0
-        ram_used = 0.0
-        ram_total = 0.0
-        ram_pct = 0.0
-        disk_pct = 0.0
-        net_up = 0.0
-        net_down = 0.0
+        cpu_pct = ram_used = ram_total = ram_pct = disk_pct = net_up = net_down = None
 
         if _PSUTIL_AVAILABLE:
-            # 1. CPU
             try:
                 cpu_pct = float(psutil.cpu_percent(interval=None))
-            except Exception:
-                cpu_pct = 0.0
+            except Exception as exc:
+                self._fail("cpu", exc)
 
-            # 2. RAM
             try:
                 mem = psutil.virtual_memory()
                 ram_total = float(mem.total) / (1024.0 ** 3)
                 ram_used = float(mem.used) / (1024.0 ** 3)
                 ram_pct = float(mem.percent)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._fail("ram", exc)
 
-            # 3. Disk Usage (primary drive)
             try:
-                drive = "C:\\" if sys.platform == "win32" else "/"
-                disk = psutil.disk_usage(drive)
-                disk_pct = float(disk.percent)
-            except Exception:
-                pass
+                drive = (os.environ.get("SystemDrive", "C:") + "\\") if sys.platform == "win32" else "/"
+                disk_pct = float(psutil.disk_usage(drive).percent)
+            except Exception as exc:
+                self._fail("disk", exc)
 
-            # 4. Network Rate Delta
             try:
                 net = psutil.net_io_counters()
                 if self._last_net_counters is not None:
@@ -237,10 +315,11 @@ class HardwareAdapter:
                         net_down = float(recv_bytes) / dt
                 self._last_net_counters = net
                 self._last_net_time = now
-            except Exception:
-                pass
+            except Exception as exc:
+                self._fail("net", exc)
+        else:
+            self._fail("psutil", RuntimeError("psutil not installed"))
 
-        # 5. GPU Telemetry
         gpu_pct, gpu_name = self._sample_gpu()
 
         with self._lock:
@@ -268,44 +347,58 @@ class HardwareAdapter:
             try:
                 l(metrics)
             except Exception as exc:
-                print(f"[hardware_adapter] Listener error: {exc}")
+                _log.warning("hardware listener error: %s", exc)
 
         return metrics
 
     def _sample_gpu(self) -> Tuple[Optional[float], Optional[str]]:
-        """Samples NVIDIA GPU utilization and name via pynvml with graceful fallback."""
-        if self._nvml_failed:
-            return None, None
+        """GPU utilisation: NVML first, then in-process PDH 'GPU Engine' counters, else (None, None)."""
+        if not self._nvml_failed:
+            if not self._nvml_initialized:
+                try:
+                    _import_pynvml().nvmlInit()
+                    self._nvml_initialized = True
+                except Exception as exc:
+                    self._nvml_failed = True
+                    _log.info("NVML unavailable (%s); trying PDH GPU Engine counters", exc)
+            if self._nvml_initialized:
+                try:
+                    pynvml = _import_pynvml()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    name_raw = pynvml.nvmlDeviceGetName(handle)
+                    name = name_raw.decode("utf-8") if isinstance(name_raw, bytes) else str(name_raw)
+                    return float(rates.gpu), name
+                except Exception as exc:
+                    self._fail("gpu-nvml", exc)
+                    return None, None
+        return self._sample_gpu_pdh(), None
 
-        if not self._nvml_initialized:
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                self._nvml_initialized = True
-            except Exception:
-                self._nvml_failed = True
-                return None, None
-
+    def _sample_gpu_pdh(self) -> Optional[float]:
+        if self._pdh_failed or sys.platform != "win32":
+            return None
         try:
-            import pynvml
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            name_raw = pynvml.nvmlDeviceGetName(handle)
-            name = name_raw.decode("utf-8") if isinstance(name_raw, bytes) else str(name_raw)
-            return float(rates.gpu), name
-        except Exception:
-            return None, None
+            if self._pdh is None:
+                self._pdh = _PdhGpuCounter()
+                _log.info("GPU utilisation source: PDH GPU Engine counters")
+            return self._pdh.sample()
+        except Exception as exc:
+            self._pdh_failed = True
+            _log.warning("GPU utilisation unavailable (PDH fallback failed): %s", exc)
+            return None
 
     def _cleanup_nvml(self) -> None:
-        """Shuts down NVML safely on exit."""
+        """Shuts down NVML / PDH safely on exit."""
         if self._nvml_initialized:
             try:
-                import pynvml
-                pynvml.nvmlShutdown()
-            except Exception:
-                pass
+                _import_pynvml().nvmlShutdown()
+            except Exception as exc:
+                _log.debug("nvmlShutdown failed: %s", exc)
             finally:
                 self._nvml_initialized = False
+        if self._pdh is not None:
+            self._pdh.close()
+            self._pdh = None
 
     def _worker_loop(self) -> None:
         """Background thread executing periodic hardware metric sampling."""
@@ -318,7 +411,7 @@ class HardwareAdapter:
             try:
                 self.sample()
             except Exception as exc:
-                print(f"[hardware_adapter] Worker sampling error: {exc}")
+                _log.warning("hardware sampling error: %s", exc)
 
             # Sleep poll interval with interruptible wait
             self._stop_event.wait(timeout=self._poll_interval)

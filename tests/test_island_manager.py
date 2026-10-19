@@ -470,8 +470,6 @@ class TestIslandPageManager(unittest.TestCase):
         cfg.island_shape_style = "notch"
         cfg.island_expand_trigger = "fist"
         cfg.island_pin_open = True
-        cfg.island_backdrop_blur = True
-        cfg.island_backdrop_opacity = 0.88
         cfg.island_waveform_color = "cyan"
 
         mgr = IslandPageManager(config=cfg, clock_fn=self.clock)
@@ -483,8 +481,9 @@ class TestIslandPageManager(unittest.TestCase):
         self.assertEqual(mgr.shape_style, IslandShapeStyle.NOTCH)
         self.assertEqual(mgr.expand_trigger, IslandExpandTrigger.FIST)
         self.assertTrue(mgr.pin_open)
-        self.assertTrue(mgr.backdrop_blur)
-        self.assertEqual(mgr.backdrop_opacity, 0.88)
+        # island is solid black: backdrop settings were removed
+        self.assertFalse(hasattr(mgr, "backdrop_blur"))
+        self.assertFalse(hasattr(mgr, "backdrop_opacity"))
         self.assertEqual(mgr.waveform_color, "cyan")
 
     def test_config_serializable_dict(self):
@@ -500,12 +499,27 @@ class TestIslandPageManager(unittest.TestCase):
         self.assertIn("island_hardware_layout", d)
         self.assertIn("island_size_scale", d)
         self.assertIn("island_shape_style", d)
-        self.assertIn("island_backdrop_blur", d)
-        self.assertIn("island_backdrop_opacity", d)
+        self.assertNotIn("island_backdrop_blur", d)
+        self.assertNotIn("island_backdrop_opacity", d)
         self.assertIn("island_pin_open", d)
         self.assertIn("island_expand_trigger", d)
         self.assertIn("island_hide_fullscreen", d)
         self.assertIn("island_waveform_color", d)
+
+    def test_old_config_with_removed_backdrop_keys_loads_and_drops_them(self):
+        """An old config file containing the removed backdrop keys loads cleanly and the keys are dropped."""
+        import json, os, tempfile
+        from config import load_config
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "jarvis_config.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"config_version": 2, "island_backdrop_blur": True,
+                           "island_backdrop_opacity": 0.5, "island_size_scale": "large"}, f)
+            cfg = load_config(path)
+            self.assertEqual(cfg.island_size_scale, "large")
+            self.assertNotIn("island_backdrop_blur", cfg.to_dict())
+            self.assertNotIn("island_backdrop_opacity", cfg.to_dict())
+            self.assertFalse(hasattr(cfg, "island_backdrop_blur"))
 
     def test_tracking_toggle_and_setter(self):
         """IslandPageManager supports tracking state querying, toggling, and setting."""

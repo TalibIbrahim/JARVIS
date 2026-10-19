@@ -176,8 +176,6 @@ class IslandPageManager:
         self.compact_mode: str = "time_weather"
         self.time_format: str = "auto"
         self.first_weekday: str = "locale"
-        self.backdrop_blur: bool = False
-        self.backdrop_opacity: float = 0.95
         self.hide_fullscreen: bool = True
         self.waveform_color: str = "blue"
 
@@ -636,10 +634,8 @@ class IslandPageManager:
 
         # Modes & Flags
         self.compact_mode = str(_get("island_compact_mode", self.compact_mode))
-        self.time_format = str(_get("island_time_format", self.time_format))
+        self.time_format = str(_get("island_clock_format", _get("island_time_format", self.time_format)))
         self.first_weekday = str(_get("island_first_weekday", self.first_weekday))
-        self.backdrop_blur = bool(_get("island_backdrop_blur", self.backdrop_blur))
-        self.backdrop_opacity = float(_get("island_backdrop_opacity", self.backdrop_opacity))
         self.pin_open = bool(_get("island_pin_open", self.pin_open))
         self.hide_fullscreen = bool(_get("island_hide_fullscreen", self.hide_fullscreen))
         self.waveform_color = str(_get("island_waveform_color", self.waveform_color))

@@ -360,52 +360,15 @@ def handle_island_voice_command(text: str, ctx: Any = None) -> Optional[str]:
         clean_t = re.sub(r"^(?:jarvis\s+|hey\s+jarvis\s+|ok\s+jarvis\s+)", "", clean_t).strip()
 
     def _post(kind: str, **kwargs):
+        # Thread-safety: this runs on the voice worker thread. Never touch Qt widgets here;
+        # the only channel to the island is overlay.post (drained on the GUI thread).
         if not ctx:
             return
         ov = getattr(ctx, "overlay", None)
-        if ov is not None:
-            if hasattr(ov, "post"):
-                try:
-                    ov.post(kind, **kwargs)
-                except Exception:
-                    pass
-            if hasattr(ov, kind):
-                try:
-                    getattr(ov, kind)(**kwargs)
-                except Exception:
-                    pass
-            island = getattr(ov, "island", None)
-            if island is not None:
-                if kind == "island_page_step" and hasattr(island, "expand_card") and hasattr(island, "card_pages"):
-                    try:
-                        curr = getattr(island, "expanded_card", "weather") or "weather"
-                        pages = getattr(island, "card_pages", ["media", "time", "weather", "hardware", "jarvis"])
-                        idx = pages.index(curr) if curr in pages else 0
-                        direction = kwargs.get("direction", 1)
-                        island.expand_card(pages[(idx + direction) % len(pages)])
-                    except Exception:
-                        pass
-                elif kind == "island_show_page" and hasattr(island, "expand_card"):
-                    try:
-                        p = kwargs.get("page", "weather")
-                        island.expand_card(p)
-                    except Exception:
-                        pass
-                elif kind == "island_expand" and hasattr(island, "expand_card"):
-                    try:
-                        island.expand_card(getattr(island, "expanded_card", "weather") or "weather")
-                    except Exception:
-                        pass
-                elif kind == "island_collapse" and hasattr(island, "collapse_card"):
-                    try:
-                        island.collapse_card()
-                    except Exception:
-                        pass
+        if ov is not None and hasattr(ov, "post"):
+            ov.post(kind, **kwargs)
         elif hasattr(ctx, "post"):
-            try:
-                ctx.post(kind, **kwargs)
-            except Exception:
-                pass
+            ctx.post(kind, **kwargs)
 
     # 1. Page Step (Next)
     if clean_t in ("next page", "next card") or _any(clean_t, "next page", "next card"):
@@ -422,7 +385,7 @@ def handle_island_voice_command(text: str, ctx: Any = None) -> Optional[str]:
     # 3. Show weather / weather page
     if clean_t in ("show weather", "weather page", "weather card") or _any(clean_t, "show weather", "weather page", "weather card"):
         _post("island_show_page", page="weather")
-        _post("expand_widget", widget="weather")
+        _post("expand_widget", widget="weather")  # legacy no-op kind, kept for compatibility
         _post_action(ctx, "island_show_page", True, args={"page": "weather"}, text=text)
         return "Displaying weather forecast, sir."
 
@@ -435,7 +398,7 @@ def handle_island_voice_command(text: str, ctx: Any = None) -> Optional[str]:
     # 5. Show media / media page
     if clean_t in ("show media", "media page", "media card") or _any(clean_t, "show media", "media page", "media card"):
         _post("island_show_page", page="media")
-        _post("expand_widget", widget="media")
+        _post("expand_widget", widget="media")  # legacy no-op kind, kept for compatibility
         _post_action(ctx, "island_show_page", True, args={"page": "media"}, text=text)
         return "Displaying media controls, sir."
 
@@ -670,7 +633,7 @@ def _run_single_command(text, ctx):
     if _any(clean_t, "set up ai", "setup ai", "configure ai", "ai settings", "open ai settings"):
         _post_action(ctx, "settings", True)
         if hasattr(ctx, "overlay") and ctx.overlay:
-            ctx.overlay.open_settings("AI")
+            ctx.overlay.open_settings("AI")  # self-marshals to the GUI thread when off-thread
             return "Opening AI settings, sir."
         return "Settings overlay is unavailable, sir."
 
