@@ -1,18 +1,24 @@
-"""ui/island_parts/calendar.py - Calendar / time card renderer (verbatim move from island.py)."""
+"""ui/island_parts/calendar.py - Calendar / time card renderer (MEASUREMENT_SHEET_v2).
+
+The whole card content (left date panel, weekday header, rule, month grid) is rendered once into a pixmap keyed by
+(date, first weekday, dpr, size scale) and blitted; it is redrawn only when the day (or config) changes.
+"""
 
 from __future__ import annotations
 
 import datetime
 from typing import Optional
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFontMetricsF, QPainter, QPixmap
 from PySide6.QtCore import QPointF, QRectF, Qt
-from ui.tokens import TYPE, qfont
+from ui.tokens import ISLAND, TYPE, qfont
 from ui.island_parts.common import create_cached_squircle_path
+
+_L = ISLAND.calendar
+_C = ISLAND.color
 
 
 class CalendarPageMixin:
-    """Calendar / time card renderer (verbatim move from island.py).
-    Methods only; all state lives on the AppleDynamicIsland instance."""
+    """Calendar / time card renderer. Methods only; all state lives on the AppleDynamicIsland instance."""
 
     def _get_calendar_data(self, now: float):
         """Retrieves and caches CalendarData for zero-allocation 60 FPS rendering."""
@@ -41,157 +47,90 @@ class CalendarPageMixin:
         self._cached_calendar_key = key
         return data
 
+    # ── cached content pixmap ───────────────────────────────────────────────
+
+    def _calendar_pixmap(self, data, dpr: float, scale: float) -> QPixmap:
+        key = (self._cached_calendar_key, round(dpr, 3), round(scale, 3))
+        if getattr(self, "_cal_pix_key", None) == key and getattr(self, "_cal_pix", None) is not None:
+            return self._cal_pix
+        pix = QPixmap(max(1, int(round(_L.w * scale * dpr))), max(1, int(round(_L.h * scale * dpr))))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(Qt.GlobalColor.transparent)
+        cp = QPainter(pix)
+        cp.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cp.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        cp.scale(scale, scale)
+        self._paint_calendar_content(cp, data)
+        cp.end()
+        self._cal_pix, self._cal_pix_key = pix, key
+        return pix
+
+    @staticmethod
+    def _draw_centered(p: QPainter, text: str, cx: float, baseline: float, token, color: QColor) -> None:
+        font = qfont(token)
+        fm = QFontMetricsF(font)
+        p.setFont(font)
+        p.setPen(color)
+        p.drawText(QPointF(cx - fm.horizontalAdvance(text) / 2.0, baseline), text)
+
+    def _paint_calendar_content(self, p: QPainter, data) -> None:
+        """Paint the full card content in 1x logical coordinates (origin = card top-left)."""
+        # Left panel
+        px, py = _L.panel_x, _L.panel_y
+        panel = QRectF(px, py, _L.panel_w, _L.panel_h)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_C.tile_fill)
+        p.drawPath(create_cached_squircle_path(panel, _L.panel_radius))
+        cx = px + _L.panel_w / 2.0
+        self._draw_centered(p, data.month_name[:1].upper() + data.month_name[1:].lower(), cx, py + _L.month_baseline, TYPE.cal_month, _C.accent)
+        self._draw_centered(p, str(data.year), cx, py + _L.year_baseline, TYPE.cal_year, _C.dim)
+        self._draw_centered(p, str(data.day), cx, py + _L.day_baseline, TYPE.cal_day, _C.value)
+        self._draw_centered(p, data.weekday_name, cx, py + _L.weekday_baseline, TYPE.cal_weekday, _C.secondary)
+
+        # Weekday header + hairline rule
+        for c_idx, letter in enumerate(data.weekday_headers):
+            self._draw_centered(p, letter, _L.col_x0 + c_idx * _L.col_pitch, _L.dow_baseline, TYPE.cal_dow, _C.dow)
+        p.fillRect(QRectF(_L.rule_x0, _L.rule_y - _L.rule_h / 2.0, _L.rule_x1 - _L.rule_x0, _L.rule_h), _C.divider)
+
+        # Month grid: in-month digits bright, weekend columns dim, out-of-month cells blank (as in the reference),
+        # today = accent circle with a white digit
+        rows = len(data.grid)
+        pitch = _L.row_pitch if rows <= 5 else (4 * _L.row_pitch) / (rows - 1)
+        font = qfont(TYPE.cal_digit)
+        fm = QFontMetricsF(font)
+        p.setFont(font)
+        for r_idx, week in enumerate(data.grid):
+            baseline = _L.row_baseline0 + r_idx * pitch
+            for c_idx, day in enumerate(week):
+                if not day.is_current_month:
+                    continue
+                dcx = _L.col_x0 + c_idx * _L.col_pitch
+                txt = str(day.day_number)
+                if day.is_today:
+                    rr = _L.today_d / 2.0
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(_C.accent)
+                    p.drawEllipse(QPointF(dcx, baseline - _L.digit_h / 2.0 + _L.today_dy), rr, rr)
+                    p.setPen(_C.white)
+                elif day.is_weekend:
+                    p.setPen(_C.dim)
+                else:
+                    p.setPen(_C.digit)
+                p.drawText(QPointF(dcx - fm.horizontalAdvance(txt) / 2.0, baseline), txt)
+
     def _draw_calendar_card(self, p: QPainter, w: float, h: float,
                             now: float, dark: bool,
                             primary: QColor, secondary: QColor, accent: QColor) -> None:
-        """
-        Expanded Calendar Page Card (390x188 px):
-        - Left tile: Inset tile (radius ~17px, fill #FFFFFF17, border 1px #FFFFFF0A):
-          * Month name in accent color (#45C1EE).
-          * Year in gray (#8E9094).
-          * Very large bold day number (heavy font, #F5F5F7).
-          * Weekday name at the bottom (#8E9094).
-        - Right side:
-          * Weekday header row over a hairline divider.
-          * Weekends dimmed (#55585C).
-          * Current month days in #F5F5F7.
-          * Today highlighted as a filled accent circle (#45C1EE) with white text.
-        """
+        """Expanded Calendar Page Card (390x188): cached date panel + weekday header + month grid."""
         scale = self._get_size_scale()
         data = self._get_calendar_data(now)
         if not data:
             return
-
-        # ── 1. Left Tile: Inset Tile ──────────────────────────────────────
-        lx = 20.0 * scale
-        ly = 20.0 * scale
-        tile_w = 112.0 * scale
-        tile_h = h - 40.0 * scale  # 148.0 * scale
-        tile_r = 17.0 * scale
-
-        t_rect = QRectF(lx, ly, tile_w, tile_h)
-        t_path = create_cached_squircle_path(t_rect, tile_r)
-
-        # Inset tile fill #FFFFFF17 and border 1px #FFFFFF0A
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(255, 255, 255, 23 if dark else 55)))
-        p.drawPath(t_path)
-        p.strokePath(t_path, QPen(QColor(255, 255, 255, 10 if dark else 25), 1.0))
-
-        # Month name in accent color (#45C1EE)
-        month_font = qfont(TYPE.footnote)
-        month_font.setPointSize(int(11 * scale))
-        month_font.setWeight(QFont.Weight.DemiBold)
-        p.setFont(month_font)
-        p.setPen(QColor("#45C1EE"))
-        p.drawText(QRectF(lx, ly + 14.0 * scale, tile_w, 18.0 * scale),
-                   Qt.AlignmentFlag.AlignCenter, data.month_name.upper())
-
-        # Year in gray (#8E9094)
-        year_font = qfont(TYPE.caption_1)
-        year_font.setPointSize(int(10 * scale))
-        year_font.setWeight(QFont.Weight.Medium)
-        p.setFont(year_font)
-        p.setPen(QColor("#8E9094"))
-        p.drawText(QRectF(lx, ly + 32.0 * scale, tile_w, 16.0 * scale),
-                   Qt.AlignmentFlag.AlignCenter, str(data.year))
-
-        # Very large bold day number (heavy font, #F5F5F7)
-        day_font = QFont("Segoe UI Variable Display", int(44 * scale), QFont.Weight.Bold)
-        day_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        p.setFont(day_font)
-        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-        p.drawText(QRectF(lx, ly + 46.0 * scale, tile_w, 58.0 * scale),
-                   Qt.AlignmentFlag.AlignCenter, str(data.day))
-
-        # Weekday name at the bottom (#8E9094)
-        weekday_font = qfont(TYPE.subheadline)
-        weekday_font.setPointSize(int(12 * scale))
-        weekday_font.setWeight(QFont.Weight.Medium)
-        p.setFont(weekday_font)
-        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
-        p.drawText(QRectF(lx, ly + 114.0 * scale, tile_w, 20.0 * scale),
-                   Qt.AlignmentFlag.AlignCenter, data.weekday_name)
-
-        # ── 2. Right Side: Calendar Grid ──────────────────────────────────
-        rx = lx + tile_w + 16.0 * scale
-        rw = (w - 28.0 * scale) - rx  # leaving room before the 5 dots on right edge
-        ry = ly
-        rh = tile_h
-
-        # Weekday header row
-        hdr_h = 20.0 * scale
-        col_w = rw / 7.0
-        hdr_font = qfont(TYPE.caption_2)
-        hdr_font.setPointSize(int(9 * scale))
-        hdr_font.setWeight(QFont.Weight.DemiBold)
-        p.setFont(hdr_font)
-
-        for c_idx in range(7):
-            hdr_text = data.weekday_headers[c_idx]
-            is_weekend_col = (data.grid[0][c_idx].is_weekend if data.grid else False)
-            if is_weekend_col:
-                p.setPen(QColor("#55585C"))
-            else:
-                p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
-            p.drawText(QRectF(rx + c_idx * col_w, ry + 2.0 * scale, col_w, hdr_h),
-                       Qt.AlignmentFlag.AlignCenter, hdr_text)
-
-        # Hairline divider
-        div_y = ry + hdr_h + 4.0 * scale
-        p.setPen(QPen(QColor(255, 255, 255, 18 if dark else 35), 1.0))
-        p.drawLine(QPointF(rx + 2.0 * scale, div_y), QPointF(rx + rw - 2.0 * scale, div_y))
-
-        # Grid of days
-        grid_top = div_y + 4.0 * scale
-        avail_h = (ry + rh) - grid_top
-        num_rows = len(data.grid)
-        row_h = avail_h / max(1, num_rows)
-
-        day_font = qfont(TYPE.caption_1)
-        day_font.setPointSize(int(10 * scale))
-        day_font.setWeight(QFont.Weight.Normal)
-
-        today_font = qfont(TYPE.caption_1)
-        today_font.setPointSize(int(10 * scale))
-        today_font.setWeight(QFont.Weight.Bold)
-
-        for r_idx, week in enumerate(data.grid):
-            for c_idx, day in enumerate(week):
-                cx = rx + c_idx * col_w + col_w / 2.0
-                cy = grid_top + r_idx * row_h + row_h / 2.0
-                cell_rect = QRectF(rx + c_idx * col_w, grid_top + r_idx * row_h, col_w, row_h)
-
-                if day.is_today:
-                    # Today highlighted as a filled accent circle (#45C1EE) with white text
-                    cr = min(col_w, row_h) * 0.40
-                    p.setPen(Qt.PenStyle.NoPen)
-                    p.setBrush(QBrush(QColor("#45C1EE")))
-                    p.drawEllipse(QPointF(cx, cy), cr, cr)
-
-                    p.setFont(today_font)
-                    p.setPen(QColor("#FFFFFF"))
-                    p.drawText(cell_rect, Qt.AlignmentFlag.AlignCenter, str(day.day_number))
-
-                elif not day.is_current_month:
-                    p.setFont(day_font)
-                    p.setPen(QColor("#3A3D40" if dark else "#B8B8C0"))
-                    p.drawText(cell_rect, Qt.AlignmentFlag.AlignCenter, str(day.day_number))
-
-                elif day.is_weekend:
-                    # Weekends dimmed (#55585C)
-                    p.setFont(day_font)
-                    p.setPen(QColor("#55585C" if dark else "#8E9094"))
-                    p.drawText(cell_rect, Qt.AlignmentFlag.AlignCenter, str(day.day_number))
-
-                else:
-                    # Current month days in #F5F5F7
-                    p.setFont(day_font)
-                    p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-                    p.drawText(cell_rect, Qt.AlignmentFlag.AlignCenter, str(day.day_number))
+        pix = self._calendar_pixmap(data, getattr(self, "_paint_dpr", 1.0), scale)
+        p.drawPixmap(QPointF(0.0, 0.0), pix)
 
     def _draw_time_card(self, p: QPainter, w: float, h: float,
                         now: float, dark: bool, primary: QColor, secondary: QColor,
                         accent: Optional[QColor] = None) -> None:
         """Expanded Calendar & Time Card."""
-        self._draw_calendar_card(p, w, h, now, dark, primary, secondary, accent or QColor("#45C1EE"))
+        self._draw_calendar_card(p, w, h, now, dark, primary, secondary, accent or QColor(_C.accent))

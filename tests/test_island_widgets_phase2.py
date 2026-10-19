@@ -233,25 +233,25 @@ class TestIslandWidgetsPhase2(unittest.TestCase):
         self.island.set_shape_style("pill")
         self.island._center_top()
         self.assertEqual(self.island.shape_style, "pill")
-        self.assertEqual(self.island.geometry().y(), geom_y + 10)
+        self.assertEqual(self.island.island_rect().y(), geom_y + 10)
 
         # Set to notch
         self.island.set_shape_style("notch")
         self.island._center_top()
         self.assertEqual(self.island.shape_style, "notch")
-        self.assertEqual(self.island.geometry().y(), geom_y)
+        self.assertEqual(self.island.island_rect().y(), geom_y)
 
         # Live switch via SettingsWindow _save
         dlg = SettingsWindow(self.cfg)
         dlg._save("island_shape_style", "pill")
         self.assertEqual(self.cfg.island_shape_style, "pill")
         self.assertEqual(self.island.shape_style, "pill")
-        self.assertEqual(self.island.geometry().y(), geom_y + 10)
+        self.assertEqual(self.island.island_rect().y(), geom_y + 10)
 
         dlg._save("island_shape_style", "notch")
         self.assertEqual(self.cfg.island_shape_style, "notch")
         self.assertEqual(self.island.shape_style, "notch")
-        self.assertEqual(self.island.geometry().y(), geom_y)
+        self.assertEqual(self.island.island_rect().y(), geom_y)
         dlg.close()
 
     def test_11_weather_no_negative_double_conversion(self):

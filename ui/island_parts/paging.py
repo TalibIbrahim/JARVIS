@@ -9,6 +9,8 @@ from typing import Optional
 from PySide6.QtGui import QBrush, QColor, QPainter
 from PySide6.QtCore import QPoint, QPointF, Qt
 
+from ui.tokens import ISLAND
+
 
 # Voice names, config names and renderer ids -> logical page key (an entry of card_pages).
 _PAGE_ALIASES = {
@@ -82,11 +84,17 @@ class PagingMixin:
         ratio = min(1.0, max(0.0, float(ratio)))
         self.media_progress = ratio
         self.media_position_sec = ratio * self.media_duration_sec
-        try:
-            from media_adapter import get_media_adapter
-            get_media_adapter().seek(self.media_position_sec)
-        except Exception:
-            pass
+        target = float(self.media_position_sec)
+
+        def _seek_job():
+            try:
+                from media_adapter import get_media_adapter
+                get_media_adapter().seek(target)
+            except Exception:
+                pass
+
+        from ui.island_parts.media import run_transport   # seek can block up to 0.8 s: never on the GUI thread
+        run_transport(_seek_job)
         self.update()
 
     def toggle_tracking_paused(self) -> None:
@@ -175,17 +183,16 @@ class PagingMixin:
             IslandState.CARD_HARDWARE_STRIP, IslandState.CARD_JARVIS, IslandState.CARD_TIMER,
         )
         if state in card_states and self.expanded_card:
-            ox, oy = float(self.x()), float(self.y())
+            ir = self.island_rect()     # global rect of the ISLAND (not of the margin window)
+            ox, oy = float(ir.x()), float(ir.y())
             scale = self._get_size_scale()
 
             def add(x, y, rw, rh, tid):
                 targets.append(((ox + x, oy + y, rw, rh), tid))
 
             if state == IslandState.CARD_MEDIA:
-                cy = 136.0 * scale
-                for off, rad, tid in ((-52.0, 22.0, "media_prev"), (0.0, 26.0, "media_toggle"), (52.0, 22.0, "media_next")):
-                    r = rad * scale
-                    add(w / 2.0 + off * scale - r, cy - r, 2 * r, 2 * r, tid)
+                for _bid, tid, bcx, bcy, hit_r in self._media_button_geometry():
+                    add(bcx - hit_r, bcy - hit_r, 2 * hit_r, 2 * hit_r, tid)
             elif state == IslandState.CARD_JARVIS:
                 lx = 22.0 * scale
                 content_w = (w - 28.0 * scale) - lx
@@ -198,13 +205,11 @@ class PagingMixin:
                 add(w / 2.0 + 44.0 * scale - bw / 2.0, cy_btn - bh / 2.0, bw, bh, "timer_pause_resume")
 
             if state != IslandState.CARD_TIMER:
-                n = len(self.card_pages)
-                spacing = 14.0 * scale
-                dot_x = w - 16.0 * scale
-                start_y = (h - (n - 1) * spacing) / 2.0
-                half_w = 12.0 * scale
-                for i, page in enumerate(self.card_pages):
-                    add(dot_x - half_w, start_y + i * spacing - spacing / 2.0, 2 * half_w, spacing, f"dot:{page}")
+                dot_x, ys, pitch = self._dots_geometry(w, h)
+                half_w = ISLAND.dots.hit_half_w * scale
+                x0 = dot_x - half_w
+                for page, dy in zip(self.card_pages, ys):
+                    add(x0, dy - pitch / 2.0, min(2 * half_w, w - x0), pitch, f"dot:{page}")
             add(0.0, 0.0, w, h, "card")
         new = tuple(targets)
         old_gen, old = self._hit_snapshot
@@ -213,53 +218,72 @@ class PagingMixin:
 
     # ── page-dot column ──
 
-    def _draw_page_dots(self, p: QPainter, w: float, h: float, dark: bool) -> None:
-        """
-        Draws the vertical column of page indicator dots along the right edge (one per enabled page):
-        - Position: x = w - 16 px, vertically centered
-        - Active dot: 100% solid white (or near-black in light mode)
-        - Inactive dot: 30% alpha
-        """
+    def _dots_geometry(self, w: float, h: float):
+        """(centre x, [centre y per page], pitch) of the dot column: 5 dia, pitch 8.2, centre 9 from the right
+        edge, vertically centred on the card."""
         scale = self._get_size_scale()
-        dot_x = w - 16.0 * scale
-        num_dots = len(self.card_pages)
-        dot_spacing = 14.0 * scale
-        total_h = (num_dots - 1) * dot_spacing
-        start_y = (h - total_h) / 2.0
-        r_dot = 3.0 * scale
+        n = len(self.card_pages)
+        pitch = ISLAND.dots.pitch * scale
+        dot_x = w - ISLAND.dots.right_inset * scale
+        start_y = (h - (n - 1) * pitch) / 2.0
+        return dot_x, [start_y + i * pitch for i in range(n)], pitch
 
+    def _dot_strengths(self, active_idx: int, now: float, n: int) -> list:
+        """Per-dot active strength 0..1 with a smooth (smoothstep) hand-over from the previous active dot."""
+        st = getattr(self, "_dots_anim", None)
+        if st is None or st["n"] != n:
+            st = {"n": n, "target": active_idx, "prev": active_idx, "t0": -1e9}
+            self._dots_anim = st
+        if active_idx != st["target"]:
+            st["prev"], st["target"], st["t0"] = st["target"], active_idx, now
+        dur = ISLAND.dots.anim_s
+        k = 1.0 if (self._reduce_motion() or dur <= 0.0) else min(1.0, max(0.0, (now - st["t0"]) / dur))
+        e = k * k * (3.0 - 2.0 * k)
+        out = [0.0] * n
+        if 0 <= st["target"] < n:
+            out[st["target"]] = e
+        if k < 1.0 and 0 <= st["prev"] < n and st["prev"] != st["target"]:
+            out[st["prev"]] = 1.0 - e
+        if k < 1.0:
+            self.update()
+        return out
+
+    def _draw_page_dots(self, p: QPainter, w: float, h: float, dark: bool) -> None:
+        """One dot per enabled page along the right edge: inactive white 25%, active white 95% (5 -> 5.6 dia)."""
+        D = ISLAND.dots
+        scale = self._get_size_scale()
+        num = len(self.card_pages)
+        if num <= 0:
+            return
+        dot_x, ys, _pitch = self._dots_geometry(w, h)
         curr_page = self._current_logical_page()
         active_idx = self.card_pages.index(curr_page) if curr_page in self.card_pages else -1
+        strengths = self._dot_strengths(active_idx, time.time(), num)
 
-        active_col = QColor(255, 255, 255, 255) if dark else QColor(28, 28, 30, 255)
-        inactive_col = QColor(255, 255, 255, 77) if dark else QColor(0, 0, 0, 77)
-
+        lo, hi = ISLAND.color.dot_inactive.alphaF(), ISLAND.color.dot_active.alphaF()
+        col = QColor(255, 255, 255)
         p.setPen(Qt.PenStyle.NoPen)
-        for i in range(num_dots):
-            dy = start_y + i * dot_spacing
-            if i == active_idx:
-                p.setBrush(QBrush(active_col))
-            else:
-                p.setBrush(QBrush(inactive_col))
-            p.drawEllipse(QPointF(dot_x, dy), r_dot, r_dot)
+        for i, dy in enumerate(ys):
+            k = strengths[i]
+            col.setAlphaF(lo + (hi - lo) * k)
+            p.setBrush(col)
+            r = (D.d + (D.d_active - D.d) * k) / 2.0 * scale
+            p.drawEllipse(QPointF(dot_x, dy), r, r)
 
     def _dot_at(self, pos: QPointF | QPoint) -> Optional[int]:
         """Hit test for the page dots on expanded cards (local coordinates)."""
         if not self.expanded_card:
             return None
-        w = max(float(self.width()), self.spring_w.target)
-        h = max(float(self.height()), self.spring_h.target)
+        iw, ih = self.island_size()
+        w = max(iw, self.spring_w.target)
+        h = max(ih, self.spring_h.target)
         scale = self._get_size_scale()
-        dot_x = w - 16.0 * scale
-        num_dots = len(self.card_pages)
-        dot_spacing = 14.0 * scale
-        total_h = (num_dots - 1) * dot_spacing
-        start_y = (h - total_h) / 2.0
-        hit_radius = 12.0 * scale
-
-        for i in range(num_dots):
-            dy = start_y + i * dot_spacing
-            if math.hypot(pos.x() - dot_x, pos.y() - dy) <= hit_radius:
+        dot_x, ys, pitch = self._dots_geometry(w, h)
+        half_w = ISLAND.dots.hit_half_w * scale
+        if abs(pos.x() - dot_x) > half_w:
+            return None
+        for i, dy in enumerate(ys):
+            if abs(pos.y() - dy) <= pitch / 2.0:
                 return i
         return None
 

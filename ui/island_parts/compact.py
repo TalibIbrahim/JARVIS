@@ -2,11 +2,135 @@
 
 from __future__ import annotations
 
+import ctypes
+import sys
 import time
-from ui.tokens import COLOR, TYPE, qfont
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from ui.tokens import COLOR, TYPE, ISLAND, qfont
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtCore import QPointF, QRectF, Qt
 from ui.island_parts.common import create_cached_squircle_path
+
+
+# ── clock format ('auto' follows the Windows short-time pattern) ──────────────
+_AUTO_24H_CACHE: list = [0.0, False]
+
+
+def _system_uses_24h() -> bool:
+    now = time.monotonic()
+    if now - _AUTO_24H_CACHE[0] < 30.0 and _AUTO_24H_CACHE[0] > 0.0:
+        return bool(_AUTO_24H_CACHE[1])
+    result = False
+    if sys.platform == "win32":
+        try:
+            buf = ctypes.create_unicode_buffer(80)
+            # LOCALE_SSHORTTIME = 0x79; locale name None = user default
+            if ctypes.windll.kernel32.GetLocaleInfoEx(None, 0x79, buf, 80):
+                result = "H" in buf.value
+        except Exception:
+            result = False
+    _AUTO_24H_CACHE[0] = now
+    _AUTO_24H_CACHE[1] = result
+    return result
+
+
+def clock_is_24h(cfg) -> bool:
+    """island_clock_format: '12h' | '24h' | 'auto' (system)."""
+    fmt = str(getattr(cfg, "island_clock_format", "auto") or "auto").lower()
+    if fmt == "24h":
+        return True
+    if fmt == "12h":
+        return False
+    return _system_uses_24h()
+
+
+def format_clock(now: float, cfg, with_period: bool = True) -> str:
+    tm = time.localtime(now)
+    if clock_is_24h(cfg):
+        return time.strftime("%H:%M", tm)
+    txt = time.strftime("%I:%M %p" if with_period else "%I:%M", tm)
+    return txt[1:] if txt.startswith("0") else txt
+
+
+# ── weather glyph (own vector drawings, 16 x 14 box, one accent colour like the reference) ──
+def glyph_kind(icon_name: str) -> str:
+    n = str(icon_name or "").lower().replace(" ", "_").replace("-", "_")
+    if n in ("sunny", "sun", "mostly_sunny"):
+        return "sun"
+    if n in ("clear", "night", "clear_night", "moon"):
+        return "night"
+    if n in ("partly_cloudy", "cloud_sun", "partly_sunny", "mostly_cloudy"):
+        return "partly"
+    if n in ("rain", "rainy", "drizzle", "showers", "shower"):
+        return "rain"
+    if n in ("snow", "snowy", "flurries", "sleet"):
+        return "snow"
+    if n in ("storm", "thunderstorm", "thunder", "stormy"):
+        return "storm"
+    if n in ("fog", "foggy", "mist", "haze"):
+        return "fog"
+    return "cloud"
+
+
+def _paint_cloud(p: QPainter, dx: float, dy: float, k: float) -> None:
+    p.save()
+    p.translate(dx, dy)
+    p.scale(k, k)
+    p.drawRoundedRect(QRectF(0.8, 6.2, 14.4, 6.6), 3.3, 3.3)
+    p.drawEllipse(QPointF(5.3, 6.9), 3.5, 3.5)
+    p.drawEllipse(QPointF(10.1, 5.7), 4.3, 4.3)
+    p.restore()
+
+
+def paint_weather_glyph(p: QPainter, kind: str, color: QColor) -> None:
+    """Draw glyph `kind` into the 16 x 14 logical box at the painter origin."""
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(color))
+    line = QPen(color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    if kind == "sun":
+        p.drawEllipse(QPointF(8.0, 7.0), 3.3, 3.3)
+        p.setPen(line)
+        import math
+        for i in range(8):
+            a = i * math.pi / 4.0
+            p.drawLine(QPointF(8.0 + math.cos(a) * 5.0, 7.0 + math.sin(a) * 5.0),
+                       QPointF(8.0 + math.cos(a) * 6.5, 7.0 + math.sin(a) * 6.5))
+    elif kind == "night":
+        moon = QPainterPath()
+        moon.addEllipse(QPointF(7.6, 7.0), 5.6, 5.6)
+        cut = QPainterPath()
+        cut.addEllipse(QPointF(10.6, 5.0), 4.9, 4.9)
+        p.drawPath(moon.subtracted(cut))
+    elif kind == "partly":
+        p.drawEllipse(QPointF(4.1, 4.3), 3.5, 3.5)
+        _paint_cloud(p, 3.4, 3.7, 0.78)
+    elif kind == "rain":
+        _paint_cloud(p, 0.0, -2.4, 0.9)
+        p.setPen(line)
+        for x in (4.6, 8.0, 11.4):
+            p.drawLine(QPointF(x, 10.2), QPointF(x - 1.0, 12.6))
+    elif kind == "snow":
+        _paint_cloud(p, 0.0, -2.4, 0.9)
+        for x in (4.6, 8.0, 11.4):
+            p.drawEllipse(QPointF(x, 11.9), 1.0, 1.0)
+    elif kind == "storm":
+        _paint_cloud(p, 0.0, -2.6, 0.9)
+        bolt = QPainterPath()
+        bolt.moveTo(9.2, 8.2)
+        bolt.lineTo(6.0, 11.2)
+        bolt.lineTo(7.9, 11.2)
+        bolt.lineTo(6.8, 13.9)
+        bolt.lineTo(10.4, 10.3)
+        bolt.lineTo(8.5, 10.3)
+        bolt.closeSubpath()
+        p.drawPath(bolt)
+    elif kind == "fog":
+        p.setPen(QPen(color, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QPointF(2.5, 3.6), QPointF(13.5, 3.6))
+        p.drawLine(QPointF(1.0, 7.0), QPointF(15.0, 7.0))
+        p.drawLine(QPointF(3.5, 10.4), QPointF(12.5, 10.4))
+    else:
+        _paint_cloud(p, 0.0, 0.0, 1.0)
 
 
 class CompactPillMixin:
@@ -133,59 +257,24 @@ class CompactPillMixin:
             p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
 
         elif compact_mode in ("time_weather", "default"):
-            # ── Time + Weather compact layout ────────────────────────────
-            # Left side: tabular clock
-            cfg = getattr(self.mgr, "cfg", None)
-            fmt_24 = (getattr(cfg, "island_clock_format", "12h") == "24h")
-            tm = time.localtime(now)
-            time_str = time.strftime("%H:%M" if fmt_24 else "%I:%M", tm).lstrip("0")
-            if not time_str:
-                time_str = "12:00"
-
-            time_font = qfont(TYPE.caption_1)
-            time_font.setWeight(QFont.Weight.DemiBold)
-            try:
-                time_font.setFeature(b"tnum", 1)
-            except Exception:
-                pass
-            p.setFont(time_font)
-            p.setPen(primary)
-            p.drawText(QRectF(14.0, 0, 48.0, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, time_str)
-
-            # Center: 1px subtle hairline divider
-            div_x = 68.0
-            p.setPen(QPen(QColor(255, 255, 255, 23 if dark else 35), 1.0))
-            p.drawLine(QPointF(div_x, cy - 6.0), QPointF(div_x, cy + 6.0))
-
-            # Right side: weather SVG glyph + temp
-            temp_str = self.format_temp(self.weather_temp)
-            temp_w = p.fontMetrics().horizontalAdvance(temp_str)
-            tx = w - 14.0 - 8.0 - temp_w
-            p.drawText(QRectF(tx, 0, temp_w + 4.0, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, temp_str)
-
-            gx = tx - 14.0
-            self._draw_weather_glyph(p, self.weather_icon, gx, cy, 14.0, dark)
-
-            # Trailing 6px status dot (Green / Gray / Red)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(dot_col))
-            p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
+            # Optional status dot: health once known, else only when something is happening (error / active).
+            show_dot = (_wh is not None) or (now < self.error_until) or self.is_ai_error                 or self.active or self.listening or self.media_playing
+            self._draw_pill_time_weather(p, w, h, cy, now, dot_col if show_dot else None)
 
         elif compact_mode == "time":
             # ── Time compact layout ──────────────────────────────────────
             cfg = getattr(self.mgr, "cfg", None)
-            fmt_24 = (getattr(cfg, "island_clock_format", "12h") == "24h")
-            tm = time.localtime(now)
-            time_str = time.strftime("%H:%M" if fmt_24 else "%I:%M %p", tm).lstrip("0")
-            time_font = qfont(TYPE.caption_1)
-            time_font.setWeight(QFont.Weight.DemiBold)
-            try:
-                time_font.setFeature(b"tnum", 1)
-            except Exception:
-                pass
-            p.setFont(time_font)
-            p.setPen(primary)
-            p.drawText(QRectF(14.0, 0, w - 38.0, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter, time_str)
+            time_str = format_clock(now, cfg, with_period=True)
+            scale = self._get_size_scale()
+            p.save()
+            p.scale(scale, scale)
+            font = qfont(TYPE.pill_time)
+            p.setFont(font)
+            p.setPen(ISLAND.color.value)
+            fm = QFontMetricsF(font)
+            lw = w / scale
+            p.drawText(QPointF((lw - fm.horizontalAdvance(time_str)) / 2.0 - 6.0, cy / scale + fm.capHeight() / 2.0), time_str)
+            p.restore()
 
             # Trailing 6px status dot
             p.setPen(Qt.PenStyle.NoPen)
@@ -204,3 +293,69 @@ class CompactPillMixin:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(dot_col))
             p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
+
+    # ── time | divider | weather glyph + temperature (+ optional status dot) ──────────
+
+    def _pill_glyph_pixmap(self, kind: str, dpr: float, scale: float) -> QPixmap:
+        color = ISLAND.color.accent
+        key = ("pill_glyph", kind, round(dpr, 3), round(scale, 3), color.rgba())
+        pix = self._icon_cache.get(key)
+        if pix is None:
+            lw, lh = ISLAND.pill.glyph_w * scale, ISLAND.pill.glyph_h * scale
+            pix = QPixmap(max(1, int(round(lw * dpr))), max(1, int(round(lh * dpr))))
+            pix.setDevicePixelRatio(dpr)
+            pix.fill(Qt.GlobalColor.transparent)
+            gp = QPainter(pix)
+            gp.scale(scale, scale)
+            paint_weather_glyph(gp, kind, color)
+            gp.end()
+            self._icon_cache[key] = pix
+        return pix
+
+    def _draw_pill_time_weather(self, p: QPainter, w: float, h: float, cy: float, now: float,
+                                dot_col) -> None:
+        L = ISLAND.pill
+        scale = self._get_size_scale()
+        cfg = getattr(self.mgr, "cfg", None)
+        dpr = getattr(self, "_paint_dpr", 1.0)
+
+        p.save()
+        p.scale(scale, scale)
+        lw, lh, lcy = w / scale, h / scale, cy / scale
+
+        # time (left)
+        tfont = qfont(TYPE.pill_time)
+        tfm = QFontMetricsF(tfont)
+        p.setFont(tfont)
+        p.setPen(ISLAND.color.value)
+        p.drawText(QPointF(L.time_x, lcy + tfm.capHeight() / 2.0 + L.text_nudge), format_clock(now, cfg, with_period=True))
+
+        # divider: 1 x 18.3, centred on the pill
+        p.fillRect(QRectF(lw / 2.0 - L.divider_w / 2.0, lcy - L.divider_h / 2.0, L.divider_w, L.divider_h),
+                   ISLAND.color.divider)
+
+        # weather: glyph + temperature, right-anchored (shifted left when the status dot is shown)
+        temp = self.format_temp(self.weather_temp)
+        pfont = qfont(TYPE.pill_temp)
+        pfm = QFontMetricsF(pfont)
+        temp_w = pfm.horizontalAdvance(temp)
+        if dot_col is not None:
+            dot_left = lw - L.dot_right - L.dot_d
+            temp_right = dot_left - L.dot_gap
+        else:
+            temp_right = lw - L.right_pad
+        temp_left = temp_right - temp_w
+        p.setFont(pfont)
+        p.setPen(ISLAND.color.value)
+        p.drawText(QPointF(temp_left, lcy + pfm.capHeight() / 2.0 + L.text_nudge), temp)
+
+        kind = glyph_kind(self.weather_icon)
+        gpix = self._pill_glyph_pixmap(kind, dpr * scale, 1.0)
+        gx = temp_left - L.glyph_gap - L.glyph_w
+        p.drawPixmap(QPointF(gx, lcy - L.glyph_h / 2.0), gpix)
+
+        if dot_col is not None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(dot_col))
+            p.drawEllipse(QPointF(lw - L.dot_right - L.dot_d / 2.0, lcy), L.dot_d / 2.0, L.dot_d / 2.0)
+        p.restore()

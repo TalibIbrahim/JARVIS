@@ -15,7 +15,13 @@ Features:
     * Time Card: large clock display, full date, next timer / alarm.
 - Focus-Safe Interactivity (WS_EX_NOACTIVATE):
     * Idle / compact: fully click-through (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE).
-    * Expanded: dynamically interactive for bounding rect (removes WS_EX_TRANSPARENT, preserves WS_EX_NOACTIVATE).
+    * Expanded / hovered: interactive only while the cursor is inside the island SHAPE (WS_EX_TRANSPARENT is removed
+      there and re-applied over the transparent shadow margin, polled each frame and on mouse move; WM_NCHITTEST /
+      HTTRANSPARENT was tested and does NOT pass clicks to other processes' windows, and per-pixel alpha alone
+      would let the faint shadow pixels take input). WS_EX_NOACTIVATE is always preserved.
+- Window = island rect + transparent margin `_pad` (32 px x size scale) on every side for the outside shadow; the
+  island itself is placed exactly where the old margin-less window was. Island-local coordinates everywhere
+  (`island_size()`, `island_rect()` global, `to_island_pos()`); use `set_island_size(w, h)` instead of `resize`.
     * Media buttons respond to standard mouse clicks, hand-tracking dwell ring (1.0s), and fist-click gesture.
     * Auto-collapse after 4 seconds of inactivity.
 - Fullscreen Suppression:
@@ -47,6 +53,7 @@ Features:
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
 import datetime
 import math
 import sys
@@ -54,7 +61,7 @@ import time
 from enum import auto, Enum
 from typing import List, Optional, Tuple, Dict
 
-from PySide6.QtCore import Qt, QTimer, QRectF, QPointF
+from PySide6.QtCore import Qt, QTimer, QRect, QRectF, QPointF
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPainterPath,
     QLinearGradient, QRadialGradient, QPixmap, QCursor, QMouseEvent, QPolygonF,
@@ -63,14 +70,15 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget, QApplication
 
 from ui.tokens import (
-    T, TYPE, COLOR, qfont, REDUCE_MOTION_MS,
+    T, TYPE, COLOR, ISLAND, qfont, REDUCE_MOTION_MS,
     SPRING_DT_MIN, SPRING_DT_MAX, RADIUS, GEOMETRY
 )
 from ui.materials import remove_backdrop, make_click_through, set_interactive
 from ui.components import Spring, create_squircle_path
 
 from ui.island_parts.common import (  # noqa: F401  (re-exported for existing importers)
-    _PATH_CACHE, create_cached_squircle_path, IslandState, _SIZE,
+    _PATH_CACHE, create_cached_squircle_path, get_shell_pixmap, IslandState, _SIZE,
+    paint_island_shadow, shell_pad_for,
     SPRING_K_RESP04, SPRING_C_DAMP07,
 )
 from ui.island_parts.compact import CompactPillMixin
@@ -243,6 +251,11 @@ class AppleDynamicIsland(
         self.hardware_state_t: float = 0.0
         # Thread-safe hit-test snapshot published during paint (see module docstring).
         self._hit_snapshot: tuple = (0, ())
+        # Transparent margin around the island (holds the outside shadow). The WINDOW is the island rect grown by
+        # `_pad` on every side; all island geometry (layout, hit-testing, hover) is in island-local coordinates.
+        self._pad: int = shell_pad_for(1.0)
+        self._shape_path: Optional[QPainterPath] = None   # island shape in island-local coords (set by paint)
+        self._cursor_in_shape: bool = False
         self._notified_page = False  # sentinel: last page reported to ctx.set_visible_page
 
         # Media state
@@ -324,7 +337,8 @@ class AppleDynamicIsland(
         self._last_rendered_temp: Optional[float] = None
         self._dirty: bool = True
 
-        self.resize(175, 36)
+        self._pad = shell_pad_for(self._get_size_scale())
+        self.set_island_size(175, 36)
         self._center_top()
 
     def _read_theme(self):
@@ -412,11 +426,19 @@ class AppleDynamicIsland(
     def set_interactive(self, interactive: bool) -> None:
         """
         Dynamically enables / disables interactivity without focus stealing.
-        When interactive is False: WS_EX_TRANSPARENT | WS_EX_NOACTIVATE (click-through).
-        When interactive is True:  WS_EX_NOACTIVATE (receives clicks, active app keeps focus).
+        When interactive is False: WS_EX_TRANSPARENT | WS_EX_NOACTIVATE (fully click-through).
+        When interactive is True:  WS_EX_NOACTIVATE; the window takes input only while the cursor is over the
+        island SHAPE (WS_EX_TRANSPARENT is re-applied while it is over the transparent shadow margin).
         """
+        if interactive and not self.is_interactive:
+            # Optimistically accept input; the next frame's cursor poll re-applies click-through if the
+            # cursor is actually over the margin (<= 1 frame).
+            self._cursor_in_shape = True
+        self.is_interactive = interactive
+        self._apply_exstyle()
+
+    def _apply_exstyle(self) -> None:
         if sys.platform != "win32":
-            self.is_interactive = interactive
             return
         try:
             hwnd = int(self.winId())
@@ -428,18 +450,30 @@ class AppleDynamicIsland(
             WS_EX_TOOLWINDOW  = 0x00000080
 
             style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            if interactive:
-                # Clear transparent, ensure noactivate
-                new_style = (style & ~WS_EX_TRANSPARENT) | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+            new_style = style | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+            if self.is_interactive and self._cursor_in_shape:
+                new_style &= ~WS_EX_TRANSPARENT      # over the island shape: receives clicks, never activates
             else:
-                # Ensure transparent and noactivate
-                new_style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-
+                new_style |= WS_EX_TRANSPARENT       # collapsed, or over the shadow margin: click-through
             if new_style != style:
                 user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
-            self.is_interactive = interactive
         except Exception as exc:
             print(f"[island] set_interactive error: {exc}")
+
+    def _shape_contains_global(self, gx: float, gy: float) -> bool:
+        """True when global point (gx, gy) is inside the current island shape (spring-sized cached path)."""
+        path = self._shape_path
+        if path is None:
+            return False
+        r = self.island_rect()
+        return path.contains(QPointF(gx - r.x(), gy - r.y()))
+
+    def _update_shape_passthrough(self, cursor_pos) -> None:
+        inside = self._shape_contains_global(cursor_pos.x(), cursor_pos.y())
+        if inside != self._cursor_in_shape:
+            self._cursor_in_shape = inside
+            if self.is_interactive:
+                self._apply_exstyle()
 
     def make_click_through(self) -> None:
         """Apply WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE and remove DWM rectangular backdrop."""
@@ -451,7 +485,33 @@ class AppleDynamicIsland(
         except Exception as exc:
             print(f"[island] backdrop error: {exc}")
 
+    # ── island vs window geometry (the window is the island plus a transparent shadow margin) ──
+
+    def set_island_size(self, w: int, h: int) -> None:
+        """Resize the window so that the ISLAND is w x h (adds the shadow margin on every side)."""
+        self._pad = shell_pad_for(self._get_size_scale())
+        self.resize(int(w) + 2 * self._pad, int(h) + 2 * self._pad)
+
+    def island_size(self) -> tuple[float, float]:
+        """Current island (card) size in logical px, without the margin."""
+        return (float(self.width() - 2 * self._pad), float(self.height() - 2 * self._pad))
+
+    def island_rect(self) -> QRect:
+        """Island rect in GLOBAL screen coordinates (the window rect minus the margin)."""
+        return QRect(self.x() + self._pad, self.y() + self._pad,
+                     self.width() - 2 * self._pad, self.height() - 2 * self._pad)
+
+    def to_island_pos(self, pos):
+        """Window-local point -> island-local point."""
+        return QPointF(pos.x() - self._pad, pos.y() - self._pad)
+
+    def global_to_island(self, gpos) -> QPointF:
+        r = self.island_rect()
+        return QPointF(gpos.x() - r.x(), gpos.y() - r.y())
+
     def _center_top(self):
+        """Place the island at its fixed screen position (centred, 10 px below the top for the pill), then grow the
+        window by the shadow margin around it so the island itself never moves."""
         try:
             screen = QApplication.primaryScreen()
             if screen:
@@ -461,15 +521,18 @@ class AppleDynamicIsland(
                 # Add horizontal nope offset during NO_SPEECH
                 nope_dx = int(round(self._nope_offset_x))
                 cx = geom.x() + (geom.width() - w) // 2 + nope_dx
-                
+
                 # Floating pill floats below top bezel; notch attaches flush to top bezel
                 is_pill = getattr(self, "shape_style", "pill") == "pill"
                 top_margin = 10 if is_pill else 0
                 cy = geom.y() + top_margin
-                
+
+                pad = shell_pad_for(self._get_size_scale())
+                self._pad = pad
+                gx, gy, gw, gh = cx - pad, cy - pad, w + 2 * pad, h + 2 * pad
                 cur = self.geometry()
-                if cur.x() != cx or cur.y() != cy or cur.width() != w or cur.height() != h:
-                    self.setGeometry(cx, cy, w, h)
+                if cur.x() != gx or cur.y() != gy or cur.width() != gw or cur.height() != gh:
+                    self.setGeometry(gx, gy, gw, gh)
         except Exception as exc:
             print(f"[island] center_top: {exc}")
 
@@ -893,8 +956,9 @@ class AppleDynamicIsland(
         """Hit test candidate chips."""
         if not self.disambiguate_candidates:
             return None
-        w = max(float(self.width()), self.spring_w.target)
-        h = max(float(self.height()), self.spring_h.target)
+        iw, ih = self.island_size()
+        w = max(iw, self.spring_w.target)
+        h = max(ih, self.spring_h.target)
         scale = self._get_size_scale()
         rects = self._chip_rects(w, h, scale)
         for i, rect in enumerate(rects):
@@ -1164,7 +1228,7 @@ class AppleDynamicIsland(
         dt = max(now - self.last_frame_t, SPRING_DT_MIN)
         self.last_frame_t = now
 
-        reduce = T.reduce_motion()
+        reduce = self._reduce_motion()
 
         # Handle NO_SPEECH horizontal 'nope' nudge
         if self.no_speech_active and self._nope_t0 > 0.0:
@@ -1325,9 +1389,10 @@ class AppleDynamicIsland(
     def _update_interaction(self, now: float, dt: float) -> None:
         """Handles cursor hover/dwell expansion, card button dwell, and auto-collapse."""
         cursor_pos = QCursor.pos()
-        geom = self.geometry()
+        geom = self.island_rect()            # the ISLAND rect, never the transparent margin window
         is_hovering = geom.contains(cursor_pos)
         self._is_hovering = is_hovering
+        self._update_shape_passthrough(cursor_pos)
 
         # When cursor hovers over the island, remove WS_EX_TRANSPARENT so mouse clicks can peek/interact!
         if is_hovering and not self.is_interactive:
@@ -1350,7 +1415,7 @@ class AppleDynamicIsland(
                 return
 
             if is_hovering:
-                local_pt = self.mapFromGlobal(cursor_pos)
+                local_pt = self.global_to_island(cursor_pos)
                 chip_idx = self._chip_at(local_pt)
                 if chip_idx is not None:
                     if chip_idx == self._hovered_chip_idx:
@@ -1413,7 +1478,7 @@ class AppleDynamicIsland(
                 return
 
             if is_hovering:
-                local_pt = self.mapFromGlobal(cursor_pos)
+                local_pt = self.global_to_island(cursor_pos)
                 btn = self._button_at(local_pt)
                 if btn:
                     if btn == self._hovered_btn:
@@ -1486,7 +1551,7 @@ class AppleDynamicIsland(
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         now = time.time()
-        pos = event.position()
+        pos = self.to_island_pos(event.position())
 
         if self.disambiguate_active and self.disambiguate_candidates:
             chip_idx = self._chip_at(pos)
@@ -1538,13 +1603,13 @@ class AppleDynamicIsland(
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self.disambiguate_active and self.disambiguate_candidates:
             self.disambiguate_until = max(self.disambiguate_until, time.time() + 4.0)
-            self._hovered_chip_idx = self._chip_at(event.position())
+            self._hovered_chip_idx = self._chip_at(self.to_island_pos(event.position()))
             super().mouseMoveEvent(event)
             return
 
         if getattr(self, "_dragging_scrubber", False) and (event.buttons() & Qt.MouseButton.LeftButton):
             sr = self._scrubber_rect()
-            ratio = min(1.0, max(0.0, (event.position().x() - sr.x()) / sr.width()))
+            ratio = min(1.0, max(0.0, (self.to_island_pos(event.position()).x() - sr.x()) / sr.width()))
             self.media_progress = ratio
             self.media_position_sec = ratio * self.media_duration_sec
             self.expanded_until = time.time() + 4.0
@@ -1553,8 +1618,9 @@ class AppleDynamicIsland(
             return
 
         self.expanded_until = time.time() + 4.0
+        self._update_shape_passthrough(event.globalPosition())   # left the shape -> click-through at once
         if self.expanded_card in ("media", "timer", "jarvis"):
-            self._hovered_btn = self._button_at(event.position())
+            self._hovered_btn = self._button_at(self.to_island_pos(event.position()))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -1562,7 +1628,7 @@ class AppleDynamicIsland(
         super().mouseReleaseEvent(event)
 
     def _button_at(self, pos: QPointF | QPoint) -> Optional[str]:
-        w = max(float(self.width()), self.spring_w.target)
+        w = max(self.island_size()[0], self.spring_w.target)
         scale = self._get_size_scale()
 
         if self.expanded_card in ("jarvis", "jarvis_card"):
@@ -1590,17 +1656,9 @@ class AppleDynamicIsland(
                 return "timer_pause_resume"
             return None
 
-        cy = 136.0 * scale
-        prev_cx = (w / 2.0 - 52.0 * scale)
-        play_cx = (w / 2.0)
-        next_cx = (w / 2.0 + 52.0 * scale)
-
-        if math.hypot(pos.x() - prev_cx, pos.y() - cy) <= 22.0 * scale:
-            return "prev"
-        if math.hypot(pos.x() - play_cx, pos.y() - cy) <= 26.0 * scale:
-            return "play_pause"
-        if math.hypot(pos.x() - next_cx, pos.y() - cy) <= 22.0 * scale:
-            return "next"
+        for btn_id, _snap_id, bcx, bcy, hit_r in self._media_button_geometry():
+            if math.hypot(pos.x() - bcx, pos.y() - bcy) <= hit_r:
+                return btn_id
         return None
 
     def _trigger_button(self, btn: str) -> None:
@@ -1821,30 +1879,49 @@ class AppleDynamicIsland(
     # Paint
     # ──────────────────────────────────────────────────────────────────────
 
+    def _reduce_motion(self) -> bool:
+        """True when config.reduce_motion is on or Windows client-area animations are off
+        (SPI_GETCLIENTAREAANIMATION): morphs then snap and the content cross-fades in REDUCE_MOTION_MS."""
+        cfg = getattr(self.mgr, "cfg", None)
+        if bool(getattr(cfg, "reduce_motion", False)):
+            return True
+        return T.reduce_motion()
+
+    def _state_radius(self, state: IslandState, w: float, h: float, scale: float) -> float:
+        """Corner radius token for the state, scaled and clamped so short shapes stay full stadiums."""
+        if state in (IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME,
+                     IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS):
+            tok = float(RADIUS.expanded_card)
+        elif state == IslandState.CARD_HARDWARE_STRIP:
+            tok = float(RADIUS.hardware_strip)
+        elif state in (IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER):
+            tok = 36.0
+        elif state == IslandState.IDLE:
+            tok = float(RADIUS.compact_pill)
+        else:
+            tok = 36.0
+        return max(0.0, min(h / 2.0, w / 2.0, tok * scale))
+
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        pad = float(self._pad)
+        p.translate(pad, pad)            # everything below is in island-local coordinates
+        try:
+            self._paint_dpr = max(1.0, float(p.deviceTransform().m11()))
+        except Exception:
+            self._paint_dpr = max(1.0, float(self.devicePixelRatioF()))
 
         now  = time.time()
         t    = now - self.t0
-        w    = float(self.width())
-        h    = float(self.height())
+        w, h = self.island_size()
 
         state   = self._resolve_state(now)
-        dark    = self.dark_mode
-        reduce  = T.reduce_motion()
-
-        if state in (IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME, IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS):
-            r = 47.0
-        elif state == IslandState.CARD_HARDWARE_STRIP:
-            r = 28.0
-        elif state in (IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER):
-            r = 36.0
-        elif state == IslandState.IDLE:
-            r = min(h / 2.0, 18.0)
-        else:
-            r = min(h / 2.0, 36.0)
+        dark    = True          # solid black island: the surface and every in-scope page are dark in both themes
+        reduce  = self._reduce_motion()
+        scale   = self._get_size_scale()
+        r       = self._state_radius(state, w, h, scale)
 
         if reduce:
             elapsed = now - self._crossfade_start
@@ -1853,77 +1930,27 @@ class AppleDynamicIsland(
             opacity = min(1.0, max(0.0, self._opacity_spring.value))
 
         is_pill = getattr(self, "shape_style", "pill") == "pill"
+
+        # 1. Shell: gradient surface + 1 px hairline (shadow is a separate 9-slice drawn under it into the margin),
+        #    pre-rendered per (size, dpr, radius, tint) and blitted.
+        tint_key, tint_stops, tint_glow = (None, None, None)
+        if state == IslandState.CARD_MEDIA:
+            tint_key, tint_stops, tint_glow = self._media_shell_tint()
+        kind = "pill" if (h <= 72.0 * scale and r >= h / 2.0 - 0.5) else "card"
+        top = 0.0 if is_pill else -16.0
+        paint_island_shadow(p, QRectF(0.0, top, w, h - top), r, kind, self._paint_dpr, scale, self._pad)
+        shell = get_shell_pixmap(int(round(w)), int(round(h)), self._paint_dpr, r, kind, not is_pill,
+                                 tint_key, tint_stops, tint_glow, scale)
+        p.drawPixmap(QPointF(0.0, 0.0), shell)
+        self._shape_path = create_cached_squircle_path(QRectF(0.0, top, w, h - top), r)
+
+        # Path of the hairline for state-coloured strokes, glows and shimmer
         if is_pill:
-            # Floating stadium capsule with 4 rounded squircle corners
-            pill_rect = QRectF(2, 2, w - 4, h - 4)
-            squircle  = create_cached_squircle_path(pill_rect, r)
-
-            # ── 1. Soft multi-layer drop shadow ──────────────────────────────
-            for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
-                sr = QRectF(2, 2 + offset, w - 4, h - 4)
-                sp = create_cached_squircle_path(sr, r)
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-                p.drawPath(sp)
-
-            # ── 2. Glass tint fill (Obsidian gradient) ────────────────────────
-            bg_grad = QLinearGradient(0, 2, 0, h - 2)
-            if dark:
-                bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
-                bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
-            else:
-                bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
-                bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
-
-            p.fillPath(squircle, QBrush(bg_grad))
+            squircle = create_cached_squircle_path(QRectF(0.5, 0.5, w - 1.0, h - 1.0), max(0.0, r - 0.5))
         else:
-            # Bezel-attached notch: top edge flush against screen bezel, bottom corners rounded
-            pill_rect = QRectF(2, -16, w - 4, h + 14)
-            squircle  = create_cached_squircle_path(pill_rect, r)
+            squircle = create_cached_squircle_path(QRectF(0.5, -16.0, w - 1.0, h + 15.5), max(0.0, r - 0.5))
 
-            # ── 1. Soft multi-layer drop shadow ──────────────────────────────
-            for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
-                sr = QRectF(2, -16 + offset, w - 4, h + 14)
-                sp = create_cached_squircle_path(sr, r)
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-                p.drawPath(sp)
-
-            # ── 2. Glass tint fill (Obsidian gradient) ────────────────────────
-            bg_grad = QLinearGradient(0, -16, 0, h)
-            if dark:
-                bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
-                bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
-            else:
-                bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
-                bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
-
-            p.fillPath(squircle, QBrush(bg_grad))
-
-        # Media Card dominant & average gradient glass ambient tint
-        if state == IslandState.CARD_MEDIA and self.media_dominant_color:
-            if getattr(self, "media_album_art", None) and not self.media_album_art.isNull():
-                card_grad = QLinearGradient(0, 0, w, h)
-                c_start = QColor(self.media_dominant_color)
-                c_start.setAlpha(65 if dark else 45)
-
-                mid_c = getattr(self, "media_secondary_color", None) or getattr(self, "media_average_color", None) or self.media_dominant_color
-                c_mid = QColor(mid_c)
-                c_mid.setAlpha(35 if dark else 24)
-
-                c_end = QColor(mid_c)
-                c_end.setAlpha(10 if dark else 6)
-
-                card_grad.setColorAt(0.0, c_start)
-                card_grad.setColorAt(0.55, c_mid)
-                card_grad.setColorAt(1.0, c_end)
-                p.fillPath(squircle, QBrush(card_grad))
-            else:
-                tint = QColor(self.media_dominant_color)
-                tint.setAlpha(36 if dark else 24)
-                p.fillPath(squircle, QBrush(tint))
-
-        # ── 3. Soft edge glow pulse in WAKE or CARD_SENDING / CARD_JARVIS ──
+        # 2. Soft edge glow pulse in WAKE or CARD_SENDING / CARD_JARVIS
         glow_val = self.spring_glow.value
         if state == IslandState.CARD_JARVIS:
             glow_pen = QPen(QColor(0, 229, 255, 75 if dark else 90), 2.0)
@@ -1937,23 +1964,14 @@ class AppleDynamicIsland(
             glow_pen = QPen(QColor(0, 229, 255, pulse_a), 2.4)
             p.strokePath(squircle, glow_pen)
 
-        # ── 4. Subtle shimmer sweep across capsule in THINKING / CARD_SENDING
+        # 3. Subtle shimmer sweep across capsule in THINKING / CARD_SENDING
         if (state in (IslandState.THINKING, IslandState.CARD_SENDING)) and not reduce:
             self._draw_shimmer(p, squircle, w, h, t, dark)
 
-        # ── 5. Top specular sheen ─────────────────────────────────────────
-        if is_pill:
-            sheen = QLinearGradient(0, 2.0, 0, 2.0 + (h - 2.0) * 0.40)
-        else:
-            sheen = QLinearGradient(0, -16, 0, h * 0.40)
-        sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
-        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
-        p.fillPath(squircle, QBrush(sheen))
-
-        # ── 6. Inner stroke (1 px hairline, state-colored) ───────────────
+        # 4. State-coloured stroke (assistant states only; the neutral hairline is part of the shell)
         self._draw_inner_stroke(p, squircle, state, t, dark)
 
-        # ── 7. Content (with opacity cross-fade) ─────────────────────────
+        # 5. Content (with opacity cross-fade)
         p.setOpacity(opacity)
         self._draw_content(p, w, h, now, t, state, dark, reduce)
         p.setOpacity(1.0)
@@ -1976,7 +1994,7 @@ class AppleDynamicIsland(
 
     def _draw_inner_stroke(self, p: QPainter, path: QPainterPath,
                            state: IslandState, t: float, dark: bool) -> None:
-        grad = QLinearGradient(0, 0, 0, float(self.height()))
+        grad = QLinearGradient(0, 0, 0, float(self.island_size()[1]))
 
         if state == IslandState.ERROR:
             c0 = QColor("#FF9F0A") if self.is_ai_error else QColor("#FF453A")
@@ -2021,22 +2039,8 @@ class AppleDynamicIsland(
             grad.setColorAt(0.0, QColor(0, 229, 255, pulse))
             grad.setColorAt(1.0, QColor(0, 0, 0, 60))
 
-        elif state in (
-            IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME,
-            IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER,
-            IslandState.CARD_HARDWARE_GRID, IslandState.CARD_HARDWARE_STRIP, IslandState.CARD_JARVIS
-        ):
-            grad.setColorAt(0.0, QColor(255, 255, 255, 75 if dark else 180))
-            grad.setColorAt(0.35, QColor(255, 255, 255, 25 if dark else 60))
-            grad.setColorAt(1.0, QColor(0, 0, 0, 80 if dark else 30))
-
         else:
-            if dark:
-                grad.setColorAt(0.0, QColor(255, 255, 255, 65))
-                grad.setColorAt(1.0, QColor(0,   0,   0,  75))
-            else:
-                grad.setColorAt(0.0, QColor(255, 255, 255, 200))
-                grad.setColorAt(1.0, QColor(0,   0,   0,   25))
+            return   # neutral states: the 1 px white-5% hairline is already part of the cached shell
 
         p.strokePath(path, QPen(QBrush(grad), 1.0))
 

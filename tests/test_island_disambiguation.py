@@ -105,10 +105,11 @@ def test_mouse_click_selection(qapp):
     candidates = ["Spotify", "SoundCloud"]
     island.trigger_disambiguate(candidates, callback=lambda c: selected.append(c))
 
-    w = max(island.width(), island.spring_w.target)
-    h = max(island.height(), island.spring_h.target)
+    iw, ih = island.island_size()
+    w = max(iw, island.spring_w.target)
+    h = max(ih, island.spring_h.target)
     rects = island._chip_rects(w, h, 1.0)
-    pt1 = rects[1].center()
+    pt1 = rects[1].center() + QPointF(island._pad, island._pad)   # window-local = island-local + margin
 
     # Simulate mouse press event on chip 1
     event = QMouseEvent(

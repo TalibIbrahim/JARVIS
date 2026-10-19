@@ -127,15 +127,105 @@ class Spring:
 
 _SQUIRCLE_CACHE: dict[tuple[float, float, float], QPainterPath] = {}
 _MAX_SQUIRCLE_CACHE = 512
+_CONTINUOUS_CACHE: dict[tuple[int, int, int, int], QPainterPath] = {}
 
-def create_squircle_path(rect: QRectF, radius: float) -> QPainterPath:
+
+def quantize_half(v: float) -> int:
+    """Quantize a length to 0.5 px steps (returns the integer number of half pixels)."""
+    return int(round(float(v) * 2.0))
+
+
+def _corner_params(r: float, smoothing: float, budget: float):
+    """Figma-style corner smoothing parameters for ONE corner (all lengths in px).
+
+    Returns (p, a, b, c, d, arc_len, arc_deg, beta_deg): the corner occupies p px along each edge;
+    two cubic runs (a, b, c, d) flank a circular arc of radius r spanning arc_deg degrees.
     """
-    Continuous-curvature squircle path (Apple G² superellipse).
-    Uses bézier control factor ≈ 0.552284 for smooth corner transitions.
-    Results are cached by (rect.width(), rect.height(), radius).
+    s = max(0.0, min(1.0, smoothing))
+    p = (1.0 + s) * r
+    if p > budget:                       # not enough edge: shrink smoothing (-> circular / stadium)
+        s = max(0.0, budget / r - 1.0)
+        p = min(p, budget)
+    arc_deg = 90.0 * (1.0 - s)
+    arc_len = math.sin(math.radians(arc_deg / 2.0)) * r * math.sqrt(2.0)
+    alpha = (90.0 - arc_deg) / 2.0
+    p3p4 = r * math.tan(math.radians(alpha / 2.0))
+    beta = 45.0 * s
+    c = p3p4 * math.cos(math.radians(beta))
+    d = c * math.tan(math.radians(beta))
+    b = (p - arc_len - c - d) / 3.0
+    a = 2.0 * b
+    return p, a, b, c, d, arc_len, arc_deg, beta
+
+
+def build_continuous_path(w: float, h: float, radius: float, smoothing: float = 0.6) -> QPainterPath:
+    """Continuous-curvature (squircle) rounded rect at the origin, w x h.
+
+    Apple/Figma corner smoothing: each corner is two cubic Beziers that ease the curvature in and out
+    around a circular arc of radius `radius`, occupying (1 + smoothing) * radius along each edge.
+    When radius >= min(w, h) / 2 the smoothing budget is zero and the result is a plain stadium.
+    """
+    path = QPainterPath()
+    r = max(0.0, min(float(radius), w / 2.0, h / 2.0))
+    if r <= 0.0:
+        path.addRect(0.0, 0.0, w, h)
+        return path
+    budget = min(w, h) / 2.0
+    p, a, b, c, d, arc_len, arc_deg, beta = _corner_params(r, smoothing, budget)
+    th = math.radians(arc_deg)
+    k = (4.0 / 3.0) * math.tan(th / 4.0) * r          # cubic handle length for the arc
+    cb, sb = math.cos(math.radians(beta)), math.sin(math.radians(beta))
+
+    def corner(vx: float, vy: float, dx: float, dy: float, nx: float, ny: float) -> None:
+        sx, sy = vx - p * dx, vy - p * dy
+
+        def pt(u: float, v: float) -> QPointF:
+            return QPointF(sx + u * dx + v * nx, sy + u * dy + v * ny)
+
+        ax, ay = a + b + c, d                          # arc start (local frame)
+        bx, by = ax + arc_len, ay + arc_len            # arc end
+        path.cubicTo(pt(a, 0.0), pt(a + b, 0.0), pt(ax, ay))
+        path.cubicTo(pt(ax + k * cb, ay + k * sb), pt(bx - k * sb, by - k * cb), pt(bx, by))
+        path.cubicTo(pt(bx + d, by + c), pt(bx + d, by + b + c), pt(bx + d, by + a + b + c))
+
+    path.moveTo(p, 0.0)
+    path.lineTo(w - p, 0.0)
+    corner(w, 0.0, 1.0, 0.0, 0.0, 1.0)                 # top-right
+    path.lineTo(w, h - p)
+    corner(w, h, 0.0, 1.0, -1.0, 0.0)                  # bottom-right
+    path.lineTo(p, h)
+    corner(0.0, h, -1.0, 0.0, 0.0, -1.0)               # bottom-left
+    path.lineTo(0.0, p)
+    corner(0.0, 0.0, 0.0, -1.0, 1.0, 0.0)              # top-left
+    path.closeSubpath()
+    return path
+
+
+def continuous_path_cached(w: float, h: float, radius: float, smoothing: float = 0.6) -> QPainterPath:
+    """Cached origin-anchored continuous path, keyed by (w, h, r) quantized to 0.5 px and smoothing to 0.01."""
+    key = (quantize_half(w), quantize_half(h), quantize_half(radius), int(round(smoothing * 100.0)))
+    path = _CONTINUOUS_CACHE.get(key)
+    if path is None:
+        if len(_CONTINUOUS_CACHE) >= _MAX_SQUIRCLE_CACHE:
+            _CONTINUOUS_CACHE.clear()
+        path = build_continuous_path(key[0] / 2.0, key[1] / 2.0, key[2] / 2.0, key[3] / 100.0)
+        _CONTINUOUS_CACHE[key] = path
+    return path
+
+
+def create_squircle_path(rect: QRectF, radius: float, smoothing: float = 0.0) -> QPainterPath:
+    """
+    Rounded-rect path for `rect`. smoothing == 0 keeps the legacy circular-arc corner (bezier factor 0.552284);
+    smoothing > 0 builds a true continuous (squircle) corner, e.g. 0.6 = Figma/Apple "corner smoothing".
+    Results are cached by (rect.width(), rect.height(), radius[, smoothing]).
     """
     w = rect.width()
     h = rect.height()
+    if smoothing > 0.0:
+        base_path = continuous_path_cached(w, h, radius, smoothing)
+        if rect.x() == 0.0 and rect.y() == 0.0:
+            return QPainterPath(base_path)
+        return base_path.translated(rect.x(), rect.y())
     key = (w, h, float(radius))
     base_path = _SQUIRCLE_CACHE.get(key)
     if base_path is None:

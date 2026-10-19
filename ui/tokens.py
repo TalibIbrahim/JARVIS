@@ -56,12 +56,14 @@ class RadiusTokens:
     # Dynamic Island Radii per MEASUREMENT_SHEET.md
     compact_pill: int = 18       # Stadium radius (H / 2 = 36 / 2 = 18 px)
     pill: int = 18               # alias
-    expanded_card: int = 47      # Squircle radius ~25% card height (188 * 0.25 = 47 px)
-    card_expanded: int = 47      # alias
-    inner_tile: int = 17         # Inner tile squircle radius ~9% card height (17 px)
-    tile: int = 17               # alias
-    hardware_strip: int = 28     # Dedicated telemetry strip squircle radius (28 px)
-    hardware: int = 28           # alias
+    expanded_card: float = 44.5  # MEASUREMENT_SHEET_v2: 24% of H=188, continuous (squircle) corner
+    card_expanded: float = 44.5  # alias
+    inner_tile: float = 9.0      # MEASUREMENT_SHEET_v2: inner tiles 8.8-9.4
+    tile: float = 9.0            # alias
+    calendar_panel: float = 11.8 # calendar left panel (8% of its height)
+    media_art: float = 15.4      # media album art (24% of 65.5)
+    hardware_strip: float = 34.5 # strip = H/2 (full stadium)
+    hardware: float = 34.5       # alias
 
     # Dynamic Island state-specific capsule radii
     wake_capsule: int = 22
@@ -124,9 +126,9 @@ class GeometryTokens:
     """Dynamic Island default geometries at 100% scale per MEASUREMENT_SHEET.md."""
     # Primary capsule layouts (100% scale)
     compact_pill: IslandSize = IslandSize(175.0, 36.0, 18.0)
-    expanded_card: IslandSize = IslandSize(390.0, 188.0, 47.0)
+    expanded_card: IslandSize = IslandSize(390.0, 188.0, 44.5)
     inner_tile: IslandSize = IslandSize(114.0, 68.0, 17.0)
-    hardware_strip: IslandSize = IslandSize(446.0, 69.0, 28.0)
+    hardware_strip: IslandSize = IslandSize(446.0, 69.0, 34.5)
 
     # Assistant & HUD states
     idle: IslandSize = IslandSize(175.0, 36.0, 18.0)
@@ -303,27 +305,27 @@ class ColorTokens:
     glass_inner_light = _c("#00000014", 20)      # 8% black stroke
 
     # ── Dynamic Island Obsidian Surface & Borders ───────────────────────
-    surface_top     = _c("#131617")        # Linear gradient top: deep obsidian
-    surface_bottom  = _c("#0A0A0A")        # Linear gradient bottom: pure near-black
-    capsule_border  = _c("#FFFFFF", 15)    # 1px hairline border: #FFFFFF at 6% alpha (rgba(255, 255, 255, 0.06), #FFFFFF0F)
-    tile_fill       = _c("#FFFFFF", 23)    # Inner tiles: fill #FFFFFF at 9% alpha (rgba(255, 255, 255, 0.09), #FFFFFF17)
-    tile_border     = _c("#FFFFFF", 10)    # Inner tiles: border 1px #FFFFFF at 4% alpha (rgba(255, 255, 255, 0.04), #FFFFFF0A)
-    sheen_top       = _c("#FFFFFF", 31)    # Specular sheen top: 12% alpha highlight (#FFFFFF)
+    surface_top     = _c("#11191B")        # MEASUREMENT_SHEET_v2 gradient top (teal-tinted)
+    surface_bottom  = _c("#0C0C0C")        # MEASUREMENT_SHEET_v2 gradient bottom
+    capsule_border  = _c("#FFFFFF", 13)    # 1px hairline: white 5%
+    tile_fill       = _c("#FFFFFF", 20)    # Inner tiles: white 8%
+    tile_border     = _c("#FFFFFF", 0)     # Inner tiles: no visible stroke in the reference
+    sheen_top       = _c("#FFFFFF", 0)     # No specular sheen in the reference
     sheen_bottom    = _c("#FFFFFF", 0)     # Specular sheen end: 0% alpha highlight (#FFFFFF)
 
     # ── Dynamic Island Palette & Accents ────────────────────────────────
-    accent_blue     = _c("#45C1EE")        # Accent Sky Blue: Media scrubber, cool weather, primary highlights
-    accent_sky_blue = _c("#45C1EE")        # Alias
-    accent_amber    = _c("#F5A524")        # Accent Amber: RAM load warning, mid-temps, battery standby
-    accent_red      = _c("#F0443A")        # Accent Red: Errors, critical temps >80°C, mic mute
-    accent_green    = _c("#34C759")        # Accent Green: Active tracking, media playing, normal temps
+    accent_blue     = _c("#4FC2E8")        # Accent blue (sheet v2)
+    accent_sky_blue = _c("#4FC2E8")        # Alias
+    accent_amber    = _c("#EBAB38")        # Accent amber (sheet v2)
+    accent_red      = _c("#E1605A")        # Accent red (sheet v2)
+    accent_green    = _c("#38C555")        # Accent green (sheet v2)
     hud_cyan        = _c("#00E5FF")        # Cyan: Dynamic Island wake pulse, mini wireframe HUD
     repulsor_gold   = _c("#FFC94D")        # Gold: Dwell hover ring, confirmation ticks
 
     # ── Dynamic Island Text & Label Hierarchy ───────────────────────────
-    label_primary   = _c("#F5F5F7")        # Primary text, heavy numerals, values (#F5F5F7)
-    label_uppercase = _c("#8E9094")        # Uppercase / labels: tile headers, section titles (#8E9094)
-    label_secondary = _c("#55585C")        # Secondary text: subtitles, timestamps, specs (#55585C)
+    label_primary   = _c("#FAFAFA")        # Value white (sheet v2)
+    label_uppercase = _c("#6B6F72")        # Tile labels (sheet v2)
+    label_secondary = _c("#828282")        # Secondary text: artist, times, weekday (sheet v2)
 
     # ── HUD_ONLY — restricted to Island / CursorFeedbackOverlay ─────────
     # DO NOT USE in SettingsWindow or any static UI
@@ -334,11 +336,11 @@ class ColorTokens:
         stark_gold_dim = _c("#FFC94D", 160)
         waveform_purple = _c("#AF52DE", 200)
         waveform_white  = _c("#FFFFFFFF", 230)
-        sky_blue        = _c("#45C1EE")
-        accent_blue     = _c("#45C1EE")
-        accent_amber    = _c("#F5A524")
-        accent_red      = _c("#F0443A")
-        accent_green    = _c("#34C759")
+        sky_blue        = _c("#4FC2E8")
+        accent_blue     = _c("#4FC2E8")
+        accent_amber    = _c("#EBAB38")
+        accent_red      = _c("#E1605A")
+        accent_green    = _c("#38C555")
 
 
 COLOR = ColorTokens()
@@ -370,6 +372,8 @@ class TypeToken(NamedTuple):
 
 
 # Font family precedence: prefer Inter if installed, fall back to Segoe UI Variable, then Segoe UI
+_ISLAND_FONT = "Segoe UI Variable Text"       # island v2 roles (falls back to Segoe UI on Windows 10)
+_ISLAND_DISPLAY = "Segoe UI Variable Display"
 _FONT = "Inter"  # Users can install Inter from assets/; runtime fallback is automatic via Qt
 
 
@@ -396,6 +400,29 @@ class TypeScale:
     uppercase_label = TypeToken(_FONT, 11, 600,  0.06)                 # 9pt/11px All Caps
     secondary_text  = TypeToken(_FONT, 13, 400,  0.0)                  # 11pt/13px Regular
     attribution     = TypeToken(_FONT, 10, 400,  0.0)                  # 9pt/10px Regular
+
+    # Island v2 roles (MEASUREMENT_SHEET_v2 section 4). Segoe UI Variable first, then the qfont() chain.
+    pill_time       = TypeToken(_ISLAND_FONT, 14, 600)
+    pill_temp       = TypeToken(_ISLAND_FONT, 14, 600)
+    hw_title        = TypeToken(_ISLAND_FONT, 13, 700)                     # sheet 12.5
+    tile_label      = TypeToken(_ISLAND_FONT, 11, 400)
+    hw_value        = TypeToken(_ISLAND_FONT, 14, 700, 0.0, tabular=True)
+    strip_value     = TypeToken(_ISLAND_FONT, 13, 700, 0.0, tabular=True)
+    strip_fps       = TypeToken(_ISLAND_FONT, 18, 700, 0.0, tabular=True)
+    weather_city    = TypeToken(_ISLAND_FONT, 11, 400)
+    weather_temp    = TypeToken(_ISLAND_DISPLAY, 45, 700)
+    weather_cond    = TypeToken(_ISLAND_FONT, 14, 600)
+    weather_value   = TypeToken(_ISLAND_FONT, 14, 600)
+    cal_month       = TypeToken(_ISLAND_FONT, 13, 700)
+    cal_year        = TypeToken(_ISLAND_FONT, 11, 400)
+    cal_day         = TypeToken(_ISLAND_DISPLAY, 66, 700, 0.0, tabular=True)
+    cal_weekday     = TypeToken(_ISLAND_FONT, 13, 700)
+    cal_dow         = TypeToken(_ISLAND_FONT, 15, 700)
+    cal_digit       = TypeToken(_ISLAND_FONT, 15, 700, 0.0, tabular=True)
+    media_title     = TypeToken(_ISLAND_FONT, 14, 600)
+    media_artist    = TypeToken(_ISLAND_FONT, 12, 400)
+    media_album     = TypeToken(_ISLAND_FONT, 12, 400)
+    media_time      = TypeToken(_ISLAND_FONT, 11, 400, 0.0, tabular=True)
 
 
 TYPE = TypeScale()
@@ -636,6 +663,158 @@ def squircle_bezier_factor(radius: float) -> float:
     return radius * 0.552284
 
 
+
+# ──────────────────────────────────────────────
+# 9.5 Island v2 tokens (docs/reference/MEASUREMENT_SHEET_v2.md, all values 1x logical px)
+# ──────────────────────────────────────────────
+def _white(alpha: float) -> "QColor":
+    """White at a fractional alpha (0..1)."""
+    return _c("#FFFFFF", int(round(alpha * 255)))
+
+
+# Continuous (Apple-style, Figma "corner smoothing") corner construction: see ui.components.
+CORNER_SMOOTHING: float = 0.6
+
+# Transparent window margin that holds the outside shadow (logical px at size scale 1: 3 sigma + dy of the
+# card shadow = 3 * 8.5 + 6 = 31.5 -> 32). The island window is the island rect grown by this on every side
+# (scaled by the island size scale; Qt logical px already follow the monitor DPI).
+SHELL_PAD: float = 32.0
+
+
+class SurfaceShadow(NamedTuple):
+    alpha: float     # peak alpha 0..1
+    sigma: float     # gaussian sigma, px
+    dy: float        # vertical offset, px
+
+
+class IslandColors:
+    """Measured island colours (sheet sections 1, 5, 7)."""
+    surface_top      = _c("#11191B")
+    surface_bottom   = _c("#0C0C0C")
+    hairline         = _white(0.05)
+    tile_fill        = _white(0.08)
+    divider          = _white(0.10)
+    track            = _white(0.16)
+    accent           = _c("#4FC2E8")
+    amber            = _c("#EBAB38")
+    red              = _c("#E1605A")
+    green            = _c("#38C555")
+    value            = _c("#FAFAFA")
+    label            = _c("#6B6F72")
+    secondary        = _c("#828282")
+    dim              = _c("#6B6E72")
+    dow              = _c("#60666A")       # calendar weekday header
+    digit            = _c("#E6E9EA")       # calendar in-month digit
+    white            = _c("#FFFFFF")
+    # Media
+    badge_fill       = _c("#0F1018")
+    media_neutral    = _c("#C8CCD0")       # tint used when there is no album art
+    bg_neutral       = _c("#0C0C0C")       # tinted background fades to this by 75% height
+    # Brand marks drawn in the media source badge (own vector drawings)
+    spotify_green    = _c("#1ED760")
+    chrome_red       = _c("#EA4335")
+    chrome_yellow    = _c("#FBBC05")
+    chrome_green     = _c("#34A853")
+    chrome_blue      = _c("#4285F4")
+    # Page dots
+    dot_inactive     = _white(0.25)
+    dot_active       = _white(0.95)
+    # Media buttons (never tinted)
+    btn_side_fill    = _white(0.037)
+    btn_play_fill    = _white(0.083)
+
+
+class IslandTint:
+    """Media tint rules (sheet section 7). Derived from the art dominant colour T."""
+    bg_value         = 0.115     # V of the tinted gradient at the card edge
+    bg_saturation    = 0.62      # x S of T (sheet: ~0.8x of the HSV-S of its measured colours; fitted against samples)
+    bg_stops         = ((0.0, 0.0), (0.50, 0.35), (0.70, 0.76), (0.75, 1.0))   # (y fraction, blend toward neutral)
+    glow_alpha       = 0.045     # top-centre elliptical glow (T over the gradient)
+    glow_ry          = 0.45      # vertical radius of the glow relative to its horizontal radius
+    scrub_start_lift = 0.25      # scrubber fill: T lightened 25% at the start
+    knob_ring_lift   = 0.50
+    pause_alpha      = 0.88
+    side_glyph_alpha = 0.62
+    wave_alpha       = 0.75
+    title_mix        = 0.05      # title: white lerped 5% toward T
+    text_mix         = 0.04      # secondary text cast
+    min_contrast     = 4.5
+
+
+class IslandShadows:
+    card = SurfaceShadow(0.5, 8.5, 6.0)
+    pill = SurfaceShadow(0.3, 4.0, 3.0)
+
+
+class PillLayout:
+    w, h = 175.0, 36.0
+    time_x = 21.7
+    divider_w, divider_h = 1.0, 18.3
+    glyph_w, glyph_h = 16.0, 14.0
+    glyph_gap = 10.7            # glyph right edge -> temperature
+    right_pad = 25.3            # temperature right edge -> pill right edge
+    dot_d = 8.0
+    dot_gap = 9.4               # temperature -> dot
+    dot_right = 15.7            # dot right edge -> pill right edge
+    text_nudge = -0.5           # optical vertical offset of the pill text (reference cap centre sits 0.5 px high)
+
+
+class MediaLayout:
+    w, h = 390.0, 188.0
+    art_x, art_y, art_size, art_radius = 24.5, 20.7, 65.5, 15.4
+    badge_d, badge_inset = 19.0, 4.0
+    text_x = 109.7
+    title_baseline, artist_baseline, album_baseline = 48.9, 69.0, 83.5
+    text_wave_gap = 14.0
+    wave_x, wave_bar_w, wave_pitch, wave_cy = 332.0, 2.5, 5.0, 53.45
+    wave_heights = (12.5, 7.5, 16.3, 10.0, 15.0, 6.3, 11.3)
+    scrub_x, scrub_w, scrub_cy, scrub_h = 74.0, 241.4, 116.3, 4.5
+    knob_d, knob_core_d = 10.0, 7.5
+    time_left_x, time_right_edge, time_baseline = 47.0, 348.0, 119.7
+    ctrl_cy = 151.7
+    prev_cx, play_cx, next_cx = 128.8, 195.3, 259.9
+    side_d, play_d = 33.0, 46.4
+    side_glyph_w, side_glyph_h = 11.0, 13.0
+    pause_bar_w, pause_gap, pause_h = 3.8, 3.8, 16.0
+    hit_side_r, hit_play_r = 22.0, 26.0     # click / dwell targets (larger than the drawn discs)
+
+
+class CalendarLayout:
+    w, h = 390.0, 188.0
+    panel_x, panel_y, panel_w, panel_h, panel_radius = 22.6, 17.0, 95.6, 151.2, 11.8
+    month_baseline, year_baseline, day_baseline, weekday_baseline = 16.9, 31.9, 96.2, 139.3   # panel-relative
+    dow_baseline = 29.3
+    col_x0, col_pitch = 152.4, 28.8
+    rule_y, rule_x0, rule_x1, rule_h = 37.5, 139.9, 337.2, 1.0
+    row_baseline0, row_pitch, digit_h = 59.1, 26.5, 10.3
+    today_d = 23.0
+    today_dy = 1.4              # reference circle centre sits 1.4 px below the digit centre
+
+
+class DotsLayout:
+    d, d_active = 5.0, 5.6
+    pitch = 8.2
+    right_inset = 9.0
+    anim_s = 0.18
+    hit_half_w = 12.0
+
+
+class IslandTokens:
+    color = IslandColors
+    tint = IslandTint
+    shadow = IslandShadows
+    pill = PillLayout
+    media = MediaLayout
+    calendar = CalendarLayout
+    dots = DotsLayout
+    corner_smoothing = CORNER_SMOOTHING
+    shell_pad = SHELL_PAD
+    crossfade_ms = REDUCE_MOTION_MS
+    tile_radius = 9.0
+
+
+ISLAND = IslandTokens()
+
 # ──────────────────────────────────────────────
 # 10. Convenience accessor namespace
 # ──────────────────────────────────────────────
@@ -662,6 +841,7 @@ class T:
     grid     = GRID
     geometry = GEOMETRY
     scale    = SCALE
+    island   = ISLAND
 
     @staticmethod
     def is_dark() -> bool:

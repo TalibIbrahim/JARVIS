@@ -216,218 +216,6 @@ def render_settings_tab(category_id: str, dpi: float, theme: str) -> QImage:
         return img
 
 
-def _render_hardware_grid_fallback(island: AppleDynamicIsland, w: float, h: float, dpi: float, theme: str) -> QImage:
-    """Renders 2x3 Hardware Monitor Grid card offscreen per MEASUREMENT_SHEET.md."""
-    pw = int(round(w * dpi))
-    ph = int(round(h * dpi))
-    pix = QPixmap(pw, ph)
-    pix.setDevicePixelRatio(dpi)
-    pix.fill(QColor(0, 0, 0, 0))
-
-    dark = (theme.lower() == "dark")
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-
-    r = 47.0
-    pill_rect = QRectF(2, 2, w - 4, h - 4)
-    squircle = create_squircle_path(pill_rect, r)
-
-    for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
-        sr = QRectF(2, 2 + offset, w - 4, h - 4)
-        sp = create_squircle_path(sr, r)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-        p.drawPath(sp)
-
-    bg_grad = QLinearGradient(0, 0, 0, h)
-    if dark:
-        bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
-        bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
-    else:
-        bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
-        bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
-    p.fillPath(squircle, QBrush(bg_grad))
-
-    sheen = QLinearGradient(0, 0, 0, h * 0.40)
-    sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
-    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
-    p.fillPath(squircle, QBrush(sheen))
-
-    p.strokePath(squircle, QPen(QColor(255, 255, 255, 15 if dark else 40), 1.0))
-
-    tiles_data = [
-        ("CPU", "38%", "#45C1EE", "3.8 GHz"),
-        ("GPU", "42%", "#34C759", "58°C"),
-        ("RAM", "56%", "#F5A524", "17.9/32 GB"),
-        ("DISK", "12%", "#45C1EE", "Read 45MB/s"),
-        ("NETWORK", "14.2", "#45C1EE", "MB/s Down"),
-        ("THERMAL", "54°C", "#34C759", "Optimal"),
-    ]
-
-    tile_w = 114.0
-    tile_h = 68.0
-    tile_r = 17.0
-    margin_x = (w - (3 * tile_w + 2 * 12.0)) / 2.0
-    margin_y = (h - (2 * tile_h + 12.0)) / 2.0
-
-    for idx, (label, val, accent_hex, sub) in enumerate(tiles_data):
-        row = idx // 3
-        col = idx % 3
-        tx = margin_x + col * (tile_w + 12.0)
-        ty = margin_y + row * (tile_h + 12.0)
-        tr = QRectF(tx, ty, tile_w, tile_h)
-        t_path = create_squircle_path(tr, tile_r)
-
-        p.fillPath(t_path, QBrush(QColor(255, 255, 255, 23 if dark else 60)))
-        p.strokePath(t_path, QPen(QColor(255, 255, 255, 10 if dark else 25), 1.0))
-
-        p.setFont(QFont("Segoe UI Variable Text", 9, QFont.Weight.DemiBold))
-        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
-        p.drawText(int(tx + 10), int(ty + 18), label)
-
-        p.setFont(QFont("Segoe UI Variable Display", 18, QFont.Weight.Bold))
-        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-        p.drawText(int(tx + 10), int(ty + 44), val)
-
-        p.setFont(QFont("Segoe UI Variable Text", 8, QFont.Weight.Normal))
-        p.setPen(QColor(accent_hex))
-        p.drawText(int(tx + 10), int(ty + 60), sub)
-
-    p.end()
-    return pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
-
-
-def _render_hardware_strip_fallback(island: AppleDynamicIsland, w: float, h: float, dpi: float, theme: str) -> QImage:
-    """Renders 5-item Hardware Strip (446x69 px) offscreen per MEASUREMENT_SHEET.md."""
-    pw = int(round(w * dpi))
-    ph = int(round(h * dpi))
-    pix = QPixmap(pw, ph)
-    pix.setDevicePixelRatio(dpi)
-    pix.fill(QColor(0, 0, 0, 0))
-
-    dark = (theme.lower() == "dark")
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-
-    r = 28.0
-    pill_rect = QRectF(2, 2, w - 4, h - 4)
-    squircle = create_squircle_path(pill_rect, r)
-
-    for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
-        sr = QRectF(2, 2 + offset, w - 4, h - 4)
-        sp = create_squircle_path(sr, r)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-        p.drawPath(sp)
-
-    bg_grad = QLinearGradient(0, 0, 0, h)
-    if dark:
-        bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
-        bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
-    else:
-        bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
-        bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
-    p.fillPath(squircle, QBrush(bg_grad))
-
-    sheen = QLinearGradient(0, 0, 0, h * 0.40)
-    sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
-    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
-    p.fillPath(squircle, QBrush(sheen))
-
-    p.strokePath(squircle, QPen(QColor(255, 255, 255, 15 if dark else 40), 1.0))
-
-    segments = [
-        ("CPU", "38%", "#45C1EE"),
-        ("GPU", "24%", "#34C759"),
-        ("RAM", "56%", "#F5A524"),
-        ("NET", "14MB", "#45C1EE"),
-        ("TEMP", "54°C", "#34C759"),
-    ]
-    seg_w = (w - 24.0) / 5.0
-    for idx, (label, val, accent_hex) in enumerate(segments):
-        sx = 12.0 + idx * seg_w
-        if idx > 0:
-            p.setPen(QPen(QColor(255, 255, 255, 10 if dark else 25), 1.0))
-            p.drawLine(QPointF(sx, 16.0), QPointF(sx, h - 16.0))
-
-        p.setFont(QFont("Segoe UI Variable Text", 9, QFont.Weight.DemiBold))
-        p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
-        p.drawText(QRectF(sx, 12.0, seg_w, 18.0), Qt.AlignmentFlag.AlignCenter, label)
-
-        p.setFont(QFont("Segoe UI Variable Display", 15, QFont.Weight.Bold))
-        p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-        p.drawText(QRectF(sx, 32.0, seg_w, 24.0), Qt.AlignmentFlag.AlignCenter, val)
-
-    p.end()
-    return pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
-
-
-def _render_jarvis_card_fallback(island: AppleDynamicIsland, w: float, h: float, dpi: float, theme: str) -> QImage:
-    """Renders JARVIS Assistant Card (390x188 px) offscreen per MEASUREMENT_SHEET.md."""
-    pw = int(round(w * dpi))
-    ph = int(round(h * dpi))
-    pix = QPixmap(pw, ph)
-    pix.setDevicePixelRatio(dpi)
-    pix.fill(QColor(0, 0, 0, 0))
-
-    dark = (theme.lower() == "dark")
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-
-    r = 47.0
-    pill_rect = QRectF(2, 2, w - 4, h - 4)
-    squircle = create_squircle_path(pill_rect, r)
-
-    for offset, alpha in [(2, 12), (4, 20), (7, 28)]:
-        sr = QRectF(2, 2 + offset, w - 4, h - 4)
-        sp = create_squircle_path(sr, r)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-        p.drawPath(sp)
-
-    bg_grad = QLinearGradient(0, 0, 0, h)
-    if dark:
-        bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
-        bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
-    else:
-        bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
-        bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
-    p.fillPath(squircle, QBrush(bg_grad))
-
-    glow_pen = QPen(QColor(0, 229, 255, 75 if dark else 90), 2.0)
-    p.strokePath(squircle, glow_pen)
-
-    sheen = QLinearGradient(0, 0, 0, h * 0.40)
-    sheen.setColorAt(0.0, QColor(255, 255, 255, 31 if dark else 80))
-    sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
-    p.fillPath(squircle, QBrush(sheen))
-
-    p.setFont(QFont("Segoe UI Variable Text", 13, QFont.Weight.Medium))
-    p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
-    p.drawText(24, 46, "“Run system diagnostic”")
-
-    p.setFont(QFont("Segoe UI Variable Text", 15, QFont.Weight.DemiBold))
-    p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-    p.drawText(24, 82, "All core subsystems nominal, sir.")
-
-    pill_w = 220.0
-    pill_h = 36.0
-    pill_r = pill_h / 2.0
-    conf_rect = QRectF(24, 116, pill_w, pill_h)
-    p.fillPath(create_squircle_path(conf_rect, pill_r), QBrush(QColor(52, 199, 89, 45 if dark else 60)))
-    p.strokePath(create_squircle_path(conf_rect, pill_r), QPen(QColor(52, 199, 89, 120), 1.0))
-
-    p.setFont(QFont("Segoe UI Variable Text", 11, QFont.Weight.DemiBold))
-    p.setPen(QColor("#34C759" if dark else "#248A3D"))
-    p.drawText(conf_rect, Qt.AlignmentFlag.AlignCenter, "✓  Diagnostic Complete")
-
-    p.end()
-    return pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
-
-
 def setup_island_state(island: AppleDynamicIsland, state_name: str, now: float) -> tuple[float, float]:
     """Configures state attributes on AppleDynamicIsland and returns target size."""
     s = state_name.upper()
@@ -581,18 +369,19 @@ def render_island_view(state_name: str, dpi: float, theme: str) -> QImage:
         tw, th = setup_island_state(island, state_name, now)
         island.spring_w.snap(tw)
         island.spring_h.snap(th)
-        island.resize(int(round(tw)), int(round(th)))
+        island.set_island_size(int(round(tw)), int(round(th)))
         get_app().processEvents()
 
         s = state_name.upper()
-        if s in ("HARDWARE_GRID", "CARD_HARDWARE_GRID") and not hasattr(island, "_draw_hardware_grid"):
-            img = _render_hardware_grid_fallback(island, tw, th, dpi, theme)
-        elif s in ("HARDWARE_STRIP", "CARD_HARDWARE_STRIP") and not hasattr(island, "_draw_hardware_strip"):
-            img = _render_hardware_strip_fallback(island, tw, th, dpi, theme)
-        elif s in ("JARVIS", "CARD_JARVIS") and not hasattr(island, "_draw_jarvis_card"):
-            img = _render_jarvis_card_fallback(island, tw, th, dpi, theme)
-        else:
-            img = render_widget_to_image(island, dpi)
+        required = {
+            "HARDWARE_GRID": "_draw_hardware_grid", "CARD_HARDWARE_GRID": "_draw_hardware_grid",
+            "HARDWARE_STRIP": "_draw_hardware_strip", "CARD_HARDWARE_STRIP": "_draw_hardware_strip",
+            "JARVIS": "_draw_jarvis_card", "CARD_JARVIS": "_draw_jarvis_card",
+        }.get(s)
+        if required and not hasattr(island, required):
+            raise AttributeError(f"AppleDynamicIsland is missing real renderer {required}() for state {s}")
+        # Full window capture: island rect plus the transparent shadow margin.
+        img = render_widget_to_image(island, dpi)
 
         island.close()
         return img
@@ -739,7 +528,7 @@ def render_island_animation_frame(sequence_name: str, t_offset: float, dpi: floa
         with injected_clock(target_time):
             w = max(40, min(int(round(island.spring_w.value)), 3840))
             h = max(20, min(int(round(island.spring_h.value)), 2160))
-            island.resize(w, h)
+            island.set_island_size(w, h)
             get_app().processEvents()
 
             img = render_widget_to_image(island, dpi)

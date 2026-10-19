@@ -395,6 +395,12 @@ class TestNonPixelBehaviors(unittest.TestCase):
 # 10. Dynamic Island Pages and Assistant States (Phase 0 Requirements)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _island_pad() -> int:
+    """Transparent shadow margin around the island (full-window captures include it)."""
+    from ui.island_parts.common import shell_pad_for
+    return shell_pad_for(1.0)
+
+
 class TestDynamicIslandPagesAndAssistantStatesVisual(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -447,8 +453,8 @@ class TestDynamicIslandPagesAndAssistantStatesVisual(unittest.TestCase):
                 img = render_hardware_grid_page(dpi, theme)
                 self.assertFalse(img.isNull())
                 self.assertEqual(img.format(), QImage.Format.Format_ARGB32)
-                expected_w = int(round(390.0 * dpi))
-                expected_h = int(round(188.0 * dpi))
+                expected_w = int(round((390.0 + 2 * _island_pad()) * dpi))
+                expected_h = int(round((188.0 + 2 * _island_pad()) * dpi))
                 self.assertEqual(img.width(), expected_w)
                 self.assertEqual(img.height(), expected_h)
 
@@ -459,8 +465,8 @@ class TestDynamicIslandPagesAndAssistantStatesVisual(unittest.TestCase):
                 img = render_hardware_strip_page(dpi, theme)
                 self.assertFalse(img.isNull())
                 self.assertEqual(img.format(), QImage.Format.Format_ARGB32)
-                expected_w = int(round(446.0 * dpi))
-                expected_h = int(round(69.0 * dpi))
+                expected_w = int(round((446.0 + 2 * _island_pad()) * dpi))
+                expected_h = int(round((69.0 + 2 * _island_pad()) * dpi))
                 self.assertEqual(img.width(), expected_w)
                 self.assertEqual(img.height(), expected_h)
 
@@ -471,8 +477,8 @@ class TestDynamicIslandPagesAndAssistantStatesVisual(unittest.TestCase):
                 img = render_jarvis_card(dpi, theme)
                 self.assertFalse(img.isNull())
                 self.assertEqual(img.format(), QImage.Format.Format_ARGB32)
-                expected_w = int(round(390.0 * dpi))
-                expected_h = int(round(188.0 * dpi))
+                expected_w = int(round((390.0 + 2 * _island_pad()) * dpi))
+                expected_h = int(round((188.0 + 2 * _island_pad()) * dpi))
                 self.assertEqual(img.width(), expected_w)
                 self.assertEqual(img.height(), expected_h)
 
