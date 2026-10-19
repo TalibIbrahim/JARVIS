@@ -8,6 +8,7 @@ and never touch Qt; the play state is flipped optimistically and reconciled by t
 
 from __future__ import annotations
 
+import bisect
 import ctypes
 import math
 import queue
@@ -19,7 +20,7 @@ from typing import Optional
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetricsF, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
-    QRadialGradient, QTransform,
+    QRadialGradient, QStaticText, QTransform,
 )
 
 from ui.tokens import ISLAND, TYPE, COLOR, qfont
@@ -31,6 +32,7 @@ from ui.components import continuous_path_cached
 _L = ISLAND.media
 _C = ISLAND.color
 _TINT = ISLAND.tint
+_LY = ISLAND.lyrics
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -227,6 +229,119 @@ def _glyph(kind: str) -> QPainterPath:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Lyrics (data arrives as overlay.post("lyrics_state", ...); all drawing is GUI-thread only)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LyricsState:
+    """One track's lyrics plus the per-line caches and animation clock. Replaced wholesale on every
+    lyrics_state event; never touched off the GUI thread."""
+    __slots__ = ("track_key", "times", "texts", "plain_first", "instrumental", "status",
+                 "idx", "prev_idx", "change_t", "line_t0", "animate", "tick_t", "nf_t0", "cache", "widths")
+
+    def __init__(self, track_key="", synced=None, plain=None, instrumental=False, status="ok"):
+        self.track_key = str(track_key or "")
+        times, texts = [], []
+        for row in (synced or []):
+            try:
+                times.append(float(row[0]))
+                texts.append(str(row[1]).strip())
+            except Exception:
+                continue
+        order = sorted(range(len(times)), key=times.__getitem__)       # bisect needs ascending times
+        self.times = [times[i] for i in order]
+        self.texts = [texts[i] for i in order]
+        first = ""
+        for ln in str(plain or "").splitlines():
+            if ln.strip():
+                first = ln.strip()
+                break
+        self.plain_first = first
+        self.instrumental = bool(instrumental)
+        self.status = str(status or "ok")
+        self.idx: Optional[int] = None           # shown line index (-1 = before the first line)
+        self.prev_idx = -1
+        self.change_t = 0.0
+        self.line_t0 = 0.0
+        self.animate = False
+        self.tick_t = -1e9
+        self.nf_t0: Optional[float] = None
+        self.cache: dict = {}                    # (kind, text) -> (QStaticText, ascent): one layout per line
+        self.widths: dict = {}                   # line index -> advance width (pill marquee)
+
+    @property
+    def synced(self) -> bool:
+        return bool(self.times)
+
+
+_LY_FONTS: dict = {}
+
+
+def _ly_font(token):
+    """(QFont, QFontMetricsF) per type token, built once."""
+    hit = _LY_FONTS.get(token)
+    if hit is None:
+        f = qfont(token)
+        hit = (f, QFontMetricsF(f))
+        _LY_FONTS[token] = hit
+    return hit
+
+
+_LY_GLYPH: dict = {}
+
+
+def _lyrics_glyph():
+    """(bubble path, line paths) of the 18 px toggle glyph centred on the origin (own drawing)."""
+    g = _LY_GLYPH.get("g")
+    if g is None:
+        bubble = QPainterPath()
+        bubble.addRoundedRect(QRectF(-8.0, -7.5, 16.0, 12.5), 4.0, 4.0)
+        tail = rounded_polygon([(-4.6, 4.0), (-6.8, 8.2), (-0.8, 4.0)], 0.6)
+        bubble = bubble.united(tail)
+        l1, l2 = QPainterPath(), QPainterPath()
+        l1.moveTo(-4.4, -3.0)
+        l1.lineTo(4.4, -3.0)
+        l2.moveTo(-4.4, 0.4)
+        l2.lineTo(1.4, 0.4)
+        g = (bubble, (l1, l2))
+        _LY_GLYPH["g"] = g
+    return g
+
+
+_LY_SHIMMER: dict = {}
+
+
+def _shimmer_assets():
+    a = _LY_SHIMMER.get("a")
+    if a is None:
+        grad = QLinearGradient(0.0, 0.0, 60.0, 0.0)
+        grad.setColorAt(0.0, QColor(255, 255, 255, 0))
+        grad.setColorAt(0.5, QColor(255, 255, 255, 34))
+        grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        a = (QBrush(grad), QRectF(0.0, 0.0, 60.0, _LY.shimmer_h + 16.0))
+        _LY_SHIMMER["a"] = a
+    return a
+
+
+def _persist_setting(key: str, value) -> None:
+    """Worker-thread body: write one key to the config file (same atomic write the settings window uses)."""
+    try:
+        import json
+        import os
+        from config import get_config_path, _atomic_write_json
+        path = get_config_path()
+        data = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+        data[key] = value
+        _atomic_write_json(path, data)
+    except Exception as exc:
+        print(f"[island] persist {key} error: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 class MediaPageMixin:
     """Media card renderer, scrubber geometry and transport actions.
@@ -252,6 +367,7 @@ class MediaPageMixin:
             ("prev", "media_prev", _L.prev_cx * s, cy, _L.hit_side_r * s),
             ("play_pause", "media_toggle", _L.play_cx * s, cy, _L.hit_play_r * s),
             ("next", "media_next", _L.next_cx * s, cy, _L.hit_side_r * s),
+            ("lyrics_toggle", "lyrics_toggle", _LY.toggle_cx * s, _LY.toggle_cy * s, _LY.toggle_hit_r * s),
         ]
 
     # ── transport (GUI thread: flip state + queue; worker: adapter call) ────
@@ -269,6 +385,316 @@ class MediaPageMixin:
     def media_next(self) -> None:
         run_transport(lambda: _adapter_call("next_track", vk=0xB0))
         self.update()
+
+    # ── lyrics: state, current line, toggle ──────────────────────────────────
+
+    def set_lyrics_state(self, **d) -> None:
+        """GUI-thread handler for overlay.post("lyrics_state", track_key=, synced=, plain=, instrumental=, status=)."""
+        new = LyricsState(d.get("track_key"), d.get("synced"), d.get("plain"), d.get("instrumental", False),
+                          d.get("status", "ok"))
+        old = getattr(self, "_lyrics", None)
+        if old is not None and old.track_key == new.track_key and old.status == new.status:
+            new.nf_t0 = old.nf_t0                       # "unavailable" stays a one-shot per track
+        self._lyrics = new
+        self.update()
+
+    def _lyrics_cfg(self) -> tuple:
+        cached = getattr(self, "_ly_cfg", None)          # refreshed by reload_config() and toggle_lyrics()
+        if cached is not None:
+            return cached
+        cfg = getattr(self.mgr, "cfg", None)
+        return (bool(getattr(cfg, "island_lyrics_enabled", False)),
+                bool(getattr(cfg, "island_lyrics_in_pill", True)))
+
+    def lyrics_enabled(self) -> bool:
+        return self._lyrics_cfg()[0]
+
+    def toggle_lyrics(self) -> None:
+        """Card glyph / dwell / fist-click: same effect as the settings switch (live cfg + persisted)."""
+        value = not self.lyrics_enabled()
+        cfg = getattr(self.mgr, "cfg", None)
+        if cfg is not None:
+            try:
+                setattr(cfg, "island_lyrics_enabled", value)
+            except Exception:
+                pass
+        self._ly_cfg = (value, self._lyrics_cfg()[1])
+        ctx = getattr(self.mgr, "ctx", None)
+        if ctx is not None and hasattr(ctx, "update_setting"):
+            try:
+                ctx.update_setting("island_lyrics_enabled", value)
+            except Exception as exc:
+                print(f"[island] update_setting error: {exc}")
+        else:
+            run_transport(lambda: _persist_setting("island_lyrics_enabled", value))
+        self.update()
+
+    def _lyrics_for_track(self) -> Optional[LyricsState]:
+        """The lyrics state if it belongs to the track now playing (stale lyrics are never shown)."""
+        st = getattr(self, "_lyrics", None)
+        if st is None or st.track_key != f"{self.media_title}|{self.media_artist}":
+            return None
+        return st
+
+    def _lyrics_tick(self, st: LyricsState, now: float) -> int:
+        """Advance the shown-line index (binary search over the synced times, -0.25 s lead). Idempotent per frame."""
+        if not st.times:
+            return -1
+        idx = bisect.bisect_right(st.times, float(self.media_position_sec) + _LY.lead_s) - 1
+        if idx != st.idx:
+            stale = st.idx is None or (now - st.tick_t) > 0.5
+            st.prev_idx = idx if st.idx is None else st.idx
+            st.idx = idx
+            st.change_t = now
+            st.line_t0 = now
+            st.animate = not stale
+        st.tick_t = now
+        return idx
+
+    def _lyrics_anim(self, st: LyricsState, now: float) -> float:
+        """Line-change progress 0..1 (eased out); 1 when idle or reduce_motion."""
+        if not st.animate or self._reduce_motion():
+            return 1.0
+        k = (now - st.change_t) / _LY.anim_s
+        if k >= 1.0:
+            return 1.0
+        k = max(0.0, k)
+        return 1.0 - (1.0 - k) ** 3
+
+    def _lyrics_strip_mode(self, now: float) -> Optional[str]:
+        """What the card strip shows: synced | plain | instrumental | loading | not_found | None (hidden)."""
+        if not self.lyrics_enabled():
+            return None
+        st = self._lyrics_for_track()
+        if st is None:
+            return None
+        if st.instrumental:
+            return "instrumental"
+        if st.status == "loading":
+            return "loading"
+        if st.status == "not_found":
+            if st.nf_t0 is None:
+                st.nf_t0 = now
+            return "not_found" if now - st.nf_t0 < _LY.not_found_s else None
+        if st.status != "ok":
+            return None
+        if st.synced:
+            return "synced"
+        return "plain" if st.plain_first else None
+
+    def _lyrics_pill_active(self, now: float) -> Optional[LyricsState]:
+        """The state to draw in the compact pill, or None to keep the normal pill content."""
+        enabled, in_pill = self._lyrics_cfg()
+        if not (enabled and in_pill and self.media_playing):
+            return None
+        st = self._lyrics_for_track()
+        if st is None or st.status != "ok" or st.instrumental or not st.synced:
+            return None
+        return st if self._lyrics_tick(st, now) >= 0 else None
+
+    def _lyrics_pill_wanted(self) -> bool:
+        """Side-effect-free twin of _lyrics_pill_active(): will the pill show a lyric line (drives the wide pill)?"""
+        enabled, in_pill = self._lyrics_cfg()
+        if not (enabled and in_pill and self.media_playing):
+            return False
+        st = self._lyrics_for_track()
+        if st is None or st.status != "ok" or st.instrumental or not st.synced or not st.times:
+            return False
+        return bisect.bisect_right(st.times, float(self.media_position_sec) + _LY.lead_s) > 0
+
+    @staticmethod
+    def _ly_line(st: LyricsState, i: int) -> str:
+        if i < 0:
+            return "♪"
+        if i >= len(st.texts):
+            return ""
+        return st.texts[i] or "♪"
+
+    @staticmethod
+    def _ly_static(st: LyricsState, kind: str, text: str, token, avail: float) -> tuple:
+        """(QStaticText, ascent) for `text` in `token`, elided to `avail`; one cached layout per (kind, text)."""
+        key = (kind, text, int(avail))
+        hit = st.cache.get(key)
+        if hit is None:
+            font, fm = _ly_font(token)
+            shown = fm.elidedText(text, Qt.TextElideMode.ElideRight, avail) if avail < 1e5 else text
+            sx = QStaticText(shown)
+            sx.prepare(QTransform(), font)
+            if len(st.cache) > 64:
+                st.cache.clear()
+            hit = (sx, fm.ascent())
+            st.cache[key] = hit
+        return hit
+
+    def _ly_draw(self, p: QPainter, st: LyricsState, kind: str, text: str, token, color: QColor,
+                 x: float, baseline: float, avail: float, alpha: float) -> None:
+        if alpha <= 0.01 or not text:
+            return
+        sx, asc = self._ly_static(st, kind, text, token, avail)
+        base = p.opacity()
+        p.setOpacity(base * min(1.0, alpha))
+        p.setFont(_ly_font(token)[0])
+        p.setPen(color)
+        p.drawStaticText(QPointF(x, baseline - asc), sx)
+        p.setOpacity(base)
+
+    def _draw_lyrics_strip(self, p: QPainter, mode: str, now: float) -> None:
+        """Two-line strip in logical card coordinates (caller has the 1x scale applied)."""
+        st = self._lyrics_for_track()
+        if st is None:
+            return
+        x, avail = _LY.x, _LY.right - _LY.x
+        y0, y1 = _LY.cur_baseline, _LY.next_baseline
+        cur_c, next_c = _C.white, _C.label
+        CUR, NXT = _LY.cur_font, _LY.next_font
+        p.save()
+        p.setClipRect(QRectF(x - 2.0, 72.5, avail + 4.0, 39.0))
+        if mode == "synced":
+            idx = self._lyrics_tick(st, now)
+            e = self._lyrics_anim(st, now)
+            if e >= 1.0:
+                self._ly_draw(p, st, "c", self._ly_line(st, idx), CUR, cur_c, x, y0, avail, 1.0)
+                self._ly_draw(p, st, "n", self._ly_line(st, idx + 1), NXT, next_c, x, y1, avail, 1.0)
+            else:
+                cur = self._ly_line(st, idx)
+                self._ly_draw(p, st, "c", self._ly_line(st, st.prev_idx), CUR, cur_c, x, y0 - e * _LY.slide_px, avail, 1.0 - e)
+                ymid = y0 + (1.0 - e) * (y1 - y0)                     # old "next" glides up and becomes current
+                self._ly_draw(p, st, "c", cur, CUR, cur_c, x, ymid, avail, e)
+                self._ly_draw(p, st, "n", cur, NXT, next_c, x, ymid, avail, 1.0 - e)
+                self._ly_draw(p, st, "n", self._ly_line(st, idx + 1), NXT, next_c, x, y1 + (1.0 - e) * _LY.slide_px, avail, e)
+        elif mode == "plain":
+            self._ly_draw(p, st, "c", st.plain_first, CUR, cur_c, x, y0, avail, 1.0)
+            self._ly_draw(p, st, "n", "Unsynced", NXT, next_c, x, y1, avail, 1.0)
+        elif mode == "instrumental":
+            self._ly_draw(p, st, "i", "♪ Instrumental", CUR, _C.secondary, x, y0, avail, 1.0)
+        elif mode == "not_found":
+            left = _LY.not_found_s - (now - (st.nf_t0 or now))
+            self._ly_draw(p, st, "u", "Lyrics unavailable", NXT, next_c, x, y0, avail, min(1.0, left / 0.35))
+        elif mode == "loading":
+            brush, hl = _shimmer_assets()
+            phase = 0.0 if self._reduce_motion() else (now % _LY.shimmer_period) / _LY.shimmer_period
+            sh = _LY.shimmer_h
+            p.setPen(Qt.PenStyle.NoPen)
+            for yb, wbar in ((y0, _LY.shimmer_w), (y1, _LY.shimmer_w * 0.66)):
+                top = yb - sh + 1.0
+                bar = QRectF(x, top, wbar, sh)
+                p.setBrush(QColor(255, 255, 255, 20))
+                p.drawRoundedRect(bar, sh / 2.0, sh / 2.0)
+                p.save()
+                clip = QPainterPath()
+                clip.addRoundedRect(bar, sh / 2.0, sh / 2.0)
+                p.setClipPath(clip, Qt.ClipOperation.IntersectClip)
+                p.translate(x - 60.0 + phase * (wbar + 60.0), top - 8.0)
+                p.setBrush(brush)
+                p.drawRect(hl)
+                p.restore()
+        p.restore()
+
+    def _draw_lyrics_toggle(self, p: QPainter, pal: MediaPalette) -> None:
+        """18 px quote-bubble glyph under the waveform (logical coords). Filled when lyrics are on; outline when off.
+        The off-state glyph only appears while the card is hovered, so the idle card is unchanged."""
+        on = self.lyrics_enabled()
+        hover = (self._hovered_btn == "lyrics_toggle")
+        if not (on or hover or getattr(self, "_is_hovering", False)):
+            return
+        cx, cy, r = _LY.toggle_cx, _LY.toggle_cy, _LY.toggle_d / 2.0 + 3.0
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        if hover:
+            disc = QColor(_C.btn_side_fill)
+            disc.setAlpha(min(255, disc.alpha() + 30))
+            p.setBrush(disc)
+            p.drawEllipse(QPointF(cx, cy), r, r)
+            if self._btn_dwell_elapsed > 0.05:
+                p.setPen(QPen(pal.tint, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawArc(QRectF(cx - r - 2.5, cy - r - 2.5, (r + 2.5) * 2.0, (r + 2.5) * 2.0), 90 * 16,
+                          -int(min(1.0, self._btn_dwell_elapsed) * 360 * 16))
+        bubble, lines = _lyrics_glyph()
+        p.translate(cx, cy)
+        if on:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(pal.pause)
+            p.drawPath(bubble)
+            lp = QPen(_C.surface_bottom, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        else:
+            p.setPen(QPen(pal.side, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(bubble)
+            lp = QPen(pal.side, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(lp)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for ln in lines:
+            p.drawPath(ln)
+        p.restore()
+
+    # ── lyrics: compact pill line ────────────────────────────────────────────
+
+    def _ly_fade_brush(self, x: float, avail: float, fade_l: float, fade_r: float, color: QColor) -> QBrush:
+        """Cached horizontal gradient: transparent -> colour over fade_l at the left, colour -> transparent over
+        fade_r at the right (px, quantised to 1 px). No per-frame allocation once warm."""
+        fl = int(round(fade_l))
+        fade_r = float(int(max(0.0, fade_r)))
+        key = (round(x, 1), round(avail, 1), fl, int(fade_r), color.rgba())
+        cache = self.__dict__.setdefault("_ly_fade_cache", {})
+        br = cache.get(key)
+        if br is None:
+            if len(cache) > 96:
+                cache.clear()
+            g = QLinearGradient(x, 0.0, x + avail, 0.0)
+            clear = QColor(color)
+            clear.setAlpha(0)
+            if fl > 0:
+                g.setColorAt(0.0, clear)
+                g.setColorAt(min(0.49, fl / avail), color)
+            else:
+                g.setColorAt(0.0, color)
+            g.setColorAt(max(0.51, 1.0 - fade_r / avail), color)
+            g.setColorAt(1.0, clear)
+            br = QBrush(g)
+            cache[key] = br
+        return br
+
+    def _draw_lyrics_pill(self, p: QPainter, st: LyricsState, w: float, h: float, cy: float,
+                          now: float, color: QColor) -> None:
+        """Current lyric line in the compact media pill: still when it fits, else it scrolls once to its end and
+        holds; crossfades on line change. Called only when _lyrics_pill_active() returned `st`."""
+        x = _LY.pill_x
+        avail = w - x - _LY.pill_right_pad
+        font, fm = _ly_font(_LY.pill_font)
+        e = self._lyrics_anim(st, now)
+        base_y = cy + fm.capHeight() / 2.0 - 0.5
+        reduce = self._reduce_motion()
+        p.save()
+        p.setClipRect(QRectF(x, 0.0, avail, h))
+        p.setFont(font)
+        p.setPen(color)
+        op0 = p.opacity()
+
+        def draw(i: int, alpha: float, elapsed: float) -> None:
+            text = self._ly_line(st, i)
+            tw = st.widths.get(i)
+            if tw is None:
+                tw = fm.horizontalAdvance(text)
+                if len(st.widths) > 256:
+                    st.widths.clear()
+                st.widths[i] = tw
+            p.setOpacity(op0 * min(1.0, alpha))
+            if tw <= avail or reduce:
+                sx, asc = self._ly_static(st, "p", text, _LY.pill_font, avail)
+                p.drawStaticText(QPointF(x, base_y - asc), sx)
+                return
+            sx, asc = self._ly_static(st, "pf", text, _LY.pill_font, 1e6)        # full-width layout, no eliding
+            off = min(tw - avail + 6.0, max(0.0, elapsed - _LY.pill_lead_s) * _LY.pill_speed)
+            p.setPen(QPen(self._ly_fade_brush(x, avail, min(_LY.pill_fade, off), min(_LY.pill_fade, 2.0 * (tw - avail + 6.0 - off)), color), 1.0))
+            p.drawStaticText(QPointF(x - off, base_y - asc), sx)
+            p.setPen(color)
+
+        if e < 1.0:
+            draw(st.prev_idx, 1.0 - e, 0.0)
+        draw(st.idx, e, now - st.line_t0)
+        p.setOpacity(op0)
+        p.restore()
 
     # ── tint ─────────────────────────────────────────────────────────────────
 
@@ -334,8 +760,13 @@ class MediaPageMixin:
         if self.media_artist:
             self._draw_marquee_text(p, self.media_artist, afont, tx, _L.artist_baseline, avail, pal.artist, elapsed)
         album_str = getattr(self, "media_album", "")
-        if album_str:
+        ly_mode = self._lyrics_strip_mode(now)            # None (default) leaves the card exactly as before
+        if album_str and ly_mode is None:
             self._draw_marquee_text(p, album_str, afont, tx, _L.album_baseline, avail, pal.album, elapsed)
+
+        if ly_mode is not None:
+            self._draw_lyrics_strip(p, ly_mode, now)
+        self._draw_lyrics_toggle(p, pal)
 
         # 3. Waveform: 7 bars, tint at 0.75 alpha, animated only while playing
         p.setPen(Qt.PenStyle.NoPen)
@@ -383,6 +814,8 @@ class MediaPageMixin:
         # 6. Controls (own scale handling inside)
         now_f = now
         for btn_id, _snap, cx, cy, _hit in self._media_button_geometry():
+            if btn_id == "lyrics_toggle":
+                continue                                  # drawn with the card layer above
             self._draw_playback_button(p, btn_id, cx, cy, scale, now_f, pal)
 
     def _draw_playback_button(self, p: QPainter, btn_id: str, cx: float, cy: float,

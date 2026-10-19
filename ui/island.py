@@ -390,6 +390,8 @@ class AppleDynamicIsland(
             if city:
                 self.weather_city = city
             self.pin_open = bool(getattr(cfg, "island_pin_open", self.pin_open))
+            self._ly_cfg = (bool(getattr(cfg, "island_lyrics_enabled", False)),
+                            bool(getattr(cfg, "island_lyrics_in_pill", True)))
             pages = getattr(cfg, "island_pages", ["media", "calendar", "weather", "hardware", "jarvis"])
             enabled_map = getattr(cfg, "island_pages_enabled", {})
             active_pages = []
@@ -1200,6 +1202,8 @@ class AppleDynamicIsland(
                 return (175.0 * scale, 32.0 * scale)
             compact_mode = self._get_current_compact_mode()
             if compact_mode == "media":
+                if self._lyrics_pill_wanted():
+                    return (ISLAND.lyrics.pill_w * scale, 32.0 * scale)
                 return (186.0 * scale, 32.0 * scale)
             elif compact_mode == "timer":
                 return (152.0 * scale, 32.0 * scale)
@@ -1279,6 +1283,12 @@ class AppleDynamicIsland(
                 self._opacity_spring.snap(0.0)
                 self._opacity_spring.set_target(1.0)
             self._prev_state = state
+
+        if reduce:
+            _ly_wide = state == IslandState.IDLE and self._lyrics_pill_wanted()
+            if _ly_wide != getattr(self, "_ly_wide_prev", False):
+                self._crossfade_start = now          # width snaps; crossfade hides the jump
+            self._ly_wide_prev = _ly_wide
 
         self.spring_w.set_target(tw)
         self.spring_h.set_target(th)
@@ -1657,6 +1667,8 @@ class AppleDynamicIsland(
         self.expanded_until = time.time() + 4.0
         if btn in ("jarvis_toggle_tracking", "jarvis_pause"):
             self.toggle_tracking_paused()
+        elif btn == "lyrics_toggle":
+            self.toggle_lyrics()
         elif btn in ("play_pause", "media_toggle"):
             self.media_toggle_play()
         elif btn in ("prev", "media_prev"):

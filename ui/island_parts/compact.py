@@ -176,14 +176,18 @@ class CompactPillMixin:
 
             p.strokePath(thumb_path, QPen(QColor(255, 255, 255, 40), 1.0))
 
-            # Center text: track title
-            font = qfont(TYPE.caption_1)
-            font.setWeight(QFont.Weight.DemiBold)
-            p.setFont(font)
-            p.setPen(primary)
-            text_rect = QRectF(34.0, 0, w - 34.0 - 44.0, h)
-            title = self.media_title if len(self.media_title) <= 14 else self.media_title[:13] + "…"
-            p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, title)
+            # Center text: current lyric line (lyrics on + in-pill + synced), else the track title
+            ly = self._lyrics_pill_active(now)
+            if ly is not None:
+                self._draw_lyrics_pill(p, ly, w, h, cy, now, ISLAND.color.white)
+            else:
+                font = qfont(TYPE.caption_1)
+                font.setWeight(QFont.Weight.DemiBold)
+                p.setFont(font)
+                p.setPen(primary)
+                text_rect = QRectF(34.0, 0, w - 34.0 - 44.0, h)
+                title = self.media_title if len(self.media_title) <= 14 else self.media_title[:13] + "…"
+                p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, title)
 
             # 4 audio-reactive animated bars
             bx0 = w - 40.0

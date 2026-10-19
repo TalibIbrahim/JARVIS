@@ -779,6 +779,30 @@ class MediaLayout:
     hit_side_r, hit_play_r = 22.0, 26.0     # click / dwell targets (larger than the drawn discs)
 
 
+class LyricsLayout:
+    """Lyrics strip (media card) and lyric line (compact media pill). Card-origin 1x px.
+    The strip takes the album line's slot (card stays 390 x 188): current line 13 semibold white, next line
+    12 regular label grey, in the title column. The toggle glyph sits under the waveform."""
+    x = 109.7                                  # = MediaLayout.text_x
+    right = 326.0                              # = wave_x - text_wave_gap (also clears the toggle glyph)
+    cur_baseline, next_baseline = 88.5, 103.8
+    cur_font = TypeToken(_ISLAND_FONT, 13, 600)
+    next_font = TypeToken(_ISLAND_FONT, 12, 400)
+    lead_s = 0.25                              # line shows this long before its timestamp
+    anim_s = 0.18                              # line change: upward slide + crossfade
+    slide_px = 12.0
+    not_found_s = 3.0                          # "Lyrics unavailable" is shown once, this long, then hidden
+    toggle_cx, toggle_cy, toggle_d, toggle_hit_r = 345.0, 84.0, 18.0, 15.0
+    shimmer_w, shimmer_h, shimmer_period = 150.0, 8.0, 1.4
+    # compact pill
+    pill_w = 240.0                             # compact media pill width while a lyric line shows (normal: 186)
+    pill_x = 34.0                             # text left (after the 20 px art thumb)
+    pill_right_pad = 48.0                      # bars start at w-40: 8 px gap after the text slot
+    pill_fade = 12.0                           # marquee edge fade width (overflowing lines only)
+    pill_font = TypeToken(_ISLAND_FONT, 13, 600)
+    pill_speed, pill_lead_s, pill_gap = 30.0, 0.8, 28.0   # marquee px/s, hold before scrolling, loop gap
+
+
 class CalendarLayout:
     w, h = 390.0, 188.0
     panel_x, panel_y, panel_w, panel_h, panel_radius = 22.6, 17.0, 95.6, 151.2, 11.8
@@ -873,6 +897,7 @@ class IslandTokens:
     shadow = IslandShadows
     pill = PillLayout
     media = MediaLayout
+    lyrics = LyricsLayout
     calendar = CalendarLayout
     weather = WeatherLayout
     hardware = HardwareGridLayout

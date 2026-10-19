@@ -159,6 +159,9 @@ class Context:
             self.speaker.reload_config(self.cfg)
         if hasattr(self.voice, "reload_config"):
             self.voice.reload_config(self.cfg)
+        lf = getattr(self, "lyrics_feed", None)
+        if lf is not None:
+            lf.refresh()
 
     def say(self, text):
         if not text:
@@ -251,6 +254,98 @@ def compact_shows_hardware(cfg):
 def _bits(bytes_per_sec):
     """Bytes/s -> true bits/s (x8); None passes through."""
     return None if bytes_per_sec is None else bytes_per_sec * 8
+
+
+class LyricsFeed:
+    """Fetches synced lyrics for the current track on one background worker (newest request wins) and posts
+    overlay 'lyrics_state'(track_key, synced, plain, instrumental, status). Idle cost: none unless enabled."""
+
+    def __init__(self, ctx, overlay, stop, client=None):
+        self.ctx = ctx
+        self.overlay = overlay
+        self._stop = stop
+        self._client = client
+        self._log = _jlog.get_logger("lyrics")
+        self._cv = threading.Condition()
+        self._pending = None      # (key, title, artist, album, dur) newest request
+        self._key = None          # key of the current track ("" when no media)
+        self._meta = None         # (title, artist, album, dur) of the current track
+        self._enabled = None
+        self._thread = None
+
+    def _enabled_now(self):
+        return bool(getattr(self.ctx.cfg, "island_lyrics_enabled", False))
+
+    def _post(self, key, status, synced=None, plain=None, instrumental=False):
+        self.overlay.post("lyrics_state", track_key=key,
+                          synced=[[t, x] for t, x in (synced or [])],
+                          plain=plain, instrumental=instrumental, status=status)
+
+    def on_media(self, meta):
+        if meta and meta.has_media and (meta.title or meta.artist):
+            title, artist = str(meta.title or ""), str(meta.artist or "")
+            key = f"{title}|{artist}"
+            self._meta = (title, artist, str(getattr(meta, "album", "") or ""),
+                          float(meta.duration) if meta.duration else 0.0)
+        else:
+            key, self._meta = "", None
+        if key == self._key:
+            return
+        self._key = key
+        self._request()
+
+    def refresh(self):
+        """Called on config reload: react to the setting being toggled live."""
+        en = self._enabled_now()
+        if en != self._enabled:
+            self._request()
+
+    def _request(self):
+        en = self._enabled_now()
+        self._enabled = en
+        key = self._key or ""
+        if not en:
+            with self._cv:
+                self._pending = None
+            self._post(key, "off")
+            return
+        if not self._meta:
+            with self._cv:
+                self._pending = None
+            return
+        self._post(key, "loading")
+        with self._cv:
+            self._pending = (key,) + self._meta
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._worker, name="LyricsWorker", daemon=True)
+                self._thread.start()
+            self._cv.notify()
+
+    def _worker(self):
+        while not self._stop.is_set():
+            with self._cv:
+                while self._pending is None and not self._stop.is_set():
+                    self._cv.wait(1.0)
+                req, self._pending = self._pending, None
+            if req is None:
+                continue
+            key, title, artist, album, dur = req
+            try:
+                if self._client is None:
+                    from lyrics_client import get_lyrics_client
+                    self._client = get_lyrics_client()
+                lyr = self._client.get_lyrics(title, artist, album, dur)
+                result = ("ok", lyr) if lyr else ("not_found", None)
+            except Exception as exc:
+                self._log.warning("lyrics lookup failed: %s: %s", type(exc).__name__, exc)
+                result = ("error", None)
+            if self._key != key or not self._enabled_now():
+                continue   # superseded or disabled meanwhile
+            status, lyr = result
+            if lyr:
+                self._post(key, status, lyr.synced, lyr.plain, lyr.instrumental)
+            else:
+                self._post(key, status)
 
 
 class HardwareFeed:
@@ -550,7 +645,10 @@ def main():
     from media_adapter import get_media_adapter
     media_adapter = get_media_adapter()
 
+    ctx.lyrics_feed = LyricsFeed(ctx, overlay, stop)
+
     def _on_media_changed(meta):
+        ctx.lyrics_feed.on_media(meta)
         if meta and meta.has_media:
             dur = float(meta.duration) if meta.duration else 0.0
             pos = float(meta.position) if meta.position else 0.0

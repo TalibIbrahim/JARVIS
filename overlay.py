@@ -3088,6 +3088,9 @@ class Overlay:
                             c_val = d["dominant_color"]
                             if c_val and hasattr(self.island, "media_dominant_color"):
                                 self.island.media_dominant_color = QColor(c_val) if isinstance(c_val, str) else c_val
+                elif kind == "lyrics_state":
+                    if hasattr(self.island, "set_lyrics_state"):
+                        self.island.set_lyrics_state(**d)
                 elif kind == "weather_state":
                     if hasattr(self.island, "weather_temp"):
                         if "temp" in d: self.island.weather_temp = float(d["temp"])
