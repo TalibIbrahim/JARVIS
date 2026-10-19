@@ -349,7 +349,9 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "write a python function", "can you help me with coding", "tell me a science fact",
         "what are black holes", "tell me about quantum computing", "give me advice on engineering",
         "translate this", "what is the weather today", "tell me a funny story about Tony Stark",
-        "how do quantum computers work", "what is the capital of France"
+        "how do quantum computers work", "what is the capital of France",
+        "tell me a joke", "tell me a story", "tell me a fun fact", "tell me something interesting",
+        "tell me something", "make me laugh", "say something funny", "how are you", "what can you do"
     ]
 }
  
@@ -369,7 +371,31 @@ SIDE_EFFECT_INTENTS = frozenset({
 })
 SIDE_EFFECT_MIN_SCORE = 0.55
 SIDE_EFFECT_MIN_MARGIN = 0.08
-_RE_WEATHER_CUE = re.compile(r"\b(?:weather|temperature|forecast|rain|raining|hot|cold|outside)\b")
+_PAGES = r"weather|hardware|media|calendar|jarvis"
+# Read-only System 1 intents need a whole-word cue in the (filler-stripped) utterance; without it
+# the utterance is not a match and falls through to System 2. One table, applied before any score.
+_READ_ONLY_CUES: Dict[str, "re.Pattern[str]"] = {k: re.compile(v) for k, v in {
+    "weather": r"\b(?:weather|temperature|forecast|rain|raining|hot|cold|outside)\b",
+    "time": r"\b(?:time|clock|hour|hours|o'?clock)\b",
+    "world_time": r"\btime\b.*\b(?:in|at)\b\s+\w+",
+    "now_playing": r"\b(?:playing|song|track|music|listening|artist|singing)\b",
+    "calculate": r"\d|\b(?:plus|minus|times|divided|multiplied|percent|square root|calculate|compute|solve)\b",
+    "convert_units": (r"\b(?:convert|miles?|kilometers?|km|feet|foot|meters?|inch(?:es)?|centimeters?|"
+                      r"grams?|kilograms?|kg|ounces?|pounds?|liters?|gallons?|fahrenheit|celsius|"
+                      r"kelvin|yards?)\b"),
+    "read_clipboard": r"\b(?:clipboard|copied)\b",
+    "timer_status": r"\b(?:timer|countdown|remaining|left)\b",
+    "diagnostics": (r"\b(?:diagnostics?|status|telemetry|system|power|vitals|ram|memory|battery|"
+                    r"hardware|resources)\b"),
+    "screen_awareness": r"\b(?:screen|page|code|error)\b",
+    "show_widget": r"\b(?:widgets?|island|media|weather)\b",
+    "toggle_widgets": r"\b(?:widgets?|island)\b",
+    "island_next_page": r"\b(?:page|card|island|dashboard)\b",
+    "island_prev_page": r"\b(?:page|card|island)\b",
+    "island_show_page": r"\b(?:" + _PAGES + r")\b",
+    "island_toggle_expand": r"\b(?:island|card|expand|collapse)\b",
+}.items()}
+_RE_WEATHER_CUE = _READ_ONLY_CUES["weather"]
 
 
 def extract_whitelist_args(action: Optional[str], clean_text: str) -> Dict[str, Any]:
@@ -392,10 +418,13 @@ def apply_decision_policy(top_act: Optional[str], top_score: float, margin: floa
     - conversation / no action -> None; score >= 0.85 -> accepted.
     - SIDE_EFFECT_INTENTS need score >= 0.55 and margin >= 0.08, except open_app/open_site with a
       whitelisted APPS/SITES name present (extracted_args), which only need the standard margin.
-    - weather additionally needs a whole-word weather cue in clean_text.
+    - every read-only intent in _READ_ONLY_CUES needs its whole-word cue in clean_text (checked first).
     - everything else uses min_score / min_margin.
     """
     if not top_act or top_act == "conversation":
+        return None
+    cue = _READ_ONLY_CUES.get(top_act)
+    if cue is not None and not cue.search(clean_text):
         return None
     if top_score >= 0.85:
         return top_act
@@ -405,8 +434,6 @@ def apply_decision_policy(top_act: Optional[str], top_score: float, margin: floa
         args = extracted_args if extracted_args is not None else extract_whitelist_args(top_act, clean_text)
         if not (top_act in ("open_app", "open_site") and args):
             need_margin = max(min_margin, SIDE_EFFECT_MIN_MARGIN)
-    elif top_act == "weather" and not _RE_WEATHER_CUE.search(clean_text):
-        return None
     if top_score >= need_score and margin >= need_margin:
         return top_act
     return None
