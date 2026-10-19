@@ -286,8 +286,22 @@ class PagingMixin:
         if self.expanded_card:
             delta = event.angleDelta().y()
             if delta == 0:
+                delta = event.pixelDelta().y()  # ~120 px per notch
+            if delta == 0:
                 return
-            self.page_step(1 if delta < 0 else -1)
+            now = time.monotonic()
+            acc = getattr(self, "_wheel_acc", 0.0)
+            if (now - getattr(self, "_wheel_last_t", -1e9) > 0.30
+                    or (acc and (acc > 0) != (delta > 0))):
+                acc = 0.0
+            self._wheel_last_t = now
+            acc = max(-120.0, min(120.0, acc + delta))
+            if (abs(acc) >= 120.0
+                    and now - getattr(self, "_wheel_step_t", -1e9) >= 0.35):
+                self.page_step(1 if acc < 0 else -1)
+                acc = 0.0
+                self._wheel_step_t = now
+            self._wheel_acc = acc
             event.accept()
             return
         super().wheelEvent(event)
