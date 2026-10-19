@@ -18,6 +18,7 @@ import math
 import time
 import datetime
 from contextlib import contextmanager
+from unittest.mock import patch
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, QSize
@@ -123,6 +124,51 @@ def injected_clock(fixed_time: float = 1000.0):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 2b. Pinned glass environment (machine independent goldens)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_GLASS_PIN = {"on": False}      # default: solid fallback (Windows transparency effects OFF)
+_PIN_BUILD = 22631              # Win11 22H2+: mica windows / acrylic popups when pinned on
+_PIN_BACKDROP = 128.0           # fixed wallpaper gray level
+
+
+@contextmanager
+def glass_environment(transparency_on: bool = False):
+    """Pin everything ui.glass / ui.materials read from the machine (EnableTransparency registry value,
+    Windows build number, desktop wallpaper) so renders are identical on every machine."""
+    import ui.materials as _m
+    import ui.glass as _g
+    prev_pin = dict(_GLASS_PIN)
+    prev_force = _g._S.force_backdrop
+    prev_on = _g._S.transparency_on
+    _GLASS_PIN["on"] = bool(transparency_on)
+    _g._S.force_backdrop = _PIN_BACKDROP
+    _g._S.transparency_on = bool(transparency_on)
+    try:
+        with patch.object(_m, "_transparency_enabled", lambda: bool(transparency_on)),              patch.object(_m, "_build_number", lambda: _PIN_BUILD),              patch.object(_m, "is_transparency_available", lambda: bool(transparency_on)),              patch.object(_g, "_sample_wallpaper", lambda: None):
+            _g._S.env_checked = 0.0
+            _g.environment(force=True)
+            _g._S.transparency_on = bool(transparency_on)
+            yield
+    finally:
+        _GLASS_PIN.update(prev_pin)
+        _g._S.force_backdrop = prev_force
+        _g._S.transparency_on = prev_on
+        _g._S.env_checked = 0.0
+
+
+def _pinned(fn):
+    """Run a render function inside the pinned glass environment (current pin setting)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with glass_environment(_GLASS_PIN["on"]):
+            return fn(*a, **kw)
+    return wrapper
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 3. Offscreen Widget Rendering Core
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -193,6 +239,7 @@ def _wait_for_cameras(dlg, max_iters: int = 200) -> bool:
     return not _pending()
 
 
+@_pinned
 def render_settings_tab(category_id: str, dpi: float, theme: str) -> QImage:
     """Renders one of the 7 Settings Window tabs."""
     get_app()
@@ -353,7 +400,8 @@ def setup_island_state(island: AppleDynamicIsland, state_name: str, now: float) 
     return tw, th
 
 
-def render_island_view(state_name: str, dpi: float, theme: str) -> QImage:
+@_pinned
+def render_island_view(state_name: str, dpi: float, theme: str, shape: str = "notch") -> QImage:
     """Renders any Dynamic Island state, expanded card, or HUD offscreen."""
     get_app()
     set_theme(theme)
@@ -362,7 +410,7 @@ def render_island_view(state_name: str, dpi: float, theme: str) -> QImage:
     with injected_clock(now):
         mgr = DummyOverlayMgr()
         island = AppleDynamicIsland(mgr)
-        island.shape_style = "notch"
+        island.shape_style = shape
         island.t0 = now
         island.last_frame_t = now
 
@@ -391,39 +439,40 @@ def render_island_view(state_name: str, dpi: float, theme: str) -> QImage:
 # Public Explicit Page & State Rendering Helpers (Phase 0 Harness Contract)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def render_compact_pill(dpi: float = 1.0, theme: str = "dark") -> QImage:
+def render_compact_pill(dpi: float = 1.0, theme: str = "dark", shape: str = "notch") -> QImage:
     """Renders the Dynamic Island compact pill (idle resting state)."""
-    return render_island_view("IDLE", dpi, theme)
+    return render_island_view("IDLE", dpi, theme, shape)
 
-def render_media_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+def render_media_page(dpi: float = 1.0, theme: str = "dark", shape: str = "notch") -> QImage:
     """Renders the Expanded Media Player card."""
-    return render_island_view("CARD_MEDIA", dpi, theme)
+    return render_island_view("CARD_MEDIA", dpi, theme, shape)
 
-def render_calendar_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+def render_calendar_page(dpi: float = 1.0, theme: str = "dark", shape: str = "notch") -> QImage:
     """Renders the Expanded Calendar / Clock card."""
-    return render_island_view("CARD_TIME", dpi, theme)
+    return render_island_view("CARD_TIME", dpi, theme, shape)
 
-def render_weather_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+def render_weather_page(dpi: float = 1.0, theme: str = "dark", shape: str = "notch") -> QImage:
     """Renders the Expanded Weather forecast card."""
-    return render_island_view("CARD_WEATHER", dpi, theme)
+    return render_island_view("CARD_WEATHER", dpi, theme, shape)
 
-def render_hardware_grid_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+def render_hardware_grid_page(dpi: float = 1.0, theme: str = "dark", shape: str = "notch") -> QImage:
     """Renders the 2x3 Hardware Monitor Grid card."""
-    return render_island_view("CARD_HARDWARE_GRID", dpi, theme)
+    return render_island_view("CARD_HARDWARE_GRID", dpi, theme, shape)
 
-def render_hardware_strip_page(dpi: float = 1.0, theme: str = "dark") -> QImage:
+def render_hardware_strip_page(dpi: float = 1.0, theme: str = "dark", shape: str = "notch") -> QImage:
     """Renders the 5-item Hardware Telemetry Strip."""
-    return render_island_view("CARD_HARDWARE_STRIP", dpi, theme)
+    return render_island_view("CARD_HARDWARE_STRIP", dpi, theme, shape)
 
-def render_jarvis_card(dpi: float = 1.0, theme: str = "dark") -> QImage:
+def render_jarvis_card(dpi: float = 1.0, theme: str = "dark", shape: str = "notch") -> QImage:
     """Renders the JARVIS Assistant card."""
-    return render_island_view("CARD_JARVIS", dpi, theme)
+    return render_island_view("CARD_JARVIS", dpi, theme, shape)
 
 def render_assistant_state(state_name: str, dpi: float = 1.0, theme: str = "dark") -> QImage:
     """Renders an assistant state: wake, listening, thinking, prompt, speaking, result, error."""
     return render_island_view(state_name, dpi, theme)
 
 
+@_pinned
 def render_cursor_view(view_type: str, dpi: float, theme: str) -> QImage:
     """Renders Cursor Feedback Overlay (dwell ring or 5-slice radial menu)."""
     get_app()
@@ -451,6 +500,7 @@ def render_cursor_view(view_type: str, dpi: float, theme: str) -> QImage:
         return img
 
 
+@_pinned
 def render_onboarding_step(step_idx: int, dpi: float, theme: str) -> QImage:
     """Renders Onboarding Dialog at step 0, 1, or 2."""
     get_app()
@@ -472,6 +522,7 @@ def render_onboarding_step(step_idx: int, dpi: float, theme: str) -> QImage:
         return img
 
 
+@_pinned
 def render_tray_menu(dpi: float, theme: str) -> QImage:
     """Renders System Tray Context Menu offscreen."""
     app = get_app()
@@ -490,6 +541,7 @@ def render_tray_menu(dpi: float, theme: str) -> QImage:
         return img
 
 
+@_pinned
 def render_island_animation_frame(sequence_name: str, t_offset: float, dpi: float, theme: str) -> QImage:
     """
     Renders an AppleDynamicIsland spring transition frame at fixed t_offset.

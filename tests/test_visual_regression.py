@@ -49,7 +49,7 @@ from tools.visual_gate_helper import (
     render_onboarding_step, render_tray_menu, render_island_animation_frame,
     render_compact_pill, render_media_page, render_calendar_page,
     render_weather_page, render_hardware_grid_page, render_hardware_strip_page,
-    render_jarvis_card, render_assistant_state,
+    render_jarvis_card, render_assistant_state, glass_environment,
     DummyOverlayMgr, ANIM_TIMESTAMPS, THEMES, DPIS,
     ISLAND_BASE_STATES, ISLAND_CARDS, ISLAND_HUDS, CURSOR_VIEWS, ONBOARDING_STEPS
 )
@@ -452,6 +452,7 @@ class TestDynamicIslandPagesAndAssistantStatesVisual(unittest.TestCase):
             for dpi in DPIS:
                 img = render_hardware_grid_page(dpi, theme)
                 self.assertFalse(img.isNull())
+                _assert_image_matches_golden(self, img, f"island_card_hardware_grid_{theme}_dpi{int(dpi * 100)}.png")
                 self.assertEqual(img.format(), QImage.Format.Format_ARGB32)
                 expected_w = int(round((390.0 + 2 * _island_pad()) * dpi))
                 expected_h = int(round((188.0 + 2 * _island_pad()) * dpi))
@@ -464,6 +465,7 @@ class TestDynamicIslandPagesAndAssistantStatesVisual(unittest.TestCase):
             for dpi in DPIS:
                 img = render_hardware_strip_page(dpi, theme)
                 self.assertFalse(img.isNull())
+                _assert_image_matches_golden(self, img, f"island_card_hardware_strip_{theme}_dpi{int(dpi * 100)}.png")
                 self.assertEqual(img.format(), QImage.Format.Format_ARGB32)
                 expected_w = int(round((446.0 + 2 * _island_pad()) * dpi))
                 expected_h = int(round((69.0 + 2 * _island_pad()) * dpi))
@@ -476,6 +478,7 @@ class TestDynamicIslandPagesAndAssistantStatesVisual(unittest.TestCase):
             for dpi in DPIS:
                 img = render_jarvis_card(dpi, theme)
                 self.assertFalse(img.isNull())
+                _assert_image_matches_golden(self, img, f"island_card_jarvis_{theme}_dpi{int(dpi * 100)}.png")
                 self.assertEqual(img.format(), QImage.Format.Format_ARGB32)
                 expected_w = int(round((390.0 + 2 * _island_pad()) * dpi))
                 expected_h = int(round((188.0 + 2 * _island_pad()) * dpi))
@@ -493,6 +496,36 @@ class TestDynamicIslandPagesAndAssistantStatesVisual(unittest.TestCase):
                     self.assertFalse(img.isNull())
                     self.assertEqual(img.format(), QImage.Format.Format_ARGB32)
                     _assert_image_matches_golden(self, img, f"island_{st}_{theme}_{dpi_str}.png")
+
+    def test_island_pill_shape_visual(self):
+        """Pill (the user's real island_shape_style) goldens: dark, 100% and 150% DPI."""
+        pages = {
+            "compact": render_compact_pill, "media": render_media_page,
+            "calendar": render_calendar_page, "weather": render_weather_page,
+            "hardware_grid": render_hardware_grid_page, "hardware_strip": render_hardware_strip_page,
+            "jarvis": render_jarvis_card,
+        }
+        for dpi in DPIS:
+            dpi_str = f"dpi{int(dpi * 100)}"
+            for name, fn in pages.items():
+                img = fn(dpi, "dark", shape="pill")
+                self.assertFalse(img.isNull())
+                _assert_image_matches_golden(self, img, f"island_pill_{name}_dark_{dpi_str}.png")
+
+    def test_island_glass_on_visual(self):
+        """Explicit glass-on render set (EnableTransparency pinned ON, Win11 22H2 build, fixed wallpaper)."""
+        with glass_environment(True):
+            if True:
+                fixed = [{"index": 0, "name": "HP HD Camera"}]
+                for dpi in DPIS:
+                    dpi_str = f"dpi{int(dpi * 100)}"
+                    with patch("ui.settings_window.list_cameras", return_value=fixed):
+                        img = render_settings_tab("Display", dpi, "dark")
+                    _assert_image_matches_golden(self, img, f"glasson_settings_display_dark_{dpi_str}.png")
+                    img = render_cursor_view("radial_menu", dpi, "dark")
+                    _assert_image_matches_golden(self, img, f"glasson_cursor_radial_menu_dark_{dpi_str}.png")
+                    img = render_tray_menu(dpi, "dark")
+                    _assert_image_matches_golden(self, img, f"glasson_tray_menu_dark_{dpi_str}.png")
 
 
 if __name__ == "__main__":
