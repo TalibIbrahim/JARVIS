@@ -478,6 +478,83 @@ def acquire_single_instance_lock(app_id="Local\\JARVIS_HandGesture_SingleInstanc
     return True
 
 
+def post_cached_weather(ctx, overlay):
+    """Post the on-disk weather cache (no network) so the compact pill has data on the first frame."""
+    log = _jlog.get_logger("weather")
+    try:
+        from weather_client import load_weather_cache
+        c = ctx.cfg
+        city = getattr(c, "island_weather_city", None) or getattr(c, "weather_city", "auto")
+        units = getattr(c, "island_weather_units", None) or getattr(c, "weather_units", "auto")
+        cached = load_weather_cache(city, units)
+    except Exception:
+        log.exception("early cached-weather post failed")
+        return False
+    if not cached:
+        return False
+    overlay.post("weather_state", **cached["payload"], stale=cached["stale"], updated_at=cached["saved_at"])
+    log.info("posted cached weather before workers (stale=%s)", cached["stale"])
+    return True
+
+
+def _start_workers_after_first_frame(fn):
+    """Run fn on a background thread once the Qt loop has started (island painted); no Qt -> start immediately."""
+    t = threading.Thread(target=fn, name="WorkerStartup", daemon=True)
+    try:
+        from PySide6.QtCore import QTimer
+    except ImportError:
+        _jlog.get_logger("main").warning("PySide6 unavailable; starting workers immediately")
+        t.start()
+        return t
+    QTimer.singleShot(0, t.start)
+    return t
+
+
+WARM_DELAY_S = 5.0
+# Modules the first voice command would otherwise import lazily (60-115 ms each). Import only: no devices, no network.
+WARM_MODULES = ("comtypes", "pycaw.pycaw", "winrt.windows.media.control", "winrt.windows.storage.streams",
+                "winreg", "window_resolver", "requests")
+
+
+def warm_first_use_imports(stop, delay=WARM_DELAY_S, modules=WARM_MODULES, lower_priority=True):
+    """Daemon thread: after `delay` s of settled startup, import the lazily-imported command dependencies and build an
+    (unused, offline) requests.Session so the first voice command is fast. Returns the thread."""
+    log = _jlog.get_logger("warm")
+
+    def _run():
+        if stop.wait(delay):
+            return
+        if lower_priority and sys.platform == "win32":
+            try:  # THREAD_PRIORITY_BELOW_NORMAL
+                k32 = ctypes.windll.kernel32
+                k32.GetCurrentThread.restype = ctypes.c_void_p
+                k32.SetThreadPriority(ctypes.c_void_p(k32.GetCurrentThread()), -1)
+            except Exception as exc:
+                log.warning("could not lower warm-up thread priority: %s", exc)
+        import importlib
+        t_all = time.perf_counter()
+        for name in modules:
+            if stop.is_set():
+                return
+            t0 = time.perf_counter()
+            try:
+                importlib.import_module(name)
+            except Exception as exc:
+                log.warning("warm import %s skipped: %s: %s", name, type(exc).__name__, exc)
+                continue
+            log.debug("warm import %s %.0f ms", name, (time.perf_counter() - t0) * 1000)
+        if "requests" in sys.modules:
+            try:
+                sys.modules["requests"].Session().close()   # builds adapters/ssl context; opens no connection
+            except Exception as exc:
+                log.warning("requests session warm failed: %s: %s", type(exc).__name__, exc)
+        log.info("first-use imports warmed in %.0f ms", (time.perf_counter() - t_all) * 1000)
+
+    t = threading.Thread(target=_run, name="WarmImports", daemon=True)
+    t.start()
+    return t
+
+
 def main():
     _jlog.setup()
     if any(arg in sys.argv for arg in ("-h", "--help", "--island-demo", "--perf-report", "--self-test")):
@@ -546,17 +623,13 @@ def main():
                     pass
         sys.exit(0)
 
-    from config import load_config
+    from config import load_config, mark_runtime_override
     from gestures import GestureEngine
-    from controller import Controller
     from overlay import Overlay
-    from tracker import Tracker
-    from voice import Speaker, Voice
 
     cfg = load_config()
     _jlog.set_debug_transcripts(getattr(cfg, "debug_log_transcripts", False))
     # CLI flags are runtime-only: mark them so a later whole-file save_config(cfg) never persists them.
-    from config import mark_runtime_override
     if args.preview:
         cfg.show_preview = True
         mark_runtime_override(cfg, "show_preview")
@@ -567,252 +640,275 @@ def main():
         cfg.camera_index = args.camera
         mark_runtime_override(cfg, "camera_index")
 
+    # ---- island first: QApplication + Overlay are created and shown before any heavy worker ----
     stop = threading.Event()
     engine = GestureEngine(cfg)
-    controller = Controller(cfg)
-    speaker = Speaker(enabled=cfg.speak, cfg=cfg)
-    speaker.start()
-
     overlay = Overlay(stop, cfg=cfg)
-    controller.set_overlay(overlay)
     engine.set_overlay(overlay)
-    ctx = Context(engine, overlay, speaker, stop, controller=controller, cfg=cfg)
+    ctx = Context(engine, overlay, None, stop, cfg=cfg)   # speaker/controller/tracker/voice are None until workers start
     overlay.ctx = ctx
     ctx.observe_overlay(overlay)
-
-    try:
-        import system_control
-        system_control.get_system_control().set_overlay(overlay)
-    except Exception:
-        pass
 
     from thread_supervisor import ThreadSupervisor, explain_graceful_degradation
     supervisor = ThreadSupervisor(stop_event=stop)
     ctx.supervisor = supervisor
+    post_cached_weather(ctx, overlay)
 
-    from updater import AutoUpdater
-    updater = AutoUpdater(ctx=ctx, overlay=overlay, auto_check=cfg.auto_update_check)
-    ctx.updater = updater
-    overlay.updater = updater
-    supervisor.register(
-        name="AutoUpdater",
-        factory=lambda: updater.start_periodic_check(interval_hours=4),
-        max_restarts=3,
-        backoff_base=2.0,
-    )
-    supervisor.start("AutoUpdater")
+    controller = speaker = media_adapter = hardware_feed = None
 
-    def _make_tracker():
-        t = Tracker(cfg, engine, controller, overlay, ctx, stop)
-        ctx.tracker = t
-        return t
+    def _start_workers():
+        """Heavy startup (controller/pyautogui, Speaker/Piper, Tracker, Voice, media, feeds); runs off the GUI thread."""
+        nonlocal controller, speaker, media_adapter, hardware_feed
+        try:
+            _start_workers_impl()
+        except BaseException:
+            _jlog.get_logger("main").exception("worker startup failed")
+            stop.set()
+            raise
 
-    def _on_tracker_error(name, exc):
-        explain_graceful_degradation("camera", overlay=overlay, speaker=speaker)
+    def _start_workers_impl():
+        nonlocal controller, speaker, media_adapter, hardware_feed
+        try:
+            import system_control
+            system_control.get_system_control().set_overlay(overlay)
+        except Exception:
+            pass
+        from updater import AutoUpdater
+        updater = AutoUpdater(ctx=ctx, overlay=overlay, auto_check=cfg.auto_update_check)
+        ctx.updater = updater
+        overlay.updater = updater
+        supervisor.register(
+            name="AutoUpdater",
+            factory=lambda: updater.start_periodic_check(interval_hours=4),
+            max_restarts=3,
+            backoff_base=2.0,
+        )
+        supervisor.start("AutoUpdater")
 
-    supervisor.register(
-        name="Tracker",
-        factory=_make_tracker,
-        max_restarts=-1,            # never terminal: keep retrying at the 60 s cap
-        backoff_base=1.0,
-        on_error=_on_tracker_error,
-        heartbeat_names=["Tracker", "FrameGrabber"],
-        stall_after=10.0,
-    )
-    supervisor.start("Tracker")
+        from controller import Controller   # pyautogui -> cv2/numpy: deliberately after the island is up
+        from tracker import Tracker
+        from voice import Speaker, Voice
+        controller = Controller(cfg)
+        ctx.controller = controller
+        controller.set_overlay(overlay)
+        speaker = Speaker(enabled=cfg.speak, cfg=cfg)
+        ctx.speaker = speaker
+        speaker.start()
 
-    if cfg.voice_enabled:
-        def _on_voice_error(name, exc):
-            explain_graceful_degradation("voice", overlay=overlay, speaker=speaker)
+        def _make_tracker():
+            t = Tracker(cfg, engine, controller, overlay, ctx, stop)
+            ctx.tracker = t
+            return t
 
-        def _make_voice():
-            v = Voice(cfg, ctx, stop)
-            ctx.voice = v
-            return v
+        def _on_tracker_error(name, exc):
+            explain_graceful_degradation("camera", overlay=overlay, speaker=speaker)
 
         supervisor.register(
-            name="Voice",
-            factory=_make_voice,
-            max_restarts=-1,        # never terminal: keep retrying at the 60 s cap
+            name="Tracker",
+            factory=_make_tracker,
+            max_restarts=-1,            # never terminal: keep retrying at the 60 s cap
             backoff_base=1.0,
-            on_error=_on_voice_error,
-            heartbeat_names=["Voice", "WakeWordDetector", "STTWorker"],
+            on_error=_on_tracker_error,
+            heartbeat_names=["Tracker", "FrameGrabber"],
             stall_after=10.0,
         )
-        supervisor.start("Voice")
+        supervisor.start("Tracker")
 
-    # Media Session Manager (Windows SMTC / Media Controls)
-    from media_adapter import get_media_adapter
-    media_adapter = get_media_adapter()
+        if cfg.voice_enabled:
+            def _on_voice_error(name, exc):
+                explain_graceful_degradation("voice", overlay=overlay, speaker=speaker)
 
-    ctx.lyrics_feed = LyricsFeed(ctx, overlay, stop)
+            def _make_voice():
+                v = Voice(cfg, ctx, stop)
+                ctx.voice = v
+                return v
 
-    def _on_media_changed(meta):
-        ctx.lyrics_feed.on_media(meta)
-        if meta and meta.has_media:
-            dur = float(meta.duration) if meta.duration else 0.0
-            pos = float(meta.position) if meta.position else 0.0
-            prog = (pos / dur) if dur > 0 else 0.0
-            thumb = meta.get_artwork_bytes(fallback=True) if hasattr(meta, "get_artwork_bytes") else getattr(meta, "thumbnail_bytes", None)
-            dom_col = meta.get_dominant_color() if hasattr(meta, "get_dominant_color") else getattr(meta, "dominant_color", None)
-            overlay.post(
-                "media_state",
-                title=meta.title,
-                artist=meta.artist,
-                album=getattr(meta, "album", ""),
-                playing=meta.is_playing,
-                active=meta.has_media,
-                position=pos,
-                duration=dur,
-                progress=prog,
-                source=meta.source_app_id,
-                thumbnail_bytes=thumb,
-                dominant_color=dom_col,
+            supervisor.register(
+                name="Voice",
+                factory=_make_voice,
+                max_restarts=-1,        # never terminal: keep retrying at the 60 s cap
+                backoff_base=1.0,
+                on_error=_on_voice_error,
+                heartbeat_names=["Voice", "WakeWordDetector", "STTWorker"],
+                stall_after=10.0,
             )
-        else:
-            overlay.post(
-                "media_state",
-                title="",
-                artist="",
-                album="",
-                playing=False,
-                active=False,
-                position=0.0,
-                duration=0.0,
-                progress=0.0,
-                source="",
-                thumbnail_bytes=None,
-                dominant_color=None,
-            )
+            supervisor.start("Voice")
 
-    media_adapter.add_listener(_on_media_changed)
-    supervisor.register(
-        name="MediaAdapter",
-        factory=lambda: media_adapter.start(),   # returns its worker thread; the supervisor watches it
-        max_restarts=3,
-        backoff_base=2.0,
-    )
-    supervisor.start("MediaAdapter")
+        # Media Session Manager (Windows SMTC / Media Controls)
+        from media_adapter import get_media_adapter
+        media_adapter = get_media_adapter()
 
-    # Weather: cached value posted immediately, 15 min background poll, refresh when the weather
-    # page / collapsed pill becomes visible and the last success is older than 10 min.
-    def _run_weather_poller():
-        import time as _time
-        from weather_client import (get_weather_client, weather_state_payload, save_weather_cache,
-                                    load_weather_cache)
-        wlog = _jlog.get_logger("weather")
-        client = get_weather_client()
-        wake = threading.Event()
-        state = {"last_ok": 0.0, "last_try": 0.0, "failing": False}
+        ctx.lyrics_feed = LyricsFeed(ctx, overlay, stop)
 
-        def _city():
-            c = ctx.cfg
-            return getattr(c, "island_weather_city", None) or getattr(c, "weather_city", "auto")
+        def _on_media_changed(meta):
+            ctx.lyrics_feed.on_media(meta)
+            if meta and meta.has_media:
+                dur = float(meta.duration) if meta.duration else 0.0
+                pos = float(meta.position) if meta.position else 0.0
+                prog = (pos / dur) if dur > 0 else 0.0
+                thumb = meta.get_artwork_bytes(fallback=True) if hasattr(meta, "get_artwork_bytes") else getattr(meta, "thumbnail_bytes", None)
+                dom_col = meta.get_dominant_color() if hasattr(meta, "get_dominant_color") else getattr(meta, "dominant_color", None)
+                overlay.post(
+                    "media_state",
+                    title=meta.title,
+                    artist=meta.artist,
+                    album=getattr(meta, "album", ""),
+                    playing=meta.is_playing,
+                    active=meta.has_media,
+                    position=pos,
+                    duration=dur,
+                    progress=prog,
+                    source=meta.source_app_id,
+                    thumbnail_bytes=thumb,
+                    dominant_color=dom_col,
+                )
+            else:
+                overlay.post(
+                    "media_state",
+                    title="",
+                    artist="",
+                    album="",
+                    playing=False,
+                    active=False,
+                    position=0.0,
+                    duration=0.0,
+                    progress=0.0,
+                    source="",
+                    thumbnail_bytes=None,
+                    dominant_color=None,
+                )
 
-        def _units():
-            c = ctx.cfg
-            return getattr(c, "island_weather_units", None) or getattr(c, "weather_units", "auto")
+        media_adapter.add_listener(_on_media_changed)
+        supervisor.register(
+            name="MediaAdapter",
+            factory=lambda: media_adapter.start(),   # returns its worker thread; the supervisor watches it
+            max_restarts=3,
+            backoff_base=2.0,
+        )
+        supervisor.start("MediaAdapter")
 
-        def _post_cached():
-            cached = load_weather_cache(_city(), _units())
-            if cached:
-                overlay.post("weather_state", **cached["payload"], stale=cached["stale"], updated_at=cached["saved_at"])
-                wlog.info("posted cached weather (stale=%s)", cached["stale"])
-                if not cached["stale"]:
-                    state["last_ok"] = _time.monotonic() - (_time.time() - cached["saved_at"])
+        # Weather: cached value posted immediately, 15 min background poll, refresh when the weather
+        # page / collapsed pill becomes visible and the last success is older than 10 min.
+        def _run_weather_poller():
+            import time as _time
+            from weather_client import (get_weather_client, weather_state_payload, save_weather_cache,
+                                        load_weather_cache)
+            wlog = _jlog.get_logger("weather")
+            client = get_weather_client()
+            wake = threading.Event()
+            state = {"last_ok": 0.0, "last_try": 0.0, "failing": False}
 
-        def _fetch_and_post(force=True):
-            state["last_try"] = _time.monotonic()
-            w = client.get_weather_for_city(_city(), units=_units(), force_refresh=force)
-            if w is None:
-                if not state["failing"]:
-                    state["failing"] = True
-                    wlog.warning("weather fetch failed; keeping last value")
-                return
-            payload = weather_state_payload(w)
-            overlay.post("weather_state", **payload, stale=bool(w.stale), updated_at=w.timestamp)
-            if w.stale:
-                if not state["failing"]:
-                    state["failing"] = True
-                    wlog.warning("weather offline; showing stale value")
-                return
-            state["failing"] = False
-            state["last_ok"] = _time.monotonic()
-            save_weather_cache(payload, _city(), _units())
+            def _city():
+                c = ctx.cfg
+                return getattr(c, "island_weather_city", None) or getattr(c, "weather_city", "auto")
 
-        def _on_page(page):
-            # weather page, or collapsed (compact pill shows weather): refresh only if stale
-            if page == "weather" or (page is None and getattr(ctx.cfg, "island_show_weather", True)
-                                     and getattr(ctx.cfg, "island_idle_display", "time_weather") == "time_weather"):
-                wake.set()
+            def _units():
+                c = ctx.cfg
+                return getattr(c, "island_weather_units", None) or getattr(c, "weather_units", "auto")
 
-        ctx.add_page_listener(_on_page)
-        try:
-            from weather_client import register_weather_refresh_callback
-            register_weather_refresh_callback(lambda: _fetch_and_post(force=True))
-        except Exception:
-            wlog.exception("could not register weather refresh callback")
+            def _post_cached():
+                cached = load_weather_cache(_city(), _units())
+                if cached:
+                    overlay.post("weather_state", **cached["payload"], stale=cached["stale"], updated_at=cached["saved_at"])
+                    wlog.info("posted cached weather (stale=%s)", cached["stale"])
+                    if not cached["stale"]:
+                        state["last_ok"] = _time.monotonic() - (_time.time() - cached["saved_at"])
 
-        def _poller_loop():
-            _post_cached()
-            if not stop.wait(2.0):
-                _fetch_and_post()
-            next_bg = _time.monotonic() + 900.0
-            while not stop.is_set():
-                wake.wait(max(1.0, next_bg - _time.monotonic()))
-                if stop.is_set():
-                    break
-                now = _time.monotonic()
-                if wake.is_set():
-                    wake.clear()
-                    if now - state["last_ok"] < 600.0 or now - state["last_try"] < 60.0:
-                        continue
-                elif now < next_bg:
-                    continue
-                _fetch_and_post()
+            def _fetch_and_post(force=True):
+                state["last_try"] = _time.monotonic()
+                w = client.get_weather_for_city(_city(), units=_units(), force_refresh=force)
+                if w is None:
+                    if not state["failing"]:
+                        state["failing"] = True
+                        wlog.warning("weather fetch failed; keeping last value")
+                    return
+                payload = weather_state_payload(w)
+                overlay.post("weather_state", **payload, stale=bool(w.stale), updated_at=w.timestamp)
+                if w.stale:
+                    if not state["failing"]:
+                        state["failing"] = True
+                        wlog.warning("weather offline; showing stale value")
+                    return
+                state["failing"] = False
+                state["last_ok"] = _time.monotonic()
+                save_weather_cache(payload, _city(), _units())
+
+            def _on_page(page):
+                # weather page, or collapsed (compact pill shows weather): refresh only if stale
+                if page == "weather" or (page is None and getattr(ctx.cfg, "island_show_weather", True)
+                                         and getattr(ctx.cfg, "island_idle_display", "time_weather") == "time_weather"):
+                    wake.set()
+
+            ctx.add_page_listener(_on_page)
+            try:
+                from weather_client import register_weather_refresh_callback
+                register_weather_refresh_callback(lambda: _fetch_and_post(force=True))
+            except Exception:
+                wlog.exception("could not register weather refresh callback")
+
+            def _poller_loop():
+                _post_cached()
+                if not stop.wait(2.0):
+                    _fetch_and_post()
                 next_bg = _time.monotonic() + 900.0
+                while not stop.is_set():
+                    wake.wait(max(1.0, next_bg - _time.monotonic()))
+                    if stop.is_set():
+                        break
+                    now = _time.monotonic()
+                    if wake.is_set():
+                        wake.clear()
+                        if now - state["last_ok"] < 600.0 or now - state["last_try"] < 60.0:
+                            continue
+                    elif now < next_bg:
+                        continue
+                    _fetch_and_post()
+                    next_bg = _time.monotonic() + 900.0
 
-        t = threading.Thread(target=_poller_loop, name="WeatherPoller", daemon=True)
-        t.start()
-        return t
+            t = threading.Thread(target=_poller_loop, name="WeatherPoller", daemon=True)
+            t.start()
+            return t
 
-    supervisor.register(
-        name="WeatherPoller",
-        factory=_run_weather_poller,
-        max_restarts=3,
-        backoff_base=5.0,
-    )
-    supervisor.start("WeatherPoller")
+        supervisor.register(
+            name="WeatherPoller",
+            factory=_run_weather_poller,
+            max_restarts=3,
+            backoff_base=5.0,
+        )
+        supervisor.start("WeatherPoller")
 
-    hardware_feed = HardwareFeed(ctx, overlay)
-    ctx.hardware_feed = hardware_feed
-    hardware_feed.start()
-    start_fullscreen_watcher(ctx, overlay, stop)
-    _jlog.start_heartbeat_monitor()
-    _jlog.start_thread_cpu_sampler(interval=10.0)
+        hardware_feed = HardwareFeed(ctx, overlay)
+        ctx.hardware_feed = hardware_feed
+        hardware_feed.start()
+        start_fullscreen_watcher(ctx, overlay, stop)
+        _jlog.start_heartbeat_monitor()
+        _jlog.start_thread_cpu_sampler(interval=10.0)
 
-    # 1 s worker-health poll (supervisor monitor thread); posts to the overlay only on change.
-    supervisor.start_health_monitor(
-        on_health=lambda h: post_worker_health(overlay, h["state"], h["reason"]),
-        context=lambda: {"engine": engine, "tracker": ctx.tracker, "voice": ctx.voice},
-        interval=1.0,
-    )
+        # 1 s worker-health poll (supervisor monitor thread); posts to the overlay only on change.
+        supervisor.start_health_monitor(
+            on_health=lambda h: post_worker_health(overlay, h["state"], h["reason"]),
+            context=lambda: {"engine": engine, "tracker": ctx.tracker, "voice": ctx.voice},
+            interval=1.0,
+        )
 
-    # Global hotkeys: Ctrl+Alt+J toggles wake/standby, Ctrl+Alt+Q quits.
-    try:
-        from pynput import keyboard
-        hotkeys = keyboard.GlobalHotKeys({
-            "<ctrl>+<alt>+j": engine.request_toggle,
-            "<ctrl>+<alt>+q": stop.set,
-        })
-        hotkeys.daemon = True
-        hotkeys.start()
-    except Exception as exc:
-        print(f"[hotkeys] unavailable: {exc}")
+        # Global hotkeys: Ctrl+Alt+J toggles wake/standby, Ctrl+Alt+Q quits.
+        try:
+            from pynput import keyboard
+            hotkeys = keyboard.GlobalHotKeys({
+                "<ctrl>+<alt>+j": engine.request_toggle,
+                "<ctrl>+<alt>+q": stop.set,
+            })
+            hotkeys.daemon = True
+            hotkeys.start()
+        except Exception as exc:
+            print(f"[hotkeys] unavailable: {exc}")
 
-    hour = datetime.datetime.now().hour
-    part = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
-    ctx.say(f"{part}, sir. Jarvis is standing by. Raise your palm to wake me.")
+        hour = datetime.datetime.now().hour
+        part = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+        ctx.say(f"{part}, sir. Jarvis is standing by. Raise your palm to wake me.")
+
+    _start_workers_after_first_frame(_start_workers)
+    warm_first_use_imports(stop)
 
     try:
         overlay.run()
@@ -822,15 +918,19 @@ def main():
         stop.set()
         supervisor.stop(timeout=2)
         try:
-            hardware_feed.stop()
+            if hardware_feed is not None:
+                hardware_feed.stop()
         except Exception as exc:
             _jlog.get_logger("main").warning("hardware feed stop failed: %s", exc)
         try:
-            media_adapter.stop(timeout=1.0)
+            if media_adapter is not None:
+                media_adapter.stop(timeout=1.0)
         except Exception:
             pass
-        controller.shutdown()
-        speaker.q.put(None)
+        if controller is not None:
+            controller.shutdown()
+        if speaker is not None:
+            speaker.q.put(None)
         if _INSTANCE_MUTEX and sys.platform == "win32":
             try:
                 ctypes.windll.kernel32.CloseHandle(_INSTANCE_MUTEX)
