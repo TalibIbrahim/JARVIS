@@ -162,17 +162,33 @@ class LyricsClient:
         except (OSError, ValueError) as exc:
             _log.warning("lyrics cache unreadable (%s): %s", key[:8], exc)
             return False, None
-        if d.get("not_found"):
-            if self._clock() - float(d.get("saved_at", 0)) > NEGATIVE_TTL_S:
-                return False, None
-            self._touch(p)
-            return True, None
+        try:
+            if not isinstance(d, dict):
+                raise ValueError("cache root is not an object")
+            if d.get("not_found"):
+                expired = self._clock() - float(d.get("saved_at", 0)) > NEGATIVE_TTL_S
+                lyr = None
+            else:
+                plain = d.get("plain")
+                if plain is not None and not isinstance(plain, str):
+                    raise ValueError("plain is not a string")
+                expired = False
+                lyr = Lyrics(
+                    synced=[(float(t), str(x)) for t, x in d.get("synced", [])],
+                    plain=plain,
+                    instrumental=bool(d.get("instrumental", False)),
+                )
+        except (ValueError, TypeError, AttributeError, OverflowError) as exc:
+            _log.warning("lyrics cache entry malformed (%s): %s; deleting", key[:8], exc)
+            try:
+                os.remove(p)
+            except OSError as rm_exc:
+                _log.warning("could not delete bad lyrics cache entry: %s", rm_exc)
+            return False, None
+        if expired:
+            return False, None
         self._touch(p)
-        return True, Lyrics(
-            synced=[(float(t), str(x)) for t, x in d.get("synced", [])],
-            plain=d.get("plain"),
-            instrumental=bool(d.get("instrumental", False)),
-        )
+        return True, lyr
 
     def _touch(self, p: str) -> None:
         try:
@@ -226,8 +242,16 @@ class LyricsClient:
     def _to_lyrics(d: dict) -> Optional[Lyrics]:
         if not isinstance(d, dict):
             return None
-        synced = parse_lrc(d.get("syncedLyrics") or "")
-        plain = d.get("plainLyrics") or None
+        raw_synced = d.get("syncedLyrics")
+        raw_plain = d.get("plainLyrics")
+        if raw_synced is not None and not isinstance(raw_synced, str):
+            _log.warning("lrclib syncedLyrics has bad type %s; treated as a miss", type(raw_synced).__name__)
+            raw_synced = None
+        if raw_plain is not None and not isinstance(raw_plain, str):
+            _log.warning("lrclib plainLyrics has bad type %s; treated as a miss", type(raw_plain).__name__)
+            raw_plain = None
+        synced = parse_lrc(raw_synced or "")
+        plain = raw_plain or None
         inst = bool(d.get("instrumental"))
         if not synced and not plain and not inst:
             return None

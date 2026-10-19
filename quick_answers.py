@@ -299,6 +299,18 @@ def extract_factual_topic(text: str) -> Optional[str]:
     return None
 
 
+def _ai_allowed(ctx: Any) -> bool:
+    """Cloud fallback gate, same rule as vision: cfg.ai_enabled and an API key."""
+    from screen_awareness import resolve_cfg
+    from ai import get_api_key
+    cfg = resolve_cfg(ctx)
+    ok = bool(cfg is not None and getattr(cfg, "ai_enabled", False) and get_api_key())
+    if not ok:
+        import jarvis_log as _jl
+        _jl.get_logger("quick_answers").info("Groq fallback skipped: AI disabled or no key")
+    return ok
+
+
 def get_quick_answer(query: str, ctx: Any = None) -> Optional[str]:
     """
     Evaluates factual queries:
@@ -325,7 +337,9 @@ def get_quick_answer(query: str, ctx: Any = None) -> Optional[str]:
                 pass
         return f"According to Wikipedia, {summary}"
 
-    # 3. Fast Groq LLM Completion Fallback
+    # 3. Fast Groq LLM Completion Fallback (cloud: only with ai_enabled AND a key)
+    if not _ai_allowed(ctx):
+        return None
     try:
         from ai import get_api_key, GroqClient, DEFAULT_LLM_MODEL
         api_key = get_api_key()

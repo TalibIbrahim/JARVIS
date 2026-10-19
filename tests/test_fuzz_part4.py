@@ -529,7 +529,7 @@ def test_pipeline_actually_exercised_side_effect_paths(pipeline):
 
 
 def _xf(bug, reason):
-    return pytest.param(bug, marks=pytest.mark.xfail(strict=True, reason=f"{bug}: {reason}"), id=bug)
+    return pytest.param(bug, id=bug)
 
 
 @pytest.mark.parametrize("bug", [
@@ -577,33 +577,36 @@ GARBAGE = [None, True, False, 0, 1, -1, -(10 ** 9), 7, 3.5, -2.5, 1e308, -1e308,
            {}, {"a": 1}, {"a": {"b": [{"c": None}]}}, [[[[[]]]]], {"": ""}, [float("nan")], "\U0001F680"]
 
 
-def _field_kind(f, default):
-    t = f.type
-    if t is int or t == "int":
-        return int
-    if t is float or t == "float":
-        return float
-    if t is bool or t == "bool":
-        return bool
-    if t is str or t == "str":
-        return str
-    origin = getattr(t, "__origin__", None)
-    if origin is list or (isinstance(t, str) and t.startswith("list")):
-        return list
-    if origin is dict or (isinstance(t, str) and t.startswith("dict")):
-        return dict
-    return type(default)
+def _declared_hints():
+    import typing
+    import config
+    return typing.get_type_hints(config.Config)
+
+
+def _unwrap_optional(t):
+    """(kind, allows_none) from a declared annotation; handles Optional[X], Union[X, None], X | None."""
+    import types as _types
+    import typing
+    origin = typing.get_origin(t)
+    if origin is typing.Union or origin is getattr(_types, "UnionType", object()):
+        args = typing.get_args(t)
+        non_none = [a for a in args if a is not type(None)]
+        kind, _ = _unwrap_optional(non_none[0]) if len(non_none) == 1 else (tuple(non_none), False)
+        return kind, type(None) in args
+    if origin is not None:
+        return origin, False
+    return t, False
 
 
 def _type_problems(cfg):
     """Shallow declared-type check of every Config field plus clamps and enum fields."""
     import config
     probs = []
-    d = config.Config()
+    hints = _declared_hints()
     for f in dataclasses.fields(config.Config):
         v = getattr(cfg, f.name)
-        kind = _field_kind(f, getattr(d, f.name))
-        if f.name == "mic_device_index" and v is None:
+        kind, allows_none = _unwrap_optional(hints[f.name])
+        if v is None and allows_none:
             continue
         ok = isinstance(v, kind) and not (kind is int and isinstance(v, bool))
         if not ok:
@@ -839,10 +842,6 @@ def test_known_config_source_bugs_stay_absent(config_fuzz, bug):
     assert bug not in viol.n, viol.summary([bug])
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-F12: config.py:~467 opens the file with encoding='utf-8' (not 'utf-8-sig'), "
-                                       "so a valid JSON config saved with a UTF-8 BOM (Notepad does this) raises "
-                                       "'Unexpected UTF-8 BOM', is treated as corrupt and the user's settings are "
-                                       "replaced by defaults (the original is kept only in .bak)")
 def test_bom_prefixed_valid_config_is_loaded(tmp_path):
     import config
     path = str(tmp_path / "jarvis_config.json")
@@ -882,7 +881,7 @@ def test_corrupt_config_restored_from_good_backup(tmp_path):
 
 def test_glass_transparency_clamp_and_enum_repairs(tmp_path):
     import config
-    for n, (raw, want) in enumerate([(5, 1.0), (-3, 0.0), (1e308, 1.0), ("0.4", 0.4), (float("inf"), 1.0), (float("-inf"), 0.0)]):
+    for n, (raw, want) in enumerate([(5, 1.0), (-3, 0.0), (1e308, 1.0), ("0.4", 0.4), (float("inf"), 0.6), (float("-inf"), 0.6)]):
         path = str(tmp_path / f"c{n}.json")
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps({"glass_transparency": raw, "glass_mode": "bogus", "island_idle_display": "media_aware"}))
@@ -1176,9 +1175,6 @@ def test_weather_client_fuzzed_open_meteo_payloads():
 
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-F13: lyrics_client.py:229 parse_lrc(d.get('syncedLyrics') or '') raises "
-                                       "AttributeError for a non-str API value (123 / list); get_lyrics documents "
-                                       "only LyricsError")
 def test_lyrics_to_lyrics_minimal_repro_non_string_synced_field():
     from lyrics_client import LyricsClient
     for payload in ({"syncedLyrics": 123}, {"syncedLyrics": ["[00:01]x"]}):
@@ -1186,8 +1182,6 @@ def test_lyrics_to_lyrics_minimal_repro_non_string_synced_field():
         assert r is None or isinstance(r.synced, list)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-F13: lyrics_client.py:230 plain = d.get('plainLyrics') or None keeps a "
-                                       "non-str value, Lyrics.plain is declared Optional[str]")
 def test_lyrics_to_lyrics_minimal_repro_non_string_plain_field():
     from lyrics_client import LyricsClient
     r = LyricsClient._to_lyrics({"plainLyrics": 123})
@@ -1229,10 +1223,6 @@ def test_weather_cache_file_fuzz(tmp_path):
     assert not bad, viol.summary(bad)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-F14: lyrics_client.py:160-175 _cache_read only guards json.load; a cache file "
-                                       "whose JSON has the wrong shape ({\"synced\": [[1, \"a\"], [\"x\", 2]]}, a list root, "
-                                       "\"synced\": [[1,2,3]]) raises ValueError/AttributeError out of get_lyrics instead "
-                                       "of being treated as a cache miss")
 def test_lyrics_cache_wrong_shape_is_a_miss_not_a_crash(tmp_path):
     from lyrics_client import LyricsClient, cache_key
     for n, junk in enumerate([{"synced": [[1, "a"], ["x", 2]]}, [1, 2, 3], {"synced": [[1, 2, 3]]}]):
@@ -1244,18 +1234,12 @@ def test_lyrics_cache_wrong_shape_is_a_miss_not_a_crash(tmp_path):
         client.get_lyrics("Song", "Artist")           # must not raise (None / Lyrics / LyricsError are fine)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-F15: weather_client.py weather_state_payload does float(w.relative_humidity) "
-                                       "and the fetch path int()s the API value with no bounds: a payload with "
-                                       "relative_humidity_2m = 10**400 gives WeatherData whose payload raises OverflowError")
 def test_weather_state_payload_survives_absurd_humidity():
     import weather_client as wc
     w = wc.WeatherData(relative_humidity=10 ** 400)
     wc.weather_state_payload(w)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG-F16: config.py:530-534 NaN glass_transparency is meant to fall back to 0.6, "
-                                       "but max(0.0, nan) returns 0.0 so clamped is never NaN and the 0.6 branch is dead: "
-                                       "{\"glass_transparency\": NaN} loads as 0.0 (solid)")
 def test_glass_transparency_nan_falls_back_to_default(tmp_path):
     import config
     path = str(tmp_path / "c.json")

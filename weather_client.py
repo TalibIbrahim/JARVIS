@@ -551,28 +551,45 @@ def trigger_weather_refresh() -> None:
 STALE_AFTER_SECONDS = 3600.0  # cached value older than this is posted with stale=True
 
 
+def _bounded(value: Any, lo: float, hi: float, name: str) -> Any:
+    """value if it is a finite real number within [lo, hi], else None (logged)."""
+    if value is None:
+        return None
+    try:
+        ok = not isinstance(value, bool) and isinstance(value, (int, float)) and lo <= float(value) <= hi
+    except OverflowError:
+        ok = False
+    if not ok:
+        import jarvis_log
+        jarvis_log.get_logger("weather").warning("weather %s out of range or invalid; using None", name)
+        return None
+    return value
+
+
 def weather_state_payload(w: "WeatherData") -> Dict[str, Any]:
     """Builds the kwargs of overlay.post("weather_state", ...). None = unavailable.
 
     wind_kmh is always km/h (converted from mph when the client fetched imperial units).
     """
-    wind = w.wind_speed
+    wind = _bounded(w.wind_speed, 0.0, 1000.0, "wind_speed")
+    humidity = _bounded(w.relative_humidity, 0.0, 100.0, "humidity")
     wind_kmh: Optional[float] = None
     if wind is not None:
         wind_kmh = float(wind) * (1.609344 if w.speed_unit == "mph" else 1.0)
     return {
-        "temp": w.temperature,
+        "temp": _bounded(w.temperature, -200.0, 200.0, "temperature"),
         "condition": w.condition,
         "icon": w.condition,
-        "high": w.high,
-        "low": w.low,
-        "feels_like": w.apparent_temperature,
+        "high": _bounded(w.high, -200.0, 200.0, "high"),
+        "low": _bounded(w.low, -200.0, 200.0, "low"),
+        "feels_like": _bounded(w.apparent_temperature, -200.0, 200.0, "apparent_temperature"),
         "city": w.city.split(",")[0],
-        "hourly": [{"time": h.time, "temp": h.temperature, "condition": h.condition} for h in w.hourly],
+        "hourly": [{"time": h.time, "temp": _bounded(h.temperature, -200.0, 200.0, "hourly temperature"),
+                    "condition": h.condition} for h in w.hourly],
         "unit_symbol": w.unit_symbol,
         "wind_kmh": None if wind_kmh is None else round(wind_kmh, 1),
         "wind_dir_deg": w.wind_direction,
-        "humidity": None if w.relative_humidity is None else float(w.relative_humidity),
+        "humidity": None if humidity is None else float(humidity),
     }
 
 

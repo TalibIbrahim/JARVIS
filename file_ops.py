@@ -156,9 +156,24 @@ class FileOperationsAdapter:
                 if matched and os.path.exists(matched):
                     target_path = matched
 
-        # 3. Direct path check if user gave absolute path
-        if not target_path and os.path.isabs(folder_name) and os.path.exists(folder_name):
-            target_path = folder_name
+        # 3. A spoken absolute path opens ONLY if it resolves (realpath) inside a whitelisted folder
+        looks_like_path = os.path.isabs(folder_name) or any(c in folder_name for c in "\\/") or ".." in folder_name
+        if not target_path and looks_like_path:
+            try:
+                cand = os.path.normcase(os.path.realpath(folder_name))
+                for root in aliases.values():
+                    r = os.path.normcase(os.path.realpath(root))
+                    if cand == r or cand.startswith(r.rstrip("\\/") + os.sep):
+                        if os.path.exists(cand):
+                            target_path = os.path.realpath(folder_name)
+                        break
+            except (OSError, ValueError) as exc:
+                import jarvis_log
+                jarvis_log.get_logger("file_ops").warning("path check failed: %s", exc)
+            if not target_path:
+                import jarvis_log
+                jarvis_log.get_logger("file_ops").warning("open_folder refused a path outside folders_whitelist")
+                return FileOpResult(False, "I can only open your whitelisted folders, sir.", None)
 
         if not target_path or not os.path.exists(target_path):
             return FileOpResult(False, f"Folder '{folder_name}' could not be located, sir.", None)

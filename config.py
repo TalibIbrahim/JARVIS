@@ -112,7 +112,7 @@ class Config:
         "jarves", "jarv", "charvis", "darvis", "jar business"
     ])
     command_window: float = 7.0         # seconds Jarvis keeps listening after "Jarvis?"
-    mic_device_index: int = None        # specific microphone device index, or None for auto-detect
+    mic_device_index: Optional[int] = None        # specific microphone device index, or None for auto-detect
     mic_energy_threshold: int = 300     # minimum audio energy threshold for speech trigger (lower = more sensitive)
     mic_dynamic_energy: bool = False    # adapt threshold dynamically (False prevents runaway threshold on laptop mics)
     mic_pause_threshold: float = 1.0    # seconds of silence before finishing phrase (prevents cutting off mid-sentence)
@@ -375,8 +375,31 @@ def _atomic_write_json(file_path: str, data: dict) -> bool:
         return False
 
 
+def _log_repair(msg: str, *args) -> None:
+    import jarvis_log
+    jarvis_log.get_logger("config").info(msg, *args)
+
+
 def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
     """Safely coerces or falls back to default if value is wrong type."""
+    if field_name == "mic_device_index":
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            _log_repair("mic_device_index %r -> None (invalid)", value)
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            if isinstance(value, (float, str)):
+                f = float(value)
+                if f == int(f):
+                    return int(f)
+        except (ValueError, TypeError, OverflowError):
+            pass
+        _log_repair("mic_device_index %r -> None (invalid)", value)
+        return None
+
     if value is None:
         return default_val if default_val is not None else None
 
@@ -392,18 +415,21 @@ def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
 
     if isinstance(default_val, int) and not isinstance(default_val, bool):
         if isinstance(value, int) and not isinstance(value, bool):
+            if abs(value) > 2**63:
+                _log_repair("%s: integer out of range -> default %r", field_name, default_val)
+                return default_val
             return value
         try:
             return int(float(value))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
+            _log_repair("%s: %r not coercible to int -> default %r", field_name, value, default_val)
             return default_val
 
     if isinstance(default_val, float):
-        if isinstance(value, (float, int)) and not isinstance(value, bool):
-            return float(value)
         try:
             return float(value)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
+            _log_repair("%s: %r not coercible to float -> default %r", field_name, value, default_val)
             return default_val
 
     if isinstance(default_val, str):
@@ -413,12 +439,26 @@ def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
 
     if isinstance(default_val, list):
         if isinstance(value, (list, tuple)):
-            return list(value)
+            items = list(value)
+            if field_name in ("wake_aliases", "island_pages"):
+                good = [i for i in items if isinstance(i, str)]
+                if len(good) != len(items):
+                    _log_repair("%s: dropped %d non-string entries", field_name, len(items) - len(good))
+                return good
+            return items
         return default_val
 
     if isinstance(default_val, dict):
         if isinstance(value, dict):
-            return dict(value)
+            if field_name == "folders_whitelist":
+                good = {k: v for k, v in value.items() if isinstance(k, str) and isinstance(v, str)}
+            elif field_name == "island_pages_enabled":
+                good = {k: v for k, v in value.items() if isinstance(k, str) and isinstance(v, bool)}
+            else:
+                return dict(value)
+            if len(good) != len(value):
+                _log_repair("%s: dropped %d invalid entries", field_name, len(value) - len(good))
+            return good
         return default_val
 
     return value
@@ -427,7 +467,7 @@ def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
 def _loaded_version(data: dict) -> int:
     try:
         return int(data.get("config_version", 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -445,7 +485,7 @@ def load_config(path=None):
 
     if os.path.exists(config_path):
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 needs_repair = True
@@ -455,7 +495,7 @@ def load_config(path=None):
             print(f"[config] corrupted config at {config_path}: {exc}. Attempting recovery from backup...")
             if os.path.exists(bak_path):
                 try:
-                    with open(bak_path, "r", encoding="utf-8") as f_bak:
+                    with open(bak_path, "r", encoding="utf-8-sig") as f_bak:
                         data = json.load(f_bak)
                     if isinstance(data, dict):
                         print(f"[config] successfully restored config from {bak_path}")
@@ -470,7 +510,7 @@ def load_config(path=None):
                 print(f"[config] no backup found at {bak_path}, falling back to defaults")
     elif os.path.exists(bak_path):
         try:
-            with open(bak_path, "r", encoding="utf-8") as f_bak:
+            with open(bak_path, "r", encoding="utf-8-sig") as f_bak:
                 data = json.load(f_bak)
             if isinstance(data, dict):
                 _atomic_write_json(config_path, data)
@@ -527,12 +567,17 @@ def load_config(path=None):
         jarvis_log.get_logger("config").info("glass_mode %r -> tinted", cfg.glass_mode)
         cfg.glass_mode = "tinted"
         migrated = True
-    clamped = min(1.0, max(0.0, cfg.glass_transparency))
-    if clamped != cfg.glass_transparency or clamped != clamped:
-        import jarvis_log
-        jarvis_log.get_logger("config").info("glass_transparency %r -> clamped", cfg.glass_transparency)
-        cfg.glass_transparency = 0.6 if clamped != clamped else clamped
+    gt = cfg.glass_transparency
+    if gt != gt or gt in (float("inf"), float("-inf")):
+        _log_repair("glass_transparency %r -> default 0.6", gt)
+        cfg.glass_transparency = 0.6
         migrated = True
+    else:
+        clamped = min(1.0, max(0.0, gt))
+        if clamped != gt:
+            _log_repair("glass_transparency %r -> clamped", gt)
+            cfg.glass_transparency = clamped
+            migrated = True
 
     if cfg.island_idle_display not in ("off", "time", "time_weather"):
         import jarvis_log
