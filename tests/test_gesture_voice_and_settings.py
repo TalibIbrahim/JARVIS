@@ -208,57 +208,100 @@ class TestWindowResolver(unittest.TestCase):
 class TestGestureShortcutsAndHUD(unittest.TestCase):
     """Tests for Gesture Shortcuts & HUD Events in gestures.py (Phase 8 Task 2)."""
 
-    def test_vertical_slide_up_increases_volume_and_emits_hud_event(self):
-        """Upward hand slide increases volume by +5% and posts 'hud_volume' event to overlay."""
-        cfg = Config(gesture_shortcuts_enabled=True, gesture_slide_volume=True)
-        mock_overlay = MagicMock()
-        engine = GestureEngine(cfg, overlay=mock_overlay)
-        t = wake_engine(engine, 0.0)
+    @staticmethod
+    def _flick(axis, sign, base=0.0, n=6, step=0.05):
+        """Genuine flick: 0.25 displacement over ~0.17 s at 30 fps."""
+        k = "dx" if axis == "x" else "dy"
+        return [[make_hand("palm", **{k: base + sign * step * i})] for i in range(n)]
 
-        # Slide upward (dy decreases: -0.04 per frame over 3 frames -> dy = -0.08 <= -0.06)
-        frames = [[make_hand("palm", dy=-0.04 * i)] for i in range(4)]
+    @staticmethod
+    def _slow(axis, sign, base=0.0):
+        """Old-style slow motion: 0.08 over 3 frames. No longer a shortcut."""
+        k = "dx" if axis == "x" else "dy"
+        return [[make_hand("palm", **{k: base + sign * 0.04 * i})] for i in range(4)]
+
+    def _assert_flick_extras(self, acts, nframes):
+        kinds = [a.kind for a in acts]
+        self.assertIn("rewind", kinds)
+        self.assertGreaterEqual(kinds.count("move"), nframes)
+
+    def _assert_nothing_fired(self, acts, mock_overlay):
+        kinds = [a.kind for a in acts]
+        for k in ("volume_up", "volume_down", "switch_window", "island_page_step", "rewind"):
+            self.assertNotIn(k, kinds)
+        mock_overlay.post.assert_not_called()
+
+    def _engine(self, **kw):
+        mock_overlay = MagicMock()
+        engine = GestureEngine(Config(gesture_shortcuts_enabled=True, **kw), overlay=mock_overlay)
+        return engine, mock_overlay, wake_engine(engine, 0.0)
+
+    def test_vertical_flick_up_increases_volume_and_emits_hud_event(self):
+        """Upward flick increases volume by +5%, posts 'hud_volume', emits rewind and a move per frame."""
+        engine, mock_overlay, t = self._engine(gesture_slide_volume=True)
+        frames = self._flick("y", -1)
         with patch("system_control.volume_up", return_value=65) as mock_vol_up:
             acts, t = feed_engine(engine, frames, t)
-
         mock_vol_up.assert_called_with(steps=5)
         mock_overlay.post.assert_any_call("hud_volume", level=65, delta=5)
-        kinds = [a.kind for a in acts]
-        self.assertIn("volume_up", kinds)
+        self.assertIn("volume_up", [a.kind for a in acts])
+        self._assert_flick_extras(acts, len(frames))
 
-    def test_vertical_slide_down_decreases_volume_and_emits_hud_event(self):
-        """Downward hand slide decreases volume by -5% and posts 'hud_volume' event to overlay."""
-        cfg = Config(gesture_shortcuts_enabled=True, gesture_slide_volume=True)
-        mock_overlay = MagicMock()
-        engine = GestureEngine(cfg, overlay=mock_overlay)
-        t = wake_engine(engine, 0.0)
-
-        # Slide downward (dy increases: +0.04 per frame over 3 frames -> dy = 0.08 >= 0.06)
-        frames = [[make_hand("palm", dy=0.04 * i)] for i in range(4)]
+    def test_vertical_flick_down_decreases_volume_and_emits_hud_event(self):
+        """Downward flick decreases volume by -5%, posts 'hud_volume', emits rewind and a move per frame."""
+        engine, mock_overlay, t = self._engine(gesture_slide_volume=True)
+        frames = self._flick("y", +1)
         with patch("system_control.volume_down", return_value=40) as mock_vol_down:
             acts, t = feed_engine(engine, frames, t)
-
         mock_vol_down.assert_called_with(steps=5)
         mock_overlay.post.assert_any_call("hud_volume", level=40, delta=-5)
-        kinds = [a.kind for a in acts]
-        self.assertIn("volume_down", kinds)
+        self.assertIn("volume_down", [a.kind for a in acts])
+        self._assert_flick_extras(acts, len(frames))
 
-    def test_horizontal_swipe_switches_window_and_emits_hud_event(self):
-        """Horizontal hand swipe triggers Alt+Tab window switch and posts 'hud_switch_window'."""
-        cfg = Config(gesture_shortcuts_enabled=True, gesture_swipe_switch=True)
-        mock_overlay = MagicMock()
-        engine = GestureEngine(cfg, overlay=mock_overlay)
-        t = wake_engine(engine, 0.0)
+    def test_slow_vertical_slide_no_longer_changes_volume(self):
+        """Old slow 0.08-over-3-frames slide (up or down) triggers nothing."""
+        for sign in (-1, +1):
+            engine, mock_overlay, t = self._engine(gesture_slide_volume=True)
+            with patch("system_control.volume_up") as up, patch("system_control.volume_down") as down:
+                acts, t = feed_engine(engine, self._slow("y", sign), t)
+            up.assert_not_called()
+            down.assert_not_called()
+            self._assert_nothing_fired(acts, mock_overlay)
+            self.assertGreaterEqual([a.kind for a in acts].count("move"), 4)
 
-        # Swipe horizontally (dx increases: +0.04 per frame over 3 frames -> dx = 0.08 >= 0.08)
-        frames = [[make_hand("palm", dx=0.04 * i)] for i in range(4)]
+    def test_horizontal_flick_right_switches_window_and_emits_hud_event(self):
+        """Right flick sends Alt+Tab, posts 'hud_switch_window', emits rewind and a move per frame."""
+        engine, mock_overlay, t = self._engine(gesture_swipe_switch=True)
+        frames = self._flick("x", +1)
         with patch("pyautogui.hotkey") as mock_hotkey, \
              patch("system_control.get_foreground_window_title", return_value="Visual Studio Code"):
             acts, t = feed_engine(engine, frames, t)
-
         mock_hotkey.assert_called_with("alt", "tab", _pause=False)
         mock_overlay.post.assert_any_call("hud_switch_window", title="Visual Studio Code")
-        kinds = [a.kind for a in acts]
-        self.assertIn("switch_window", kinds)
+        self.assertIn("switch_window", [a.kind for a in acts])
+        self._assert_flick_extras(acts, len(frames))
+
+    def test_horizontal_flick_left_sends_alt_shift_tab(self):
+        """Left flick sends Alt+Shift+Tab."""
+        engine, mock_overlay, t = self._engine(gesture_swipe_switch=True)
+        frames = self._flick("x", -1)
+        with patch("pyautogui.hotkey") as mock_hotkey, \
+             patch("system_control.get_foreground_window_title", return_value="Visual Studio Code"):
+            acts, t = feed_engine(engine, frames, t)
+        mock_hotkey.assert_called_with("alt", "shift", "tab", _pause=False)
+        mock_overlay.post.assert_any_call("hud_switch_window", title="Visual Studio Code")
+        self.assertIn("switch_window", [a.kind for a in acts])
+        self._assert_flick_extras(acts, len(frames))
+
+    def test_slow_horizontal_swipe_no_longer_switches_window(self):
+        """Old slow 0.08-over-3-frames swipe (either direction) triggers nothing."""
+        for sign in (-1, +1):
+            engine, mock_overlay, t = self._engine(gesture_swipe_switch=True)
+            with patch("pyautogui.hotkey") as mock_hotkey:
+                acts, t = feed_engine(engine, self._slow("x", sign), t)
+            mock_hotkey.assert_not_called()
+            self._assert_nothing_fired(acts, mock_overlay)
+            self.assertGreaterEqual([a.kind for a in acts].count("move"), 4)
 
     def test_gesture_shortcuts_disabled_setting_suppresses_events(self):
         """When gesture_shortcuts_enabled is False, slides and swipes are ignored."""
@@ -268,7 +311,7 @@ class TestGestureShortcutsAndHUD(unittest.TestCase):
         t = wake_engine(engine, 0.0)
 
         # Slide upward
-        frames = [[make_hand("palm", dy=-0.04 * i)] for i in range(4)]
+        frames = [[make_hand("palm", dy=-0.05 * i)] for i in range(6)]
         acts, t = feed_engine(engine, frames, t)
         mock_overlay.post.assert_not_called()
         self.assertNotIn("volume_up", [a.kind for a in acts])
@@ -280,7 +323,7 @@ class TestGestureShortcutsAndHUD(unittest.TestCase):
         engine = GestureEngine(cfg, overlay=mock_overlay)
         t = wake_engine(engine, 0.0)
 
-        frames = [[make_hand("palm", dy=-0.04 * i)] for i in range(4)]
+        frames = [[make_hand("palm", dy=-0.05 * i)] for i in range(6)]
         acts, t = feed_engine(engine, frames, t)
         mock_overlay.post.assert_not_called()
         self.assertNotIn("volume_up", [a.kind for a in acts])
@@ -292,7 +335,7 @@ class TestGestureShortcutsAndHUD(unittest.TestCase):
         engine = GestureEngine(cfg, overlay=mock_overlay)
         t = wake_engine(engine, 0.0)
 
-        frames = [[make_hand("palm", dx=0.04 * i)] for i in range(4)]
+        frames = [[make_hand("palm", dx=0.05 * i)] for i in range(6)]
         acts, t = feed_engine(engine, frames, t)
         mock_overlay.post.assert_not_called()
         self.assertNotIn("switch_window", [a.kind for a in acts])
@@ -649,43 +692,43 @@ class TestDynamicIslandVoiceIntents(unittest.TestCase):
 class TestDynamicIslandGestureHooks(unittest.TestCase):
     """Phase 4: Unit tests for Dynamic Island gesture hooks in gestures.py and controller.py."""
 
-    def test_vertical_swipe_down_in_island_area_steps_next_page(self):
-        """Swipe down while hand is in top-screen area (hy <= 0.38) triggers island_page_step(1)."""
-        cfg = Config(gesture_shortcuts_enabled=True)
+    def _island_run(self, base, sign, n=6, step=0.05):
         mock_overlay = MagicMock()
-        engine = GestureEngine(cfg, overlay=mock_overlay)
+        engine = GestureEngine(Config(gesture_shortcuts_enabled=True), overlay=mock_overlay)
         t = wake_engine(engine, 0.0)
+        frames = [[make_hand("palm", dy=base + sign * step * i)] for i in range(n)]
+        acts, t = feed_engine(engine, frames, t + 1.0)
+        return acts, mock_overlay, len(frames)
 
-        # Baseline frame at top of screen (hy = 0.25 <= 0.38)
-        _, t = feed_engine(engine, [[make_hand("palm", dy=-0.45)]], t + 1.0)
-        # Swipe downward (dy increases: +0.04 per frame over 3 frames -> dy = +0.08 >= 0.06)
-        frames = [[make_hand("palm", dy=-0.45 + 0.04 * i)] for i in range(1, 4)]
-        acts, t = feed_engine(engine, frames, t)
-
+    def test_vertical_flick_down_in_island_area_steps_next_page(self):
+        """Down flick while hand is in top-screen area (hy <= 0.38) triggers island_page_step(1)."""
+        acts, mock_overlay, n = self._island_run(-0.45, +1)
         mock_overlay.post.assert_any_call("island_page_step", direction=1)
         kinds = [a.kind for a in acts]
         self.assertIn("island_page_step", kinds)
-        step_act = next(a for a in acts if a.kind == "island_page_step")
-        self.assertEqual(step_act.n, 1)
+        self.assertIn("rewind", kinds)
+        self.assertGreaterEqual(kinds.count("move"), n)
+        self.assertEqual(next(a for a in acts if a.kind == "island_page_step").n, 1)
 
-    def test_vertical_swipe_up_in_island_area_steps_prev_page(self):
-        """Swipe up while hand is in top-screen area (hy <= 0.38) triggers island_page_step(-1)."""
-        cfg = Config(gesture_shortcuts_enabled=True)
-        mock_overlay = MagicMock()
-        engine = GestureEngine(cfg, overlay=mock_overlay)
-        t = wake_engine(engine, 0.0)
-
-        # Baseline frame at top of screen
-        _, t = feed_engine(engine, [[make_hand("palm", dy=-0.35)]], t + 1.0)
-        # Swipe upward (dy decreases: -0.04 per frame over 3 frames -> dy = -0.08 <= -0.06)
-        frames = [[make_hand("palm", dy=-0.35 - 0.04 * i)] for i in range(1, 4)]
-        acts, t = feed_engine(engine, frames, t)
-
+    def test_vertical_flick_up_in_island_area_steps_prev_page(self):
+        """Up flick while hand is in top-screen area (hy <= 0.38) triggers island_page_step(-1)."""
+        acts, mock_overlay, n = self._island_run(-0.35, -1)
         mock_overlay.post.assert_any_call("island_page_step", direction=-1)
         kinds = [a.kind for a in acts]
         self.assertIn("island_page_step", kinds)
-        step_act = next(a for a in acts if a.kind == "island_page_step")
-        self.assertEqual(step_act.n, -1)
+        self.assertIn("rewind", kinds)
+        self.assertGreaterEqual(kinds.count("move"), n)
+        self.assertEqual(next(a for a in acts if a.kind == "island_page_step").n, -1)
+
+    def test_slow_vertical_swipe_in_island_area_does_not_step_page(self):
+        """Old slow 0.08-over-3-frames swipe in the island area (either direction) no longer steps."""
+        for base, sign in ((-0.45, +1), (-0.35, -1)):
+            acts, mock_overlay, n = self._island_run(base, sign, n=4, step=0.04)
+            kinds = [a.kind for a in acts]
+            self.assertNotIn("island_page_step", kinds)
+            self.assertNotIn("rewind", kinds)
+            mock_overlay.post.assert_not_called()
+            self.assertGreaterEqual(kinds.count("move"), n)
 
     def test_controller_island_page_step_handling(self):
         """Controller (worker thread) only posts island_page_step; the GUI-side drain moves the island page."""

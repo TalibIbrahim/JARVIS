@@ -28,6 +28,51 @@ pyautogui.FAILSAFE = False      # hand control would otherwise trip the corner f
 pyautogui.MINIMUM_DURATION = 0
 
 
+class _HighResTimer:
+    """Windows high-resolution waitable timer (Win10 1803+). WaitForSingleObject releases the GIL."""
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2
+    TIMER_ALL_ACCESS = 0x1F0003
+
+    def __init__(self, k32, handle):
+        self._k32 = k32
+        self._h = handle
+        self._due = ctypes.c_longlong()
+
+    @classmethod
+    def create(cls):
+        """Returns a timer, or None if unavailable (caller falls back to time.sleep)."""
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateWaitableTimerExW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong]
+            k32.CreateWaitableTimerExW.restype = ctypes.c_void_p
+            k32.SetWaitableTimer.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_longlong), ctypes.c_long,
+                                             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            k32.SetWaitableTimer.restype = ctypes.c_int
+            k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            k32.WaitForSingleObject.restype = ctypes.c_ulong
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            h = k32.CreateWaitableTimerExW(None, None, cls.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                           cls.TIMER_ALL_ACCESS)
+            if not h:
+                return None
+            return cls(k32, h)
+        except Exception:
+            return None
+
+    def wait(self, seconds: float) -> None:
+        # Negative due time = relative, in 100 ns units
+        self._due.value = -int(seconds * 1e7)
+        if self._k32.SetWaitableTimer(self._h, ctypes.byref(self._due), 0, None, None, 0):
+            self._k32.WaitForSingleObject(self._h, 100)
+        else:
+            time.sleep(seconds)
+
+    def close(self) -> None:
+        if self._h:
+            self._k32.CloseHandle(self._h)
+            self._h = None
+
+
 class LookbackBuffer:
     """Preallocated circular buffer for zero-allocation cursor position lookback."""
     __slots__ = ("_cap", "_t", "_x", "_y", "_head", "_count")
@@ -260,6 +305,7 @@ class Controller:
             except Exception:
                 pass
 
+        hr_timer = _HighResTimer.create() if self._win else None
         jarvis_log.thread_started("CursorLoop")
         next_tick = time.perf_counter() + dt_target
         hb_t0 = time.perf_counter()
@@ -303,12 +349,13 @@ class Controller:
                     if self.overlay:
                         self.overlay.post("cursor_dwell", **dwell_state)
 
-                # Hybrid sleep/spin to lock cursor loop frequency at 120+ Hz with < 0.3 ms jitter
+                # Precise wait without holding the GIL (high-res waitable timer; falls back to time.sleep)
                 rem = next_tick - time.perf_counter()
-                if rem > 0.0015:
-                    time.sleep(rem - 0.001)
-                while time.perf_counter() < next_tick and not self._stop_thread.is_set():
-                    pass
+                if rem > 0.0:
+                    if hr_timer is not None:
+                        hr_timer.wait(rem)
+                    else:
+                        time.sleep(rem)
 
                 next_tick += dt_target
                 now_after = time.perf_counter()
@@ -332,6 +379,8 @@ class Controller:
         else:
             jarvis_log.thread_exited("CursorLoop")
         finally:
+            if hr_timer is not None:
+                hr_timer.close()
             if self._win:
                 try:
                     ctypes.windll.winmm.timeEndPeriod(1)
@@ -630,11 +679,13 @@ class Controller:
                     return
 
                 raw_dt = now - self.last_move_t
-                dt = max(min(raw_dt, 0.05), 1e-4)
+                dt = max(raw_dt, 1e-3)
 
-                # Gap detected from sleep/resume, screen lock, or frame drop
-                if raw_dt > 0.10:
-                    self.failsafe_release()
+                # Genuine stall (sleep/resume, camera hiccup): drop this one delta and reset filters.
+                # Frames 100-500 ms apart are normal under slow inference and are applied as-is.
+                if raw_dt > 0.5:
+                    if raw_dt > 1.0:
+                        self.failsafe_release()
                     self._reset_filters()
                     self.last_landmark_x = flm_x
                     self.last_landmark_y = flm_y
@@ -719,6 +770,13 @@ class Controller:
                 pyautogui.click(_pause=False)
 
             self.pinching = False
+
+        elif k == "rewind":
+            # A shortcut flick began a.age seconds ago: put the cursor back where it was then.
+            lb_x, lb_y = self.history.get_lookback(now - a.age, self.cur_x, self.cur_y)
+            self.target_x, self.target_y = lb_x, lb_y
+            self.cur_x, self.cur_y = lb_x, lb_y
+            self._move(round(lb_x), round(lb_y))
 
         elif k == "island_page_step":
             self.island_page_step(a.n)

@@ -49,7 +49,7 @@ class Hand:
 
 @dataclass
 class Action:
-    kind: str           # move click right_click drag_start drag_end scroll zoom activate deactivate lost
+    kind: str           # move rewind click right_click drag_start drag_end scroll zoom activate deactivate lost
     x: float = 0.0
     y: float = 0.0
     dx: float = 0.0
@@ -59,6 +59,8 @@ class Action:
     speed: float = 0.0
     precision: bool = False
     clutched: bool = False
+    t: float = 0.0      # rewind: flick start time (engine clock)
+    age: float = 0.0    # rewind: seconds between flick start and now
 
 
 class Pose:
@@ -132,9 +134,8 @@ class GestureEngine:
         self._flash_until = 0.0
         self._mode = ""
         self._lost_sent = False
-        self._stroke_start = None
-        self._slide_cooldown_until = 0.0
-        self._swipe_cooldown_until = 0.0
+        self._palm_hist = []
+        self._shortcut_cooldown_until = 0.0
         self._reset_state()
 
     def set_overlay(self, overlay):
@@ -404,8 +405,8 @@ class GestureEngine:
                 self._flash_label("DRAG", now)
 
         # Phase 8: Gesture Shortcuts (Vertical Slide & Horizontal Swipe)
-        if self._check_gesture_shortcuts(lm, p, now, actions):
-            return actions
+        flick_actions = []
+        self._check_gesture_shortcuts(lm, p, now, flick_actions)
 
         # 3. Cursor Motion (Wrist + 4 MCP Knuckles Anchor)
         anchor = self._compute_palm_anchor(lm)
@@ -427,10 +428,11 @@ class GestureEngine:
                 ax, ay = self._map(*anchor)
                 if self.last_anchor is not None and self.last_anchor_t is not None:
                     raw_dt = now - self.last_anchor_t
-                    if raw_dt > 0.10:
+                    if raw_dt > 0.5:
+                        # genuine stall (sleep/resume, camera hiccup): drop this one delta only
                         adx, ady, speed = 0.0, 0.0, 0.0
                     else:
-                        dt = max(min(raw_dt, 0.05), 1e-4)
+                        dt = max(raw_dt, 1e-3)
                         adx = anchor[0] - self.last_anchor[0]
                         ady = anchor[1] - self.last_anchor[1]
                         speed = math.hypot(adx, ady) / dt
@@ -448,6 +450,7 @@ class GestureEngine:
             self.last_anchor_t = None
             self.precision_active = False
 
+        actions.extend(flick_actions)
         return actions
 
     def _on_pose_transition(self, prev_pose, new_pose, now, actions):
@@ -486,124 +489,90 @@ class GestureEngine:
 
     def _check_gesture_shortcuts(self, lm, p, now, actions) -> bool:
         """
-        Phase 8: Gesture Shortcuts & HUD Events.
-        - Vertical slide: slide up (volume +5%), slide down (volume -5%); emits overlay.post("hud_volume", level=..., delta=...).
-        - Horizontal swipe: switch window (Alt+Tab); emits overlay.post("hud_switch_window", title=...).
+        Deliberate-flick shortcuts. Never suppresses cursor motion (caller always emits the move).
+        - Horizontal flick: right = Alt+Tab, left = Alt+Shift+Tab.
+        - Vertical flick: volume +/-5%, or an island page step when the hand is near the top.
+        A flick needs displacement >= 0.18 frame widths within <= 0.25 s, a peak speed >= 1.2 frame
+        widths/s, and a dominant axis (> 2x the other). When one fires, a "rewind" action is appended so
+        the controller puts the cursor back where it was when the flick began.
+        Returns True if a shortcut fired.
         """
         cfg = self.cfg
         if not getattr(cfg, "gesture_shortcuts_enabled", True):
-            self._stroke_start = None
+            self._palm_hist = []
             return False
 
         # Exclude other dedicated poses/actions (peace/scroll, thumbs-up, dragging, right-click pinch)
         if p.peace or p.thumbs_up or self.dragging or self.rp_down:
-            self._stroke_start = None
+            self._palm_hist = []
             return False
 
-        # Use knuckles/palm center as motion anchor
         hx = (lm[WRIST][0] + lm[MIDDLE_MCP][0]) / 2.0
         hy = (lm[WRIST][1] + lm[MIDDLE_MCP][1]) / 2.0
 
-        if self._stroke_start is None:
-            self._stroke_start = (hx, hy, now)
+        hist = self._palm_hist
+        if hist and now < hist[-1][0]:          # clock jumped backwards
+            hist.clear()
+        hist.append((now, hx, hy))
+        while hist and now - hist[0][0] > 0.30:
+            hist.pop(0)
+        if len(hist) < 3 or now < self._shortcut_cooldown_until:
             return False
 
-        sx, sy, st = self._stroke_start
-        dt = now - st
-
-        # Reset stroke tracking if window exceeded or clock jumped
-        if dt > 0.55 or dt < 0.0:
-            self._stroke_start = (hx, hy, now)
+        # Window start candidates: samples within 0.25 s of now
+        win = [s for s in hist if now - s[0] <= 0.25]
+        if len(win) < 3:
             return False
 
-        dx = hx - sx
-        dy = hy - sy
+        # Peak segment speed (frame widths / s); segment dt floored at one 60 fps frame
+        peak_x = peak_y = 0.0
+        for (t0, x0, y0), (t1, x1, y1) in zip(win, win[1:]):
+            sdt = max(t1 - t0, 0.016)
+            peak_x = max(peak_x, abs(x1 - x0) / sdt)
+            peak_y = max(peak_y, abs(y1 - y0) / sdt)
 
-        # 1. Horizontal swipe: switch window (Alt+Tab)
-        swipe_thresh = getattr(cfg, "swipe_threshold", 0.08)
-        if (
-            getattr(cfg, "gesture_swipe_switch", True)
-            and abs(dx) >= swipe_thresh
-            and abs(dx) > 1.35 * max(abs(dy), 1e-4)
-            and now >= getattr(self, "_swipe_cooldown_until", 0.0)
-        ):
-            self._swipe_cooldown_until = now + 0.40
-            self._stroke_start = (hx, hy, now)
+        t0, x0, y0 = win[0]
+        dx = hx - x0
+        dy = hy - y0
+        min_disp = getattr(cfg, "flick_min_disp", 0.18)
+        min_peak = getattr(cfg, "flick_min_peak", 1.2)
 
-            title = ""
-            try:
-                import system_control
-                title = system_control.get_foreground_window_title() or ""
-            except Exception:
-                pass
+        horizontal = (abs(dx) >= min_disp and peak_x >= min_peak and abs(dx) > 2.0 * abs(dy))
+        vertical = (abs(dy) >= min_disp and peak_y >= min_peak and abs(dy) > 2.0 * abs(dx))
 
-            try:
-                import pyautogui
-                pyautogui.hotkey("alt", "tab", _pause=False)
-            except Exception:
-                pass
-
-            try:
-                import system_control
-                new_title = system_control.get_foreground_window_title()
-                if new_title:
-                    title = new_title
-            except Exception:
-                pass
-
-            if not title:
-                title = "Switched Window"
-
-            if self.overlay and hasattr(self.overlay, "post"):
-                try:
-                    self.overlay.post("hud_switch_window", title=title)
-                except Exception:
-                    pass
-
-            actions.append(Action("switch_window"))
-            self._flash_label("SWITCH WINDOW", now)
+        if horizontal and getattr(cfg, "gesture_swipe_switch", True):
+            self._shortcut_cooldown_until = now + 0.60
+            self._palm_hist = []
+            self._fire_window_switch(dx > 0, now, actions)
+            actions.append(Action("rewind", t=t0, age=now - t0))
             return True
 
-        # 2. Vertical slide / swipe:
-        # - Top-screen/island area: swipe down -> next page (1), swipe up -> prev page (-1)
-        # - General area: slide up -> volume +5%, slide down -> volume -5%
-        # In screen coordinates, moving hand UP means hy decreases (dy < 0), DOWN means hy increases (dy > 0)
-        slide_thresh = getattr(cfg, "slide_threshold", 0.06)
-        if (
-            abs(dy) >= slide_thresh
-            and abs(dy) > 1.35 * max(abs(dx), 1e-4)
-            and now >= getattr(self, "_slide_cooldown_until", 0.0)
-        ):
-            # Check if hand/cursor is in top-screen / island area
+        if vertical:
             is_top_area = (
                 hy <= 0.38
-                or sy <= 0.38
+                or y0 <= 0.38
                 or getattr(self, "in_island_area", False)
                 or (hasattr(self, "cursor_y") and self.cursor_y is not None and self.cursor_y < 250)
             )
-
             if is_top_area:
-                self._slide_cooldown_until = now + 0.35
-                self._stroke_start = (hx, hy, now)
-                direction = 1 if dy > 0 else -1  # Swipe down (dy > 0) -> next page (1), Swipe up (dy < 0) -> prev page (-1)
-
+                self._shortcut_cooldown_until = now + 0.60
+                self._palm_hist = []
+                direction = 1 if dy > 0 else -1
                 if self.overlay and hasattr(self.overlay, "post"):
                     try:
                         self.overlay.post("island_page_step", direction=direction)
                     except Exception:
                         pass
                 actions.append(Action("island_page_step", n=direction, dy=dy))
-                lbl = "ISLAND NEXT" if direction > 0 else "ISLAND PREV"
-                self._flash_label(lbl, now)
+                actions.append(Action("rewind", t=t0, age=now - t0))
+                self._flash_label("ISLAND NEXT" if direction > 0 else "ISLAND PREV", now)
                 return True
 
             if getattr(cfg, "gesture_slide_volume", True):
-                self._slide_cooldown_until = now + 0.28
-                self._stroke_start = (hx, hy, now)
-
+                self._shortcut_cooldown_until = now + 0.60
+                self._palm_hist = []
                 delta = 5 if dy < 0 else -5
                 level = 50
-
                 try:
                     import system_control
                     if delta > 0:
@@ -618,14 +587,49 @@ class GestureEngine:
                         self.overlay.post("hud_volume", level=level, delta=delta)
                     except Exception:
                         pass
-
-                act_kind = "volume_up" if delta > 0 else "volume_down"
-                actions.append(Action(act_kind, dy=dy, n=delta))
-                lbl = "VOLUME +5%" if delta > 0 else "VOLUME -5%"
-                self._flash_label(lbl, now)
+                actions.append(Action("volume_up" if delta > 0 else "volume_down", dy=dy, n=delta))
+                actions.append(Action("rewind", t=t0, age=now - t0))
+                self._flash_label("VOLUME +5%" if delta > 0 else "VOLUME -5%", now)
                 return True
 
         return False
+
+    def _fire_window_switch(self, right, now, actions):
+        title = ""
+        try:
+            import system_control
+            title = system_control.get_foreground_window_title() or ""
+        except Exception:
+            pass
+
+        try:
+            import pyautogui
+            if right:
+                pyautogui.hotkey("alt", "tab", _pause=False)
+            else:
+                pyautogui.hotkey("alt", "shift", "tab", _pause=False)
+        except Exception:
+            pass
+
+        try:
+            import system_control
+            new_title = system_control.get_foreground_window_title()
+            if new_title:
+                title = new_title
+        except Exception:
+            pass
+
+        if not title:
+            title = "Switched Window"
+
+        if self.overlay and hasattr(self.overlay, "post"):
+            try:
+                self.overlay.post("hud_switch_window", title=title)
+            except Exception:
+                pass
+
+        actions.append(Action("switch_window"))
+        self._flash_label("SWITCH WINDOW", now)
 
     def _compute_palm_anchor(self, lm):
         mode = getattr(self.cfg, "palm_anchor", "knuckles")
@@ -765,8 +769,8 @@ class GestureEngine:
                 self._flash_label("DOUBLE CLICK" if double else "CLICK", now)
 
         # Phase 8: Gesture Shortcuts (Vertical Slide & Horizontal Swipe)
-        if self._check_gesture_shortcuts(lm, p, now, actions):
-            return actions
+        flick_actions = []
+        self._check_gesture_shortcuts(lm, p, now, flick_actions)
 
         # cursor: follow anchor
         closing = p.pinch_ti < cfg.pinch_freeze and not self.dragging
@@ -789,10 +793,11 @@ class GestureEngine:
                 ax, ay = self._map(*anchor)
                 if self.last_anchor is not None and self.last_anchor_t is not None:
                     raw_dt = now - self.last_anchor_t
-                    if raw_dt > 0.10:
+                    if raw_dt > 0.5:
+                        # genuine stall (sleep/resume, camera hiccup): drop this one delta only
                         adx, ady, speed = 0.0, 0.0, 0.0
                     else:
-                        dt = max(min(raw_dt, 0.05), 1e-4)
+                        dt = max(raw_dt, 1e-3)
                         adx = anchor[0] - self.last_anchor[0]
                         ady = anchor[1] - self.last_anchor[1]
                         speed = math.hypot(adx, ady) / dt
@@ -810,6 +815,7 @@ class GestureEngine:
             self.last_anchor_t = None
             self.precision_active = False
 
+        actions.extend(flick_actions)
         return actions
 
     # ---------- internals ----------
@@ -874,9 +880,8 @@ class GestureEngine:
         self.reopen_freeze_until = 0.0
 
         # Shortcut state
-        self._stroke_start = None
-        self._slide_cooldown_until = 0.0
-        self._swipe_cooldown_until = 0.0
+        self._palm_hist = []
+        self._shortcut_cooldown_until = 0.0
 
     def _clear_motion(self):
         self.two_since = None
@@ -888,7 +893,7 @@ class GestureEngine:
         self.last_anchor_t = None
         self.precision_active = False
         self.clutched = False
-        self._stroke_start = None
+        self._palm_hist = []
 
     def _end_pinch(self, actions):
         if self.dragging:
