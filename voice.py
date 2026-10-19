@@ -834,6 +834,33 @@ def _warm_piper_cache(voice):
                 print(f"[voice] Failed to pre-render phrase '{phrase}': {exc}")
 
 
+_PIPER_INTRA_OP_THREADS = 2  # chosen by measurement: 1 thread is ~1.3x slower first-sentence, MediaPipe p99 equal
+
+
+def _load_piper_limited(model_path, config_path):
+    """
+    Build a PiperVoice whose ONNX session is thread-limited and non-spinning.
+    PiperVoice.load() uses default SessionOptions (all cores, spin-waiting), which starves the
+    MediaPipe hand-tracking loop while JARVIS speaks. PiperVoice accepts a ready session, so we
+    construct it directly with the arguments load() would use.
+    """
+    import json
+    from pathlib import Path
+    import onnxruntime
+    from piper import PiperVoice
+    from piper.config import PiperConfig
+
+    with open(config_path, "r", encoding="utf-8") as fh:
+        config = PiperConfig.from_dict(json.load(fh))
+    so = onnxruntime.SessionOptions()
+    so.intra_op_num_threads = _PIPER_INTRA_OP_THREADS
+    so.inter_op_num_threads = 1
+    so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    so.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    session = onnxruntime.InferenceSession(str(model_path), sess_options=so, providers=["CPUExecutionProvider"])
+    return PiperVoice(config=config, session=session, download_dir=Path.cwd())
+
+
 def get_shared_piper(model_path: str, config_path: str):
     """
     Returns the warm, process-wide PiperVoice instance.
@@ -849,9 +876,8 @@ def get_shared_piper(model_path: str, config_path: str):
 
         if os.path.exists(model_path) and os.path.exists(config_path):
             try:
-                from piper import PiperVoice
                 print(f"[voice] Loading Paul Bettany J.A.R.V.I.S. neural voice ({os.path.basename(model_path)})...")
-                voice = PiperVoice.load(model_path, config_path=config_path)
+                voice = _load_piper_limited(model_path, config_path)
                 _SHARED_PIPER_VOICE = voice
                 _SHARED_PIPER_PATH = model_path
                 print("[voice] Paul Bettany voice model loaded.")
