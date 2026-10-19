@@ -22,7 +22,7 @@ import time
 from typing import Optional
 
 from PySide6.QtCore import (
-    Qt, QTimer, QRectF, QPointF, QSize, Signal, QObject
+    Qt, QTimer, QRectF, QPointF, QSize, Signal, QObject, QRect, QPoint
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QIcon, QLinearGradient,
@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QLabel, QComboBox, QLineEdit, QFileDialog,
     QSizePolicy, QProgressBar, QListWidget, QListWidgetItem, QMenu,
     QApplication, QAbstractItemView, QTableWidget, QTableWidgetItem, QInputDialog,
-    QPushButton, QColorDialog
+    QPushButton, QColorDialog, QLayout
 )
 
 from ui.tokens import T, TYPE, COLOR, SPACING, RADIUS, SIZES, qfont
@@ -113,6 +113,7 @@ _TILE_COLORS = {
     "Voice":    "#AF52DE",
     "AI":       "#FF9F0A",
     "Display":  "#FF453A",
+    "Commands": "#0E7C9E",
     "About":    "#5E5CE6",
 }
 
@@ -122,6 +123,7 @@ _SIDEBAR_SECTIONS = [
     ("Tracking", ["Gestures", "Pointer"]),
     ("Voice",    ["Voice", "AI"]),
     ("Display",  ["Display"]),
+    ("Commands", ["Commands"]),
     ("About",    ["About"]),
 ]
 _SIDEBAR_LABELS = {
@@ -131,6 +133,7 @@ _SIDEBAR_LABELS = {
     "Voice":    "Voice",
     "AI":       "AI & Intelligence",
     "Display":  "Display",
+    "Commands": "Commands",
     "About":    "About",
 }
 _SIDEBAR_ICONS = {
@@ -140,11 +143,12 @@ _SIDEBAR_ICONS = {
     "Voice":    "V",
     "AI":       "A",
     "Display":  "D",
+    "Commands": "C",
     "About":    "I",
 }
 
 # Flat ordered list of category IDs (matches stack widget order)
-_CATEGORIES = ["General", "Gestures", "Pointer", "Voice", "AI", "Display", "About"]
+_CATEGORIES = ["General", "Gestures", "Pointer", "Voice", "AI", "Display", "Commands", "About"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -376,6 +380,11 @@ def _draw_tile_icon(p: QPainter, cid: str, tx: float, ty: float, size: float) ->
         p.drawRoundedRect(QRectF(cx - 6.0, cy - 5.5, 12.0, 8.0), 1.5, 1.5)
         p.drawLine(QPointF(cx, cy + 2.5), QPointF(cx, cy + 5.5))
         p.drawLine(QPointF(cx - 3.5, cy + 5.5), QPointF(cx + 3.5, cy + 5.5))
+
+    elif cid == "Commands":
+        for i in (-4.2, 0.0, 4.2):
+            p.drawPoint(QPointF(cx - 5.0, cy + i))
+            p.drawLine(QPointF(cx - 2.4, cy + i), QPointF(cx + 6.0, cy + i))
 
     elif cid == "About":
         p.drawEllipse(QPointF(cx, cy), 5.8, 5.8)
@@ -767,6 +776,300 @@ class _RoutinesListWidget(QWidget):
 # Main Settings Window
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Commands page widgets (filter capsules, command rows)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _Flow(QLayout):
+    """Wrapping left-to-right layout (used for the quoted example chips)."""
+
+    def __init__(self, parent: Optional[QWidget] = None, hspace: int = 6, vspace: int = 6):
+        super().__init__(parent)
+        self._items: list = []
+        self._h = hspace
+        self._v = vspace
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, i: int):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i: int):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, w: int) -> int:
+        return self._do(QRect(0, 0, w, 0), True)
+
+    def setGeometry(self, rect) -> None:
+        super().setGeometry(rect)
+        self._do(rect, False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        s = QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do(self, rect, test: bool) -> int:
+        m = self.contentsMargins()
+        r = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = r.x(), r.y(), 0
+        for it in self._items:
+            sz = it.sizeHint()
+            if x + sz.width() > r.right() + 1 and line_h > 0:
+                x = r.x()
+                y += line_h + self._v
+                line_h = 0
+            if not test:
+                it.setGeometry(QRect(QPoint(x, y), sz))
+            x += sz.width() + self._h
+            line_h = max(line_h, sz.height())
+        return y + line_h - rect.y() + m.bottom()
+
+
+class _Chip(QWidget):
+    """Small painted capsule: quoted example (kind="quote") or the 'Needs AI' tag (kind="ai")."""
+
+    def __init__(self, text: str, kind: str = "quote", parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._text = text
+        self._kind = kind
+        self._font = qfont(TYPE.caption_1)
+        if kind == "ai":
+            self._font.setWeight(QFont.Weight.DemiBold)
+        fm = QFontMetrics(self._font)
+        self._w = fm.horizontalAdvance(text) + 18
+        self._h = fm.height() + 6
+        self.setFixedSize(self._w, self._h)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._w, self._h)
+
+    def paintEvent(self, event) -> None:
+        dark = T.is_dark()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        if self._kind == "ai":
+            p.setBrush(glass.solid_fill_for_white(QColor(T.color.accent.resolve(dark))))
+            p.setPen(Qt.PenStyle.NoPen)
+            fg = QColor("#FFFFFF")
+        else:
+            p.setBrush(QColor(255, 255, 255, 22) if dark else QColor(0, 0, 0, 14))
+            p.setPen(QPen(QColor(255, 255, 255, 36) if dark else QColor(0, 0, 0, 26), 1.0))
+            fg = glass.label_color("label", dark)
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        p.setPen(fg)
+        p.setFont(self._font)
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self._text)
+
+
+class _HandGlyph(QWidget):
+    """Tiny open-hand glyph marking gesture commands."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setFixedSize(20, 20)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(glass.label_color("secondary_label", T.is_dark()), 1.4,
+                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i, top in enumerate((4.0, 2.0, 2.5, 4.5)):             # four fingers
+            x = 6.0 + i * 2.7
+            p.drawLine(QPointF(x, 10.0), QPointF(x, top + 1.0))
+        path = QPainterPath()                                       # palm
+        path.moveTo(5.0, 10.0)
+        path.lineTo(5.0, 12.0)
+        path.cubicTo(5.0, 17.5, 8.0, 18.0, 11.0, 18.0)
+        path.cubicTo(14.5, 18.0, 16.0, 15.5, 16.0, 12.0)
+        path.lineTo(16.0, 10.0)
+        p.drawPath(path)
+        p.drawLine(QPointF(5.0, 11.0), QPointF(2.8, 8.0))           # thumb
+
+
+class _FilterCapsule(QWidget):
+    """Filter capsule with a count badge. Exactly one is active at a time (managed by the page)."""
+    clicked = Signal(str)
+
+    def __init__(self, key: str, label: str, count: int, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.key = key
+        self._label = label
+        self._count = count
+        self._active = False
+        self._hover = False
+        self._font = qfont(TYPE.subheadline)
+        self._font.setWeight(QFont.Weight.DemiBold)
+        self._bfont = qfont(TYPE.caption_2)
+        self._bfont.setWeight(QFont.Weight.DemiBold)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setFixedHeight(30)
+        self._relayout()
+
+    def _relayout(self) -> None:
+        self._tw = QFontMetrics(self._font).horizontalAdvance(self._label)
+        self._bw = max(18, QFontMetrics(self._bfont).horizontalAdvance(str(self._count)) + 10)
+        self.setFixedWidth(14 + self._tw + 7 + self._bw + 6)
+        self.update()
+
+    def set_count(self, n: int) -> None:
+        if n != self._count:
+            self._count = n
+            self._relayout()
+
+    def set_active(self, v: bool) -> None:
+        if v != self._active:
+            self._active = v
+            self.update()
+
+    def enterEvent(self, e) -> None:
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e) -> None:
+        self._hover = False
+        self.update()
+
+    def mouseReleaseEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit(self.key)
+
+    def keyPressEvent(self, e) -> None:
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit(self.key)
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, event) -> None:
+        dark = T.is_dark()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        rad = r.height() / 2
+        if self._active:
+            p.setBrush(glass.solid_fill_for_white(QColor(T.color.accent.resolve(dark))))
+            p.setPen(Qt.PenStyle.NoPen)
+            fg = QColor("#FFFFFF")
+            badge_bg, badge_fg = QColor(255, 255, 255, 56), QColor("#FFFFFF")
+        else:
+            a = 40 if self._hover else 26
+            p.setBrush(QColor(255, 255, 255, a) if dark else QColor(0, 0, 0, a // 2 + 4))
+            p.setPen(QPen(QColor(255, 255, 255, 40) if dark else QColor(0, 0, 0, 30), 1.0))
+            fg = glass.label_color("label", dark)
+            badge_bg = QColor(255, 255, 255, 30) if dark else QColor(0, 0, 0, 22)
+            badge_fg = glass.label_color("secondary_label", dark)
+        p.drawRoundedRect(r, rad, rad)
+        p.setPen(fg)
+        p.setFont(self._font)
+        p.drawText(QRectF(14, 0, self._tw + 2, self.height()),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._label)
+        bx = 14 + self._tw + 7
+        br = QRectF(bx, (self.height() - 18) / 2, self._bw, 18)
+        p.setBrush(badge_bg)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(br, 9, 9)
+        p.setPen(badge_fg)
+        p.setFont(self._bfont)
+        p.drawText(br, Qt.AlignmentFlag.AlignCenter, str(self._count))
+
+
+class _CommandRow(QWidget):
+    """One command: semibold title, quoted example chips (or hand glyph), secondary description."""
+
+    def __init__(self, spec, dark: bool, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.spec = spec
+        self.category = str(getattr(spec, "category", ""))
+        self._divider = False
+        title = str(getattr(spec, "title", ""))
+        examples = tuple(getattr(spec, "examples", ()) or ())
+        desc = str(getattr(spec, "description", "") or "")
+        self.haystack = " ".join([title, *examples, desc]).lower()
+        is_gesture = getattr(spec, "kind", "voice") == "gesture"
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 10, 0, 10)
+        v.setSpacing(5)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        lbl = QLabel(title, self)
+        f = qfont(TYPE.body)
+        f.setWeight(QFont.Weight.DemiBold)
+        lbl.setFont(f)
+        lbl.setStyleSheet(f"color: {glass.label_color('label', dark).name()};")
+        head.addWidget(lbl)
+        if bool(getattr(spec, "requires_ai", False)):
+            head.addWidget(_Chip("Needs AI", "ai", self))
+        head.addStretch()
+        v.addLayout(head)
+
+        if is_gesture:
+            line = QHBoxLayout()
+            line.setSpacing(6)
+            line.addWidget(_HandGlyph(self))
+            if examples:
+                ex = QLabel("  ·  ".join(examples), self)
+                ex.setFont(qfont(TYPE.footnote))
+                ex.setWordWrap(True)
+                ex.setStyleSheet(f"color: {glass.label_color('label', dark).name()};")
+                line.addWidget(ex, stretch=1)
+            else:
+                line.addStretch()
+            v.addLayout(line)
+        elif examples:
+            flow = _Flow(hspace=6, vspace=6)
+            for e in examples:
+                flow.addWidget(_Chip("“" + e + "”", "quote", self))
+            v.addLayout(flow)
+
+        if desc:
+            d = QLabel(desc, self)
+            d.setFont(qfont(TYPE.footnote))
+            d.setWordWrap(True)
+            d.setStyleSheet(f"color: {glass.label_color('secondary_label', dark).name()};")
+            v.addWidget(d)
+
+    def set_divider(self, on: bool) -> None:
+        if on != self._divider:
+            self._divider = on
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        if self._divider:
+            p = QPainter(self)
+            p.fillRect(0, 0, self.width(), 1,
+                       QColor(255, 255, 255, 20) if T.is_dark() else QColor(0, 0, 0, 20))
+
+
+class _HScroll(QScrollArea):
+    """Horizontal strip: no scrollbars, wheel scrolls sideways."""
+
+    def wheelEvent(self, e) -> None:
+        bar = self.horizontalScrollBar()
+        d = e.angleDelta()
+        bar.setValue(bar.value() - (d.x() or d.y()))
+        e.accept()
+
+
 class SettingsWindow(QDialog):
     """
     Apple HIG System Settings window.
@@ -845,6 +1148,7 @@ class SettingsWindow(QDialog):
         self._build_voice_page()
         self._build_ai_page()
         self._build_display_page()
+        self._build_commands_page()
         self._build_about_page()
 
         # Theme polling timer (live Windows theme detection every 2 s)
@@ -1960,6 +2264,21 @@ class SettingsWindow(QDialog):
                             "While media is playing, show the track in the compact island instead of the clock",
                             self.now_playing_pill_switch)
 
+        self.lyrics_switch = AppleSwitch(bool(getattr(self.cfg, "island_lyrics_enabled", False)))
+        self.sw_lyrics = self.lyrics_switch
+        self.lyrics_switch.toggled.connect(self._on_lyrics_toggled)
+        island_card.add_row("Show Lyrics",
+                            "Synced lyrics from LRCLIB (free online service); shows the current line in the media card",
+                            self.lyrics_switch)
+
+        self.lyrics_pill_switch = AppleSwitch(bool(getattr(self.cfg, "island_lyrics_in_pill", True)))
+        self.sw_lyrics_pill = self.lyrics_pill_switch
+        self.lyrics_pill_switch.toggled.connect(lambda v: self._save("island_lyrics_in_pill", v))
+        island_card.add_row("Lyrics in Compact Pill",
+                            "While music plays, the idle pill shows the current lyric line",
+                            self.lyrics_pill_switch)
+        self.lyrics_pill_switch.setEnabled(self.lyrics_switch.isChecked())
+
         # 4. 12/24 h Format
         self.clock_format_control = SegmentedControl([
             ("auto", "Auto"),
@@ -2378,6 +2697,147 @@ class SettingsWindow(QDialog):
         layout.addStretch()
         self._stack.addWidget(page)
 
+    def _build_commands_page(self) -> None:
+        page, layout = make_scroll_page("Commands", "Everything J.A.R.V.I.S. can do by voice or gesture")
+        dark = self._dark
+        self._cmd_page = page
+        self._cmd_rows: list = []
+        self._cmd_groups: dict = {}
+        self._cmd_caps: dict = {}
+        self._cmd_filter = "All"
+
+        try:
+            from command_catalog import get_catalog, CATEGORIES
+            specs = list(get_catalog())
+            cats = [str(c) for c in CATEGORIES]
+        except Exception:
+            specs, cats = [], []
+
+        def _empty(text: str) -> None:
+            lbl = QLabel(text)
+            lbl.setFont(qfont(TYPE.callout))
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setContentsMargins(0, SPACING.xl, 0, SPACING.xl)
+            lbl.setStyleSheet(f"color: {glass.label_color('secondary_label', dark).name()};")
+            layout.addWidget(lbl)
+
+        if not specs:
+            self._cmd_search = None
+            _empty("Command list unavailable")
+            layout.addStretch()
+            self._stack.addWidget(page)
+            return
+
+        for s in specs:                                   # categories missing from CATEGORIES still show up
+            c = str(getattr(s, "category", ""))
+            if c not in cats:
+                cats.append(c)
+        cats = [c for c in cats if any(str(getattr(s, "category", "")) == c for s in specs)]
+
+        # Search
+        self._cmd_search = SidebarSearchField("Search commands", page)
+        self._cmd_search.setFixedHeight(32)
+        self._cmd_search.textChanged.connect(lambda _t: self._apply_cmd_filter())
+        layout.addWidget(self._cmd_search)
+
+        # Filter capsules (horizontal strip)
+        strip = _HScroll()
+        strip.setWidgetResizable(True)
+        strip.setFrameShape(QFrame.Shape.NoFrame)
+        strip.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        strip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        strip.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        strip.setFixedHeight(40)
+        holder = QWidget()
+        holder.setStyleSheet("background: transparent;")
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 4, 0, 4)
+        hl.setSpacing(8)
+        for key in ["All"] + cats:
+            n = len(specs) if key == "All" else sum(1 for s in specs if str(getattr(s, "category", "")) == key)
+            cap = _FilterCapsule(key, key, n, holder)
+            cap.clicked.connect(self._on_cmd_filter)
+            hl.addWidget(cap)
+            self._cmd_caps[key] = cap
+        hl.addStretch()
+        strip.setWidget(holder)
+        layout.addWidget(strip)
+
+        # Grouped cards, built once; filtering only toggles visibility
+        for cat in cats:
+            hdr = QLabel(cat.upper())
+            hdr.setFont(qfont(TYPE.caption_2))
+            hdr.setContentsMargins(SPACING.xs, SPACING.sm, 0, 0)
+            hdr.setProperty("role", "section_header")
+            card = GroupedCard()
+            rows = []
+            for s in specs:
+                if str(getattr(s, "category", "")) == cat:
+                    row = _CommandRow(s, dark)
+                    card.add_widget(row, divider=False)
+                    rows.append(row)
+                    self._cmd_rows.append(row)
+            layout.addWidget(hdr)
+            layout.addWidget(card)
+            self._cmd_groups[cat] = (hdr, card, rows)
+
+        self._cmd_empty = QLabel("No matching commands")
+        self._cmd_empty.setFont(qfont(TYPE.callout))
+        self._cmd_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cmd_empty.setContentsMargins(0, SPACING.xl, 0, SPACING.xl)
+        self._cmd_empty.setStyleSheet(f"color: {glass.label_color('secondary_label', dark).name()};")
+        self._cmd_empty.setVisible(False)
+        layout.addWidget(self._cmd_empty)
+
+        layout.addStretch()
+        self._cmd_caps["All"].set_active(True)
+        self._apply_cmd_filter()
+        self._stack.addWidget(page)
+
+    def _on_cmd_filter(self, key: str) -> None:
+        self._cmd_filter = key
+        for k, cap in self._cmd_caps.items():
+            cap.set_active(k == key)
+        self._apply_cmd_filter()
+
+    def _apply_cmd_filter(self) -> None:
+        if not getattr(self, "_cmd_groups", None):
+            return
+        query = self._cmd_search.text().strip().lower() if self._cmd_search is not None else ""
+        words = query.split()
+        sel = self._cmd_filter
+        counts = {cat: 0 for cat in self._cmd_groups}
+        total_match = 0
+        shown = 0
+        page = getattr(self, "_cmd_page", None)
+        if page is not None:
+            page.setUpdatesEnabled(False)
+        try:
+            for cat, (hdr, card, rows) in self._cmd_groups.items():
+                first = True
+                for row in rows:
+                    match = all(w in row.haystack for w in words)
+                    if match:
+                        counts[cat] += 1
+                    vis = match and sel in ("All", cat)
+                    if row.isVisibleTo(card) != vis:
+                        row.setVisible(vis)
+                    if vis:
+                        row.set_divider(not first)
+                        first = False
+                        shown += 1
+                gv = sel in ("All", cat) and counts[cat] > 0
+                hdr.setVisible(gv)
+                card.setVisible(gv)
+                total_match += counts[cat]
+        finally:
+            if page is not None:
+                page.setUpdatesEnabled(True)
+        for cat, n in counts.items():
+            self._cmd_caps[cat].set_count(n)
+        self._cmd_caps["All"].set_count(total_match)
+        self._cmd_empty.setVisible(shown == 0)
+
     def _build_about_page(self) -> None:
         page, layout = make_scroll_page("About", "J.A.R.V.I.S. system information")
 
@@ -2465,6 +2925,10 @@ class SettingsWindow(QDialog):
         self._stack.addWidget(page)
 
     # ── Event handlers ────────────────────────────────────────────────────
+
+    def _on_lyrics_toggled(self, on: bool) -> None:
+        self._save("island_lyrics_enabled", bool(on))
+        self.lyrics_pill_switch.setEnabled(bool(on))
 
     def _on_mic_selected(self, combo_idx: int) -> None:
         dev = self.mic_combo.itemData(combo_idx)
