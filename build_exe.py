@@ -37,6 +37,8 @@ def build():
         "--hidden-import", "scipy.signal",
         "--hidden-import", "psutil",
         "--hidden-import", "pynvml",
+        "--hidden-import", "aec_audio_processing",
+        "--hidden-import", "pyaudiowpatch",
         "--hidden-import", "PIL",
         "--hidden-import", "PIL.Image",
         "--hidden-import", "pycaw",
