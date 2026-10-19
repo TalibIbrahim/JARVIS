@@ -1259,7 +1259,7 @@ class AppleDynamicIsland(
                     self.last_type_time = now
 
         # Media playback progress simulation & visualizer bars
-        if self.media_playing:
+        if self.media_playing and not self._dragging_scrubber:
             self.media_position_sec = min(self.media_duration_sec, self.media_position_sec + dt)
             self.media_progress = self.media_position_sec / max(1.0, self.media_duration_sec)
             for i in range(4):
@@ -1657,7 +1657,10 @@ class AppleDynamicIsland(
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        was_dragging = getattr(self, "_dragging_scrubber", False)
         self._dragging_scrubber = False
+        if was_dragging and event.button() == Qt.MouseButton.LeftButton and self.media_duration_sec > 0:
+            self.media_seek(self.media_progress)   # press/drag only move the knob; the seek happens on release
         super().mouseReleaseEvent(event)
 
     def _button_at(self, pos: QPointF | QPoint) -> Optional[str]:

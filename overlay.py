@@ -3164,9 +3164,10 @@ class Overlay:
                         if "album" in d: self.island.media_album = str(d["album"])
                         if "playing" in d: self.island.media_playing = bool(d["playing"])
                         if "active" in d: self.island.media_active = bool(d["active"])
-                        if "progress" in d: self.island.media_progress = float(d["progress"])
+                        dragging = getattr(self.island, "_dragging_scrubber", False)   # the user owns the knob mid-drag
+                        if "progress" in d and not dragging: self.island.media_progress = float(d["progress"])
                         if "duration" in d: self.island.media_duration_sec = float(d["duration"])
-                        if "position" in d: self.island.media_position_sec = float(d["position"])
+                        if "position" in d and not dragging: self.island.media_position_sec = float(d["position"])
                         if "source" in d: self.island.media_source = str(d["source"])
                         if "thumbnail_bytes" in d:
                             t_bytes = d["thumbnail_bytes"]
