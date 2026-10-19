@@ -15,8 +15,12 @@
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-27272a?style=for-the-badge" />
   <img alt="Python" src="https://img.shields.io/badge/python-3.12-3b82f6?style=for-the-badge" />
   <img alt="UI" src="https://img.shields.io/badge/UI-PySide6%2060fps-10b981?style=for-the-badge" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-458%20passed-brightgreen?style=for-the-badge" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-786%20passed-brightgreen?style=for-the-badge" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-27272a?style=for-the-badge" />
+</p>
+
+<p align="center">
+  <img src="assets/readme/hero.png" alt="J.A.R.V.I.S. Dynamic Island: compact pill, media, calendar, weather and hardware cards" width="900" />
 </p>
 
 <p align="center">
@@ -73,6 +77,23 @@ J.A.R.V.I.S. v2.0.0 is a massive architectural evolution that transforms JARVIS 
 
 Built entirely with native PySide6 and running at **60 FPS**, the Dynamic Island floats seamlessly at the top center of your primary screen. It combines `WS_EX_TRANSPARENT` for total click-through transparency during idle states with bounded interactive windows (`WS_EX_NOACTIVATE`) when expanded—ensuring focus is never stolen from your games, IDEs, or full-screen apps.
 
+<table>
+  <tr>
+    <td align="center"><img src="assets/readme/island_media.png" alt="Now Playing card" width="420" /><br><sub>Now Playing (album-art tint)</sub></td>
+    <td align="center"><img src="assets/readme/island_calendar.png" alt="Calendar card" width="420" /><br><sub>Calendar</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/readme/island_weather.png" alt="Weather card" width="420" /><br><sub>Weather</sub></td>
+    <td align="center"><img src="assets/readme/island_hardware.png" alt="Hardware monitor card" width="420" /><br><sub>Hardware Monitor</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/readme/island_jarvis.png" alt="JARVIS status card" width="420" /><br><sub>JARVIS status &amp; tracking control</sub></td>
+    <td align="center"><img src="assets/readme/island_listening.png" alt="Assistant reply" width="380" /><br><br><img src="assets/readme/island_compact.png" alt="Compact pill" width="230" /><br><sub>Assistant reply &middot; compact pill</sub></td>
+  </tr>
+</table>
+
+<p align="center"><img src="assets/readme/island_hardware_strip.png" alt="Hardware strip with tracking FPS" width="520" /><br><sub>Hardware strip with live tracking FPS</sub></p>
+
 ### Island State & Widget Architecture
 
 | State / Widget | Behavior & Visual Presentation |
@@ -93,6 +114,8 @@ Built entirely with native PySide6 and running at **60 FPS**, the Dynamic Island
 ---
 
 ## Settings Control Center (Liquid Glass)
+
+<p align="center"><img src="assets/readme/settings_glass.png" alt="Liquid Glass settings window" width="760" /></p>
 
 J.A.R.V.I.S. v2.0.0 features a completely redesigned, Apple HIG-compliant Settings Window (`ui/settings_window.py`):
 
@@ -134,6 +157,8 @@ Anchored on the rigid **metacarpal knuckles (landmarks 0, 5, 9, 13, 17)** rather
 - **Hover Trigger**: Hovering still within a 14 px radius for 1.0 s triggers a left click.
 - **Translucent Progress Ring**: An Apple visionOS-style translucent glass ring fills around the cursor and pulses on completion.
 - **Radial Action Menu**: Optional mode where hovering reveals an action menu: *Click, Double Click, Right Click, Drag, Scroll*.
+
+<p align="center"><img src="assets/readme/radial_menu.png" alt="Dwell radial menu" width="240" /></p>
 
 ---
 

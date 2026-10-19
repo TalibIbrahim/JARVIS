@@ -117,3 +117,4 @@ tests/diffs/
 
 # Local reference screenshots (user-provided, not project files)
 docs/reference/
+!assets/readme/*.png
