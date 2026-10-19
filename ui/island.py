@@ -368,6 +368,7 @@ class AppleDynamicIsland(
 
     def reload_config(self) -> None:
         """Live apply settings without restart."""
+        self._dirty = True                      # repaint even if the paint gating would skip
         self.dark_mode, _ = self._read_theme()
         self._icon_cache.clear()
         self._cached_calendar_data = None
@@ -1336,7 +1337,7 @@ class AppleDynamicIsland(
             or self.media_playing
             or (state == IslandState.CARD_MEDIA and any(abs(b - 0.15) > 0.01 for b in self._media_bars))
             or (state in (IslandState.CARD_TIMER, IslandState.IDLE) and self.timer_active and not getattr(self, "timer_paused", False))
-            or (state == IslandState.TRACKING and self.active and self.landmarks)
+            or (state == IslandState.TRACKING and self.active and self._tracking_visual_changed())
             or (self.disambiguate_active and bool(self.disambiguate_candidates))
             or getattr(self, "_dirty", False)
         )
@@ -1367,6 +1368,7 @@ class AppleDynamicIsland(
         )
 
         if needs_repaint:
+            self._last_activity_t = time.monotonic()      # read by Overlay's idle-gated settings prewarm
             self.update()
             self._last_rendered_state = state
             self._last_rendered_dark = self.dark_mode
@@ -1374,6 +1376,27 @@ class AppleDynamicIsland(
 
         self._prev_springs_active = springs_active
         self._prev_is_hovering = getattr(self, "_is_hovering", False)
+
+    def _tracking_visual_changed(self) -> bool:
+        """True when the mini skeleton would draw differently since the last check.
+
+        Landmarks arrive at ~20 Hz while the tick runs at ~60 Hz; the skeleton only draws the
+        wrist/fingertip rays and the index tip of the first hand, so that is the token."""
+        lms = self.landmarks
+        tok = ()
+        if lms:
+            try:
+                hand = lms[0]
+                tok = (len(lms), len(hand),
+                       tuple((hand[i][0], hand[i][1]) for i in (0, 4, 8, 12, 16, 20) if i < len(hand)))
+            except Exception:
+                tok = None
+        if tok is None:
+            return True                         # unexpected shape: keep the old always-repaint behaviour
+        if tok == getattr(self, "_last_tracking_tok", None):
+            return False
+        self._last_tracking_tok = tok
+        return True
 
     def _update_wave_bars(self, now: float) -> None:
         live_vol = 0.0
