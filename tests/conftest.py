@@ -38,6 +38,18 @@ def pytest_addoption(parser):
     )
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "benchmark: latency/throughput benchmarks with thresholds (run alone with -m benchmark)")
+
+
+def pytest_collection_modifyitems(config, items):
+    """The System 1 decide p99 test lives in test_decision_benchmark.py; tag it instead of duplicating it."""
+    for item in items:
+        if item.nodeid.split("::")[0].endswith("test_decision_benchmark.py"):
+            item.add_marker(pytest.mark.benchmark)
+
+
 @pytest.fixture(scope="session")
 def generate_goldens_flag(pytestconfig):
     """Returns True if --generate-goldens was passed or GENERATE_GOLDENS=1 is in env."""
