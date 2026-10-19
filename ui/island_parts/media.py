@@ -20,7 +20,7 @@ from typing import Optional
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetricsF, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
-    QRadialGradient, QStaticText, QTransform,
+    QRadialGradient, QStaticText, QTextLayout, QTextOption, QTransform,
 )
 
 from ui.tokens import ISLAND, TYPE, COLOR, qfont
@@ -236,7 +236,7 @@ class LyricsState:
     """One track's lyrics plus the per-line caches and animation clock. Replaced wholesale on every
     lyrics_state event; never touched off the GUI thread."""
     __slots__ = ("track_key", "times", "texts", "plain_first", "instrumental", "status",
-                 "idx", "prev_idx", "change_t", "line_t0", "animate", "tick_t", "nf_t0", "cache", "widths")
+                 "idx", "prev_idx", "change_t", "line_t0", "animate", "tick_t", "nf_t0", "cache")
 
     def __init__(self, track_key="", synced=None, plain=None, instrumental=False, status="ok"):
         self.track_key = str(track_key or "")
@@ -266,7 +266,6 @@ class LyricsState:
         self.tick_t = -1e9
         self.nf_t0: Optional[float] = None
         self.cache: dict = {}                    # (kind, text) -> (QStaticText, ascent): one layout per line
-        self.widths: dict = {}                   # line index -> advance width (pill marquee)
 
     @property
     def synced(self) -> bool:
@@ -630,69 +629,86 @@ class MediaPageMixin:
 
     # ── lyrics: compact pill line ────────────────────────────────────────────
 
-    def _ly_fade_brush(self, x: float, avail: float, fade_l: float, fade_r: float, color: QColor) -> QBrush:
-        """Cached horizontal gradient: transparent -> colour over fade_l at the left, colour -> transparent over
-        fade_r at the right (px, quantised to 1 px). No per-frame allocation once warm."""
-        fl = int(round(fade_l))
-        fade_r = float(int(max(0.0, fade_r)))
-        key = (round(x, 1), round(avail, 1), fl, int(fade_r), color.rgba())
-        cache = self.__dict__.setdefault("_ly_fade_cache", {})
-        br = cache.get(key)
-        if br is None:
-            if len(cache) > 96:
-                cache.clear()
-            g = QLinearGradient(x, 0.0, x + avail, 0.0)
-            clear = QColor(color)
-            clear.setAlpha(0)
-            if fl > 0:
-                g.setColorAt(0.0, clear)
-                g.setColorAt(min(0.49, fl / avail), color)
-            else:
-                g.setColorAt(0.0, color)
-            g.setColorAt(max(0.51, 1.0 - fade_r / avail), color)
-            g.setColorAt(1.0, clear)
-            br = QBrush(g)
-            cache[key] = br
-        return br
+    def _ly_pill_layout(self, st: LyricsState, text: str, avail: float, k: float) -> tuple:
+        """((QStaticText, ...) one per line, ascent, font height) for `text` word-wrapped to `avail` logical px on at
+        most pill_max_lines lines, the end of the last line elided with an ellipsis. Cached per (text, width, dpr*scale)."""
+        key = ("pw", text, int(avail * 10), int(k * 100))
+        hit = st.cache.get(key)
+        if hit is None:
+            font, fm = _ly_font(_LY.pill_font)
+            lines = []
+            tl = QTextLayout(text, font)
+            opt = QTextOption()
+            opt.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+            tl.setTextOption(opt)
+            tl.beginLayout()
+            while True:
+                ln = tl.createLine()
+                if not ln.isValid():
+                    break
+                ln.setLineWidth(avail)
+                if len(lines) == _LY.pill_max_lines - 1:
+                    rest = text[ln.textStart():]                      # last allowed line: take everything left, elide
+                    lines.append(fm.elidedText(rest, Qt.TextElideMode.ElideRight, avail) if fm.horizontalAdvance(rest) > avail else rest.rstrip())
+                    break
+                lines.append(text[ln.textStart():ln.textStart() + ln.textLength()].rstrip())
+            tl.endLayout()
+            xf = QTransform.fromScale(k, k)
+            statics = []
+            for ln_text in lines or [""]:
+                sx = QStaticText(ln_text)
+                sx.prepare(xf, font)
+                statics.append(sx)
+            if len(st.cache) > 64:
+                st.cache.clear()
+            hit = (tuple(statics), fm.ascent(), fm.height())
+            st.cache[key] = hit
+        return hit
 
     def _draw_lyrics_pill(self, p: QPainter, st: LyricsState, w: float, h: float, cy: float,
                           now: float, color: QColor) -> None:
-        """Current lyric line in the compact media pill: still when it fits, else it scrolls once to its end and
-        holds; crossfades on line change. Called only when _lyrics_pill_active() returned `st`."""
-        x = _LY.pill_x
-        avail = w - x - _LY.pill_right_pad
-        font, fm = _ly_font(_LY.pill_font)
-        e = self._lyrics_anim(st, now)
-        base_y = cy + fm.capHeight() / 2.0 - 0.5
-        reduce = self._reduce_motion()
+        """Tall lyrics pill content in logical (1x) coordinates: art thumb, word-wrapped current line (max 2 lines,
+        no scrolling), crossfading with a small upward slide on line change. Bars and dot are drawn by the caller."""
+        L = _LY
+        hp = max(0.0, min(1.0, (h - 32.0) / (L.pill_h - 32.0)))          # morph progress from the normal pill
+        ts = 20.0 + (L.pill_thumb - 20.0) * hp
+        tx = 8.0 + (L.pill_thumb_x - 8.0) * hp
+        ty = cy - ts / 2.0
+        path = create_cached_squircle_path(QRectF(tx, ty, ts, ts), 5.0 + (L.pill_thumb_r - 5.0) * hp)
+        art = self._get_album_art(L.pill_thumb * self._get_size_scale())
         p.save()
-        p.setClipRect(QRectF(x, 0.0, avail, h))
+        p.setClipPath(path)
+        p.drawPixmap(QRectF(tx, ty, ts, ts), art, QRectF(0.0, 0.0, art.width(), art.height()))
+        p.restore()
+        p.strokePath(path, QPen(QColor(255, 255, 255, 40), 1.0))
+
+        a_text = max(0.0, min(1.0, (hp - 0.4) / 0.6))
+        if a_text <= 0.01:
+            return
+        x = L.pill_x
+        avail = L.pill_w - L.pill_x - L.pill_right_pad                  # fixed: the wrap never reflows while morphing
+        k = max(1.0, getattr(self, "_paint_dpr", 1.0)) * self._get_size_scale()
+        font = _ly_font(L.pill_font)[0]
+        e = self._lyrics_anim(st, now)
+        p.save()
+        p.setClipRect(QRectF(x, 0.0, max(0.0, min(avail, w - L.pill_right_pad - x)), h))
         p.setFont(font)
         p.setPen(color)
         op0 = p.opacity()
 
-        def draw(i: int, alpha: float, elapsed: float) -> None:
-            text = self._ly_line(st, i)
-            tw = st.widths.get(i)
-            if tw is None:
-                tw = fm.horizontalAdvance(text)
-                if len(st.widths) > 256:
-                    st.widths.clear()
-                st.widths[i] = tw
-            p.setOpacity(op0 * min(1.0, alpha))
-            if tw <= avail or reduce:
-                sx, asc = self._ly_static(st, "p", text, _LY.pill_font, avail)
-                p.drawStaticText(QPointF(x, base_y - asc), sx)
+        def draw(i: int, alpha: float, dy: float) -> None:
+            if alpha <= 0.01:
                 return
-            sx, asc = self._ly_static(st, "pf", text, _LY.pill_font, 1e6)        # full-width layout, no eliding
-            off = min(tw - avail + 6.0, max(0.0, elapsed - _LY.pill_lead_s) * _LY.pill_speed)
-            p.setPen(QPen(self._ly_fade_brush(x, avail, min(_LY.pill_fade, off), min(_LY.pill_fade, 2.0 * (tw - avail + 6.0 - off)), color), 1.0))
-            p.drawStaticText(QPointF(x - off, base_y - asc), sx)
-            p.setPen(color)
+            statics, asc, fh = self._ly_pill_layout(st, self._ly_line(st, i), avail, k)
+            block = len(statics) * L.pill_line_h
+            top = cy - block / 2.0 + dy
+            p.setOpacity(op0 * min(1.0, alpha) * a_text)
+            for j, sx in enumerate(statics):
+                p.drawStaticText(QPointF(x, top + j * L.pill_line_h + (L.pill_line_h - fh) / 2.0), sx)
 
         if e < 1.0:
-            draw(st.prev_idx, 1.0 - e, 0.0)
-        draw(st.idx, e, now - st.line_t0)
+            draw(st.prev_idx, 1.0 - e, -e * L.pill_slide)
+        draw(st.idx, e, (1.0 - e) * L.pill_slide)
         p.setOpacity(op0)
         p.restore()
 

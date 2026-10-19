@@ -161,26 +161,33 @@ class CompactPillMixin:
 
         if compact_mode == "media":
             # ── Media compact layout ─────────────────────────────────────
-            # Leading side: 20x20 album art thumbnail (rounded squircle)
-            thumb_size = 20.0
-            tx = 8.0
-            ty = cy - thumb_size / 2.0
-            thumb_rect = QRectF(tx, ty, thumb_size, thumb_size)
-            thumb_path = create_cached_squircle_path(thumb_rect, 5.0)
-
-            p.save()
-            p.setClipPath(thumb_path)
-            art = self._get_album_art(thumb_size)
-            p.drawPixmap(QPointF(tx, ty), art)
-            p.restore()
-
-            p.strokePath(thumb_path, QPen(QColor(255, 255, 255, 40), 1.0))
-
-            # Center text: current lyric line (lyrics on + in-pill + synced), else the track title
+            # Lyric line (lyrics on + in-pill + synced) draws the tall pill in logical (1x) coordinates
             ly = self._lyrics_pill_active(now)
             if ly is not None:
+                s = self._get_size_scale()
+                p.save()
+                p.scale(s, s)
+                w, h, cy = w / s, h / s, cy / s
+                dot_cx = w - 14.0
                 self._draw_lyrics_pill(p, ly, w, h, cy, now, ISLAND.color.white)
             else:
+                # Leading side: 20x20 album art thumbnail (rounded squircle)
+                thumb_size = 20.0
+                tx = 8.0
+                ty = cy - thumb_size / 2.0
+                thumb_rect = QRectF(tx, ty, thumb_size, thumb_size)
+                thumb_path = create_cached_squircle_path(thumb_rect, 5.0)
+
+                p.save()
+                p.setClipPath(thumb_path)
+                art = self._get_album_art(thumb_size)
+                p.drawPixmap(QPointF(tx, ty), art)
+                p.restore()
+
+                p.strokePath(thumb_path, QPen(QColor(255, 255, 255, 40), 1.0))
+
+            # Center text: the track title when no lyric line is showing
+            if ly is None:
                 font = qfont(TYPE.caption_1)
                 font.setWeight(QFont.Weight.DemiBold)
                 p.setFont(font)
@@ -211,6 +218,8 @@ class CompactPillMixin:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(dot_col))
             p.drawEllipse(QPointF(dot_cx, cy), dot_r, dot_r)
+            if ly is not None:
+                p.restore()
 
         elif compact_mode == "timer":
             # ── Timer compact layout ─────────────────────────────────────

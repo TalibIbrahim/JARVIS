@@ -795,12 +795,14 @@ class LyricsLayout:
     toggle_cx, toggle_cy, toggle_d, toggle_hit_r = 345.0, 84.0, 18.0, 15.0
     shimmer_w, shimmer_h, shimmer_period = 150.0, 8.0, 1.4
     # compact pill
-    pill_w = 240.0                             # compact media pill width while a lyric line shows (normal: 186)
-    pill_x = 34.0                             # text left (after the 20 px art thumb)
+    pill_w, pill_h = 240.0, 58.0               # compact media pill while a lyric line shows (normal: 186 x 32); a stadium
+    pill_thumb, pill_thumb_x, pill_thumb_r = 34.0, 12.0, 8.0   # album art thumb, vertically centred
+    pill_x = 56.0                              # text left (thumb_x + thumb + 10)
     pill_right_pad = 48.0                      # bars start at w-40: 8 px gap after the text slot
-    pill_fade = 12.0                           # marquee edge fade width (overflowing lines only)
     pill_font = TypeToken(_ISLAND_FONT, 13, 600)
-    pill_speed, pill_lead_s, pill_gap = 30.0, 0.8, 28.0   # marquee px/s, hold before scrolling, loop gap
+    pill_line_h = 16.5                         # word-wrapped onto at most 2 lines, end of line 2 elided
+    pill_max_lines = 2
+    pill_slide = 4.0                           # line change: 180 ms crossfade + this upward slide
 
 
 class CalendarLayout:

@@ -1203,7 +1203,7 @@ class AppleDynamicIsland(
             compact_mode = self._get_current_compact_mode()
             if compact_mode == "media":
                 if self._lyrics_pill_wanted():
-                    return (ISLAND.lyrics.pill_w * scale, 32.0 * scale)
+                    return (ISLAND.lyrics.pill_w * scale, ISLAND.lyrics.pill_h * scale)
                 return (186.0 * scale, 32.0 * scale)
             elif compact_mode == "timer":
                 return (152.0 * scale, 32.0 * scale)
@@ -1902,6 +1902,8 @@ class AppleDynamicIsland(
             tok = 36.0
         elif state == IslandState.IDLE:
             tok = float(RADIUS.compact_pill)
+            if h > 36.5 * scale:                   # taller lyrics pill: stay a full stadium while it morphs
+                tok = max(tok, h / 2.0 / max(0.1, scale))
         else:
             tok = 36.0
         return max(0.0, min(h / 2.0, w / 2.0, tok * scale))
