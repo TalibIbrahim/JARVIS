@@ -1142,8 +1142,11 @@ class WakeWordDetector(threading.Thread):
         sensitivity="balanced",
         followup_window=6.0,
         device_index=None,
+        on_speech_end=None,
     ):
         super().__init__(name="WakeWordDetector", daemon=True)
+        self.on_speech_end = on_speech_end
+        self._was_speaking = False
         self.cfg = cfg  # property: also keeps self.vad.cfg in sync (live mic_energy_threshold)
         self.on_wake = on_wake
         self.on_utterance = on_utterance
@@ -1590,11 +1593,17 @@ class WakeWordDetector(threading.Thread):
 
                     # Suppress wake word if assistant is speaking
                     if Voice.is_speaking:
+                        self._was_speaking = True
                         self.guard.evaluate(0.0, is_speaking=True)
                         pre_roll.clear()
                         continue
 
                     now = time.time()
+                    if self._was_speaking:
+                        # JARVIS just finished speaking: let Voice restore ducked media if the window lapsed.
+                        self._was_speaking = False
+                        if self.on_speech_end:
+                            self.on_speech_end(now)
 
                     # Check if follow-up window expired without speech
                     if self.listening_until > 0.0 and now >= self.listening_until:
@@ -1796,6 +1805,40 @@ class Voice(threading.Thread):
         self.sensitivity = getattr(cfg, "wake_sensitivity", "balanced") if cfg else "balanced"
         self.followup_window = float(getattr(cfg, "wake_followup_window", getattr(cfg, "command_window", 6.0))) if cfg else 6.0
         self.wake_detector = None
+        self._ducked = False
+        self._restore_pending = False
+
+    def _duck_media(self, reason):
+        """Lower other apps' volume so the follow-up is heard. Once per interaction."""
+        self._restore_pending = False
+        if self._ducked or not getattr(self.cfg, "media_duck_on_wake", True):
+            return
+        import audio_ducker
+        if audio_ducker.duck(reason=reason):
+            self._ducked = True
+            _vlog.info("media duck: %s", reason)
+
+    def _restore_media(self, reason, force=False):
+        """Restore volume once the interaction is over; deferred while JARVIS is mid-reply."""
+        if not self._ducked:
+            return
+        if Voice.is_speaking and not force:
+            self._restore_pending = True
+            return
+        import audio_ducker
+        self._ducked = False
+        self._restore_pending = False
+        audio_ducker.restore(reason=reason)
+        _vlog.info("media restore: %s", reason)
+
+    def _on_speech_finished(self, now):
+        """Speaker went idle. If media is still ducked and the follow-up window has expired, restore now
+        instead of waiting for the ducker's 20 s auto-restore."""
+        if not self._ducked:
+            return
+        wd_until = self.wake_detector.listening_until if self.wake_detector else 0.0
+        if now >= self.listening_until and now >= wd_until:
+            self._restore_media("speech_done")
 
     def mic_state(self):
         """("ok"|"reconnecting"|"stalled"|"flatline"|"down", reason) for the supervisor health summary."""
@@ -1844,6 +1887,7 @@ class Voice(threading.Thread):
             self.wake_detector.cfg = self.cfg
 
     def _on_wake_detected(self):
+        self._duck_media("wake_word")
         now = time.time()
         self.listening_until = now + self.followup_window
         if self.wake_detector:
@@ -1878,6 +1922,7 @@ class Voice(threading.Thread):
             self.ctx.say("Yes, sir?")
 
     def _on_no_speech_detected(self):
+        self._restore_media("followup_closed")
         self.listening_until = 0.0
         if self.wake_detector:
             self.wake_detector.listening_until = 0.0
@@ -1923,6 +1968,7 @@ class Voice(threading.Thread):
             jarvis_log.thread_exited("Voice")
         finally:
             self._own_stop.set()
+            self._restore_media("voice_stop", force=True)
 
     def _run_body(self):
         try:
@@ -1961,6 +2007,7 @@ class Voice(threading.Thread):
             on_utterance=self._on_utterance_recorded,
             on_no_speech=self._on_no_speech_detected,
             on_wake_idle=self._on_wake_idle,
+            on_speech_end=self._on_speech_finished,
             stop_event=self._own_stop,
             sensitivity=self.sensitivity,
             followup_window=self.followup_window,
@@ -2225,6 +2272,9 @@ class Voice(threading.Thread):
                     except Exception:
                         pass
                 return
+
+        if matched_alias is not None:
+            self._duck_media("alias_wake" if command else "alias_only")
 
         if not command:
             self.listening_until = now + getattr(self.cfg, "wake_followup_window", getattr(self.cfg, "command_window", 6.0))
