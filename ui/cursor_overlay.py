@@ -196,6 +196,10 @@ class CursorFeedbackOverlay(QWidget):
         # Animate ring scale spring
         self._ring_scale.update(0.016, T.reduce_motion())
 
+        if not self.radial_open:
+            from ui import glass
+            glass.release_radial_backdrop(self)       # drop the disc-shaped mask / blur
+
         sz = 220 if self.radial_open else 160
         if self.width() != sz or self.height() != sz:
             self.resize(sz, sz)
@@ -292,66 +296,6 @@ class CursorFeedbackOverlay(QWidget):
 
     def _draw_radial_menu(self, p: QPainter, cx: float, cy: float,
                           dark: bool, accent: QColor) -> None:
-        sectors = [
-            ("click",       "Click",  0),
-            ("double_click","Double", 1),
-            ("right_click", "Right",  2),
-            ("drag",        "Drag",   3),
-            ("scroll",      "Scroll", 4),
-        ]
-        r_menu   = 65.0
-        n        = len(sectors)
-        arc_step = 360.0 / n
-
-        # Glass disc background
-        g_disc = QRadialGradient(cx, cy, r_menu)
-        if dark:
-            g_disc.setColorAt(0.0, QColor(40, 40, 48, 220))
-            g_disc.setColorAt(1.0, QColor(20, 20, 24, 200))
-        else:
-            g_disc.setColorAt(0.0, QColor(240, 240, 248, 220))
-            g_disc.setColorAt(1.0, QColor(220, 220, 232, 200))
-
-        p.setPen(QPen(QColor(255, 255, 255, 35) if dark else QColor(0, 0, 0, 18), 1.0))
-        p.setBrush(QBrush(g_disc))
-        p.drawEllipse(QPointF(cx, cy), r_menu, r_menu)
-
-        # Inner ring
-        p.setPen(QPen(QColor(255, 255, 255, 20) if dark else QColor(0, 0, 0, 12), 0.8))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(cx, cy), r_menu - 12.0, r_menu - 12.0)
-
-        for sid, label, idx in sectors:
-            ang_deg = idx * arc_step - 90.0
-            ang_rad = math.radians(ang_deg)
-            sx = cx + 44.0 * math.cos(ang_rad)
-            sy = cy + 44.0 * math.sin(ang_rad)
-
-            is_sel = (self.radial_hover == sid)
-
-            if is_sel:
-                # Spring-animated highlight pill
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(accent))
-                p.drawRoundedRect(QRectF(sx - 26, sy - 12, 52, 24), 8.0, 8.0)
-
-                # Arc fill showing sector selection progress (450 ms)
-                if self.radial_prog > 0.01:
-                    prog_pen = QPen(QColor(255, 255, 255, 160), 2.5,
-                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-                    p.setPen(prog_pen)
-                    p.setBrush(Qt.BrushStyle.NoBrush)
-                    arc_r = 20.0
-                    arc_box = QRectF(sx - arc_r, sy - arc_r, arc_r * 2, arc_r * 2)
-                    p.drawArc(arc_box, int(90 * 16), -int(self.radial_prog * 360 * 16))
-
-                text_col = QColor("#FFFFFF")
-            else:
-                text_col = T.color.label.resolve(dark)
-
-            from ui.tokens import qfont, TYPE
-            font = qfont(TYPE.caption_2)
-            font.setWeight(700)
-            p.setFont(font)
-            p.setPen(text_col)
-            p.drawText(QRectF(sx - 26, sy - 11, 52, 22), Qt.AlignmentFlag.AlignCenter, label)
+        """Liquid-glass radial menu (painter lives in ui.glass; spring-morphed selection capsule)."""
+        from ui import glass
+        glass.paint_radial_menu(self, p, cx, cy, dark, accent)

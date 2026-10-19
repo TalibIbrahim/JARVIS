@@ -103,6 +103,7 @@ if PYSIDE6_AVAILABLE:
             AppleSwitch, SegmentedControl, GroupedCard, Spring as _UISpring
         )
         from ui.tokens import T as _T
+        from ui import glass as _glass          # Liquid Glass material (radial menu, tooltips, Settings)
         _NEW_UI_AVAILABLE = True
     except Exception as _ui_import_err:
         print(f"[overlay] ui/ subpackage not loaded: {_ui_import_err}")
@@ -140,6 +141,18 @@ def apply_glass_backdrop(hwnd, dark=True):
     """
     if sys.platform != "win32":
         return False
+
+    # Windows "Transparency effects" OFF => solid surface, never blur (also not via the Win10 accent path)
+    try:
+        import winreg
+        _k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        _on = winreg.QueryValueEx(_k, "EnableTransparency")[0]
+        winreg.CloseKey(_k)
+        if not _on:
+            return False
+    except Exception:
+        pass
 
     # 1. Windows 11 DwmSetWindowAttribute (Build >= 22000)
     try:
@@ -1077,6 +1090,9 @@ class CursorFeedbackOverlay(QWidget):
 
         # 4. Radial Action Menu (when Dwell radial menu is open)
         if self.radial_open:
+            if _NEW_UI_AVAILABLE:
+                _glass.paint_radial_menu(self, p, cx, cy, self.dark_mode, accent)     # Liquid Glass radial
+                return
             sectors = [
                 ("click", "Click", 0),
                 ("double_click", "Double", 1),
@@ -2373,10 +2389,6 @@ class SettingsWindow(QDialog):
         theme_ctrl.valueChanged.connect(lambda v: self._save("theme_mode", v))
         card.add_row("Appearance Theme", "Follows Windows accent and mode", theme_ctrl)
 
-        sw_blur = AppleSwitch(getattr(self.cfg, "glass_blur", True))
-        sw_blur.toggled.connect(lambda v: self._save("glass_blur", v))
-        card.add_row("Windows Glass Backdrop", "Hardware Acrylic / Mica background blur", sw_blur)
-
         sw_skel = AppleSwitch(getattr(self.cfg, "show_skeleton_mini", True))
         sw_skel.toggled.connect(lambda v: self._save("show_skeleton_mini", v))
         card.add_row("Mini Hand Visualizer", "Renders live skeleton inside the island", sw_skel)
@@ -2694,6 +2706,12 @@ class Overlay:
                 self.cursor_overlay = CursorFeedbackOverlay()
                 self.tray           = JarvisTray(self, self.app)
 
+            if _NEW_UI_AVAILABLE:
+                try:
+                    _glass.configure(self.cfg)                       # glass_mode / glass_transparency
+                except Exception as _glass_err:
+                    print(f"[overlay] glass init error: {_glass_err}")
+
             self.island.show()
             self.island.make_click_through()
             self.cursor_overlay.show()
@@ -2746,6 +2764,11 @@ class Overlay:
         """Live updates settings across Dynamic Island, overlays, and background subsystems."""
         if new_cfg is not None:
             self.cfg = new_cfg
+        if _NEW_UI_AVAILABLE:
+            try:
+                _glass.configure(self.cfg)                           # live Clear/Tinted + Transparency
+            except Exception:
+                pass
         if hasattr(self, "island") and hasattr(self.island, "reload_config"):
             self.island.reload_config()
         if hasattr(self, "cursor_overlay") and hasattr(self.cursor_overlay, "reload_config"):

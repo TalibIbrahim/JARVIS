@@ -5,8 +5,9 @@ ui/settings_window.py — J.A.R.V.I.S. Apple HIG System Settings Window
   Left:  220 px sidebar with search, icon tiles, section groups, pill selection
   Right: scrollable content area with Large Title, inset grouped cards, footnotes
 
-Materials: Mica backdrop (DWMWA_SYSTEMBACKDROP_TYPE=2) with DwmExtendFrameIntoClientArea.
-           Solid fallback on Windows 10 / transparency off.
+Materials: Liquid Glass (ui/glass.py). Windows 11: Mica via DWM; Windows 10: accent-policy blur;
+           Windows "Transparency effects" OFF: solid tinted surface, no blur. Tint, plates, specular, glow
+           and hairline are painted from cached layers; Clear/Tinted + Transparency apply live.
 Theme:     Full light + dark support; live system-theme polling.
 """
 
@@ -37,16 +38,17 @@ from PySide6.QtWidgets import (
 
 from ui.tokens import T, TYPE, COLOR, SPACING, RADIUS, SIZES, qfont
 from ui.materials import (
-    apply_best_backdrop, make_snap_layouts_compatible,
-    set_dark_titlebar, set_rounded_corners, solid_tint_stylesheet
+    apply_material, make_snap_layouts_compatible,
+    set_dark_titlebar, set_rounded_corners, remove_backdrop,
 )
+from ui import glass
 from ui.components import (
     Spring, create_squircle_path,
     AppleSwitch, SegmentedControl, HSlider, GroupedCard,
     PrimaryButton, PlainButton, DestructiveButton, SuccessButton,
     StatusPill, MicLevelMeter, SensitivityPreviewWidget,
     make_scroll_page, slider_card_row,
-    SidebarSearchField, AppleComboBox,
+    SidebarSearchField, AppleComboBox, PageOrderList,
 )
 
 try:
@@ -233,7 +235,7 @@ class _SidebarWidget(QWidget):
 
     def _apply_theme(self) -> None:
         dark = T.is_dark()
-        hdr_col = T.color.tertiary_label.resolve(dark).name()
+        hdr_col = glass.label_color('secondary_label', dark).name()
         for row_info in self._rows:
             row_info["widget"].refresh_theme()
         # update section headers
@@ -301,11 +303,9 @@ class _SidebarWidget(QWidget):
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         dark = T.is_dark()
-        bg = T.color.sidebar_background.resolve(dark)
-        is_mica = getattr(self.window(), "_backdrop_type", None) == "mica"
-        if is_mica:
-            bg = QColor(bg.red(), bg.green(), bg.blue(), 210)
-        p.fillRect(self.rect(), bg)
+        spec = glass.current("window", dark)
+        # sidebar = a glass plate over the window tint (carries the labels, so it uses the plate alpha)
+        p.fillRect(self.rect(), spec.plate_color)
 
 
 def _draw_tile_icon(p: QPainter, cid: str, tx: float, ty: float, size: float) -> None:
@@ -436,14 +436,18 @@ class _SidebarRow(QWidget):
         w, h  = float(self.width()), float(self.height())
         cx, cy = w / 2.0, h / 2.0
 
-        # Pill selection highlight
+        # Pill selection highlight (accent glass capsule: tint + specular/hairline edge)
         if self._selected:
             accent = T.color.accent.resolve(dark)
-            pill_col = QColor(accent.red(), accent.green(), accent.blue(), 30)
+            pill_col = QColor(accent.red(), accent.green(), accent.blue(), 56 if dark else 40)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(pill_col))
             margin = 4.0
-            p.drawRoundedRect(QRectF(margin, 2, w - margin * 2, h - 4), (h - 4) / 2.0, (h - 4) / 2.0)
+            pr = QRectF(margin, 2, w - margin * 2, h - 4)
+            p.drawRoundedRect(pr, pr.height() / 2.0, pr.height() / 2.0)
+            p.drawPixmap(pr.topLeft(), glass.edge_layer(int(round(pr.width())), int(round(pr.height())),
+                                                        pr.height() / 2.0, dark, self.devicePixelRatioF(),
+                                                        specular=True, glow=False))
         elif self._hovered:
             hover_col = QColor(128, 128, 128, 20)
             p.setPen(Qt.PenStyle.NoPen)
@@ -466,7 +470,7 @@ class _SidebarRow(QWidget):
 
         # Label text
         label_x = tile_x + tile_size + 10.0
-        label_col = T.color.accent.resolve(dark) if self._selected else T.color.label.resolve(dark)
+        label_col = glass.label_color("label", dark)       # selected state is the capsule + weight (accent text fails 4.5:1 in light)
         label_font = qfont(TYPE.body)
         if self._selected:
             label_font.setWeight(QFont.Weight.DemiBold)
@@ -569,7 +573,7 @@ class _FolderAliasesEditor(QWidget):
             f"border: 1px solid {'rgba(255,255,255,0.10)' if dark else 'rgba(0,0,0,0.10)'}; "
             f"border-radius: 6px; color: {T.color.label.resolve(dark).name()}; font-size: 11px; }} "
             f"QHeaderView::section {{ background: {'rgba(255,255,255,0.08)' if dark else 'rgba(0,0,0,0.06)'}; "
-            f"color: {T.color.secondary_label.resolve(dark).name()}; border: none; font-size: 10px; font-weight: 600; padding: 2px 4px; }}"
+            f"color: {glass.label_color('secondary_label', dark).name()}; border: none; font-size: 10px; font-weight: 600; padding: 2px 4px; }}"
         )
         self._refresh_table()
         layout.addWidget(self._table)
@@ -652,7 +656,7 @@ class _PrivacyLogTable(QWidget):
             f"border: 1px solid {'rgba(255,255,255,0.10)' if dark else 'rgba(0,0,0,0.10)'}; "
             f"border-radius: 6px; color: {T.color.label.resolve(dark).name()}; font-size: 11px; }} "
             f"QHeaderView::section {{ background: {'rgba(255,255,255,0.08)' if dark else 'rgba(0,0,0,0.06)'}; "
-            f"color: {T.color.secondary_label.resolve(dark).name()}; border: none; font-size: 10px; font-weight: 600; padding: 2px 4px; }}"
+            f"color: {glass.label_color('secondary_label', dark).name()}; border: none; font-size: 10px; font-weight: 600; padding: 2px 4px; }}"
         )
         self._populate_entries()
         layout.addWidget(self.table)
@@ -730,7 +734,7 @@ class _RoutinesListWidget(QWidget):
             lbl_n.setStyleSheet(f"font-weight: 600; color: {T.color.label.resolve(dark).name()};")
             lbl_d = QLabel(desc, row)
             lbl_d.setFont(qfont(TYPE.caption_1))
-            lbl_d.setStyleSheet(f"color: {T.color.secondary_label.resolve(dark).name()};")
+            lbl_d.setStyleSheet(f"color: {glass.label_color('secondary_label', dark).name()};")
             lbl_d.setWordWrap(True)
             txt_l.addWidget(lbl_n)
             txt_l.addWidget(lbl_d)
@@ -784,6 +788,18 @@ class SettingsWindow(QDialog):
 
         self._dark = T.is_dark()
         self._backdrop_type: Optional[str] = None
+
+        glass.configure(cfg)                       # glass_mode / glass_transparency (getattr defaults)
+        glass.add_listener(self._on_glass_changed)
+        self._glass_save_timer = QTimer(self)      # debounced persistence of the Transparency slider
+        self._glass_save_timer.setSingleShot(True)
+        self._glass_save_timer.setInterval(250)
+        self._glass_save_timer.timeout.connect(self._flush_glass_save)
+        self._city_save_timer = QTimer(self)       # debounced persistence of the typed city
+        self._city_save_timer.setSingleShot(True)
+        self._city_save_timer.setInterval(600)
+        self._city_save_timer.timeout.connect(self._flush_city_save)
+        self._city_pending = ""
 
         self.setWindowTitle("J.A.R.V.I.S. Settings")
         self.setMinimumSize(820, 580)
@@ -840,6 +856,7 @@ class SettingsWindow(QDialog):
         self._sidebar.select(_CATEGORIES[0])
         for btn in self.findChildren(PrimaryButton):
             btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        glass.attach_tooltips(self)                # glass tooltips for every widget that has one
 
     # ── Backdrop ─────────────────────────────────────────────────────────
 
@@ -858,27 +875,27 @@ class SettingsWindow(QDialog):
         QTimer.singleShot(0, self._apply_backdrop)
 
     def _apply_backdrop(self) -> None:
+        """Windows 11: Mica. Windows 10: accent blur. Transparency effects off (or non-Windows): solid, no blur."""
         if sys.platform != "win32":
+            self._backdrop_type = "solid"
+            self.update()
             return
         hwnd = int(self.winId())
         dark = T.is_dark()
-        result = apply_best_backdrop(hwnd, dark, prefer_mica=True)
-        self._backdrop_type = result
-        if result == "solid":
-            # Apply solid tint via stylesheet
-            self.setStyleSheet(self.styleSheet() + solid_tint_stylesheet(dark))
+        self._backdrop_type = apply_material(hwnd, "window", dark)     # "mica" | "blur" | "solid"
         make_snap_layouts_compatible(hwnd)
         set_rounded_corners(hwnd)
         self.update()
 
+    def _on_glass_changed(self) -> None:
+        """glass_mode / glass_transparency / Windows transparency flag changed: repaint everything live."""
+        for w in [self] + self.findChildren(QWidget):
+            w.update()
+
     def paintEvent(self, event) -> None:
         p = QPainter(self)
-        dark = T.is_dark()
-        bg = T.color.grouped_background.resolve(dark)
-        is_mica = getattr(self, "_backdrop_type", None) == "mica"
-        if is_mica:
-            bg = QColor(bg.red(), bg.green(), bg.blue(), 220)
-        p.fillRect(self.rect(), bg)
+        spec = glass.current("window", T.is_dark())
+        glass.paint_window_background(p, self.size(), spec, self.devicePixelRatioF())
 
     # ── Global stylesheet (text, scroll bars, combos) ──────────────────
 
@@ -890,7 +907,9 @@ class SettingsWindow(QDialog):
         sep_c      = T.color.separator.resolve(dark).name()
         accent_c   = T.color.accent.resolve(dark).name()
         fill_c     = T.color.elevated_background.resolve(dark).name()
-        sec_label  = T.color.secondary_label.resolve(dark).name()
+        sec_label  = glass.label_color('secondary_label', dark).name()
+        glass_fill = "rgba(255,255,255,0.08)" if dark else "rgba(0,0,0,0.05)"
+        glass_edge = "rgba(255,255,255,0.12)" if dark else "rgba(0,0,0,0.10)"
 
         self.setStyleSheet(f"""
             QDialog {{
@@ -914,11 +933,11 @@ class SettingsWindow(QDialog):
             }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
             QComboBox {{
-                background: {fill_c};
-                border: 1px solid rgba(128,128,128,0.2);
-                border-radius: 7px;
+                background: {glass_fill};
+                border: 1px solid {glass_edge};
+                border-radius: 15px;
                 color: {label_c};
-                padding: 5px 28px 5px 10px;
+                padding: 5px 28px 5px 14px;
                 font-size: 12px;
             }}
             QComboBox:hover {{ border-color: rgba(128,128,128,0.4); }}
@@ -936,11 +955,11 @@ class SettingsWindow(QDialog):
                 padding: 4px;
             }}
             QLineEdit {{
-                background: {fill_c};
-                border: 1px solid rgba(128,128,128,0.2);
-                border-radius: 7px;
+                background: {glass_fill};
+                border: 1px solid {glass_edge};
+                border-radius: 15px;
                 color: {label_c};
-                padding: 6px 10px;
+                padding: 6px 14px;
                 font-size: 12px;
                 selection-background-color: {accent_c};
             }}
@@ -963,10 +982,14 @@ class SettingsWindow(QDialog):
 
     def _poll_theme(self) -> None:
         new_dark = T.is_dark()
+        env_changed = glass.environment(force=True)    # Windows transparency flag / wallpaper, live
         if new_dark != self._dark:
             self._dark = new_dark
             self._apply_global_stylesheet()
             self._apply_backdrop()
+        elif env_changed and self.isVisible():
+            self._apply_backdrop()                     # effects toggled in Windows: blur on/off without restart
+        self._refresh_glass_footnote()
 
     # ── Navigation ────────────────────────────────────────────────────────
 
@@ -1661,7 +1684,7 @@ class SettingsWindow(QDialog):
         self.lbl_test_result = QLabel("Click above to test recording and speech transcription.")
         self.lbl_test_result.setFont(qfont(TYPE.footnote))
         self.lbl_test_result.setWordWrap(True)
-        self.lbl_test_result.setStyleSheet(f"color: {T.color.secondary_label.resolve(self._dark).name()};")
+        self.lbl_test_result.setStyleSheet(f"color: {glass.label_color('secondary_label', self._dark).name()};")
 
         self.btn_test_mic.clicked.connect(self._run_mic_test)
 
@@ -1812,7 +1835,7 @@ class SettingsWindow(QDialog):
         self.btn_test_conn  = PrimaryButton("Test Connection")
         self.lbl_conn_status = QLabel("Ready to test")
         self.lbl_conn_status.setFont(qfont(TYPE.footnote))
-        self.lbl_conn_status.setStyleSheet(f"color: {T.color.secondary_label.resolve(self._dark).name()};")
+        self.lbl_conn_status.setStyleSheet(f"color: {glass.label_color('secondary_label', self._dark).name()};")
 
         self.btn_test_conn.clicked.connect(self._run_test_connection)
 
@@ -1843,16 +1866,42 @@ class SettingsWindow(QDialog):
         theme_seg.valueChanged.connect(lambda v: self._save("theme_mode", v))
         card.add_row("Appearance", "Follow the Windows system theme or force a specific mode", theme_seg)
 
-        sw_blur = AppleSwitch(getattr(self.cfg, "glass_blur", True))
-        sw_blur.toggled.connect(lambda v: self._save("glass_blur", v))
-        card.add_row("Glass Backdrop",
-                     "Hardware Acrylic or Mica blur behind the Island and Settings window",
-                     sw_blur)
+        # Liquid Glass: Clear / Tinted + Transparency (applied live to Settings, the radial menu and tooltips)
+        self.glass_mode_control = SegmentedControl([
+            ("clear",  "Clear"),
+            ("tinted", "Tinted"),
+        ], current=getattr(self.cfg, "glass_mode", glass.GLASS.default_mode))
+        self.glass_seg = self.glass_mode_control
+        self.glass_mode_control.valueChanged.connect(lambda v: self._save("glass_mode", v))
+        card.add_row("Glass Style",
+                     "Clear lets more of the desktop show through; Tinted adds a colored plate for legibility",
+                     self.glass_mode_control)
+
+        glass_t = glass._clamp01(getattr(self.cfg, "glass_transparency", glass.GLASS.default_transparency))
+        trow = QWidget()
+        trow_l = QHBoxLayout(trow)
+        trow_l.setContentsMargins(0, 0, 0, 0)
+        trow_l.setSpacing(SPACING.sm)
+        self.glass_transparency_slider = HSlider(0.0, 1.0, glass_t, "", trow)
+        self.glass_slider = self.glass_transparency_slider
+        self.glass_slider.setFixedWidth(180)
+        self.glass_pct_label = QLabel(f"{int(round(glass_t * 100))}%")
+        self.glass_pct_label.setFont(qfont(TYPE.metric))
+        self.glass_pct_label.setMinimumWidth(40)
+        self.glass_pct_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.glass_pct_label.setStyleSheet(
+            f"color: {glass.label_color('label', self._dark).name()}; background: transparent;")
+        self.glass_transparency_slider.valueChanged.connect(self._on_glass_transparency)
+        trow_l.addWidget(self.glass_slider)
+        trow_l.addWidget(self.glass_pct_label)
+        card.add_row("Transparency",
+                     "0% is a solid surface, 100% shows the most backdrop; text is kept at readable contrast",
+                     trow)
 
         sw_skel = AppleSwitch(getattr(self.cfg, "show_skeleton_mini", True))
         sw_skel.toggled.connect(lambda v: self._save("show_skeleton_mini", v))
         card.add_row("Mini Hand Skeleton",
-                     "Renders a live hand wireframe inside the Dynamic Island",
+                     "Show a small live hand outline inside the Dynamic Island",
                      sw_skel)
 
         sw_motion = AppleSwitch(getattr(self.cfg, "reduce_motion", False))
@@ -1861,7 +1910,8 @@ class SettingsWindow(QDialog):
                      "Replace spring animations with quick crossfades (matches Windows accessibility setting)",
                      sw_motion)
 
-        card.set_footnote("Reduce Motion is also auto-detected from Windows Settings > Accessibility > Visual Effects.")
+        self.appearance_card = card
+        self._refresh_glass_footnote()
         layout.addWidget(card)
 
         # ── Dynamic Island Section ─────────────────────────────────────────
@@ -1936,7 +1986,7 @@ class SettingsWindow(QDialog):
 
         # 6. City Input Field / Searchable Dropdown
         city_default = getattr(self.cfg, "island_weather_city", "New York")
-        self.city_combo = QComboBox()
+        self.city_combo = AppleComboBox()
         self.city_combo.setEditable(True)
         self.city_combo.setFixedWidth(230)
         self.city_search_edit = self.city_combo.lineEdit()
@@ -1953,21 +2003,15 @@ class SettingsWindow(QDialog):
             QComboBox {{
                 background: {fill_c};
                 border: 1px solid {border_c};
-                border-radius: 6px;
+                border-radius: 15px;
                 color: {label_c};
-                padding: 4px 8px;
+                padding: 5px 14px;
                 font-size: 12px;
             }}
             QComboBox:hover {{ border-color: rgba(128,128,128,0.4); }}
             QComboBox:focus {{ border: 1.5px solid {accent_c}; }}
             QComboBox::drop-down {{ border: none; width: 22px; }}
-            QComboBox::down-arrow {{
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid {label_c};
-                margin-right: 6px;
-            }}
+            QComboBox::down-arrow {{ image: none; width: 0px; height: 0px; }}
             QComboBox QAbstractItemView {{
                 background: {popup_c};
                 border: 1px solid {border_c};
@@ -2038,7 +2082,8 @@ class SettingsWindow(QDialog):
         def _on_city_text_edited(v):
             cleaned = v.strip()
             if cleaned:
-                self._save("island_weather_city", cleaned)
+                self._city_pending = cleaned          # persist + refresh weather once typing pauses
+                self._city_save_timer.start()
                 self._city_search_timer.start()
 
         self.city_search_edit.textChanged.connect(_on_city_text_edited)
@@ -2047,6 +2092,8 @@ class SettingsWindow(QDialog):
             val = self.city_combo.itemText(idx).strip()
             if val:
                 self._city_search_timer.stop()
+                self._city_save_timer.stop()
+                self._city_pending = ""
                 self._save("island_weather_city", val)
 
         self.city_combo.activated.connect(_on_city_activated)
@@ -2083,7 +2130,7 @@ class SettingsWindow(QDialog):
         self.sw_pin_open = self.pin_open_switch
         self.pin_open_switch.toggled.connect(lambda v: self._save("island_pin_open", v))
         island_card.add_row("Pin Open",
-                            "Keep expanded card open permanently and suppress 4-second auto-collapse timer",
+                            "Keep the expanded card open instead of auto-collapsing",
                             self.pin_open_switch)
 
         # 12. Expand Trigger (Hover / Click / Dwell / Fist / Voice)
@@ -2106,7 +2153,7 @@ class SettingsWindow(QDialog):
         wf_layout.setContentsMargins(0, 0, 0, 0)
         wf_layout.setSpacing(8)
 
-        self.wf_color_combo = QComboBox()
+        self.wf_color_combo = AppleComboBox()
         presets = [
             ("Blue (Default)", "blue", "#007AFF"),
             ("Cyan",           "cyan", "#32ADE6"),
@@ -2135,22 +2182,16 @@ class SettingsWindow(QDialog):
             QComboBox {{
                 background: {fill_c};
                 border: 1px solid {border_c};
-                border-radius: 6px;
+                border-radius: 15px;
                 color: {label_c};
-                padding: 4px 8px;
+                padding: 5px 14px;
                 font-size: 12px;
                 min-width: 140px;
             }}
             QComboBox:hover {{ border-color: rgba(128,128,128,0.4); }}
             QComboBox:focus {{ border: 1.5px solid {accent_c}; }}
             QComboBox::drop-down {{ border: none; width: 22px; }}
-            QComboBox::down-arrow {{
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid {label_c};
-                margin-right: 6px;
-            }}
+            QComboBox::down-arrow {{ image: none; width: 0px; height: 0px; }}
             QComboBox QAbstractItemView {{
                 background: {popup_c};
                 border: 1px solid {border_c};
@@ -2242,83 +2283,84 @@ class SettingsWindow(QDialog):
         island_card.set_footnote("Changes apply immediately to the Dynamic Island on your screen.")
         layout.addWidget(island_card)
 
-        # ── Card Pages & Hardware Sensors Section ───────────────────────────
+        # ── Card pages: on/off + ORDER ──────────────────────────────────────
         pages_card = GroupedCard()
         self.pages_card = pages_card
 
-        pages_map = getattr(self.cfg, "island_pages_enabled", {
-            "media": True, "calendar": True, "weather": True, "hardware": True, "jarvis": True
-        })
+        pages_map = dict(getattr(self.cfg, "island_pages_enabled", {}) or {})
+        pages_order = list(getattr(self.cfg, "island_pages", None) or
+                           ["media", "calendar", "weather", "hardware", "jarvis"])
+        self.page_order_list = PageOrderList([
+            ("media",    "Media Player",
+             "Now Playing artwork and audio controls"),
+            ("calendar", "Calendar & Clock",
+             "Monthly calendar grid and date tile"),
+            ("weather",  "Weather Forecast",
+             "Current conditions, temperature and weather metrics"),
+            ("hardware", "Hardware Monitor",
+             "System resource and network telemetry"),
+            ("jarvis",   "JARVIS Assistant",
+             "Assistant state, camera FPS, last command and tracking pause control"),
+        ], pages_order, pages_map)
+        self.page_order_list.orderChanged.connect(lambda order: self._save("island_pages", list(order)))
 
         def _on_page_toggle(page_name: str, enabled: bool):
-            cur = dict(getattr(self.cfg, "island_pages_enabled", {}))
+            cur = dict(getattr(self.cfg, "island_pages_enabled", {}) or {})
             cur[page_name] = enabled
             self._save("island_pages_enabled", cur)
 
-        # Page Toggles
-        self.sw_page_media = AppleSwitch(pages_map.get("media", True))
-        self.sw_page_media.toggled.connect(lambda v: _on_page_toggle("media", v))
-        pages_card.add_row("Media Player Page",
-                           "Include Now Playing artwork and audio controls in card carousel",
-                           self.sw_page_media)
+        self.page_order_list.enabledChanged.connect(_on_page_toggle)
+        pages_card.add_row("Card Pages",
+                           "Switch pages on or off and use the arrows to set the order they appear in",
+                           QWidget())
+        pages_card.add_widget(self.page_order_list, divider=False)
+        pages_card.set_footnote("Disabled pages are skipped during mouse wheel and page dot navigation; "
+                                "the top page is shown first.")
+        layout.addWidget(pages_card)
 
-        self.sw_page_cal = AppleSwitch(pages_map.get("calendar", True))
-        self.sw_page_cal.toggled.connect(lambda v: _on_page_toggle("calendar", v))
-        pages_card.add_row("Calendar & Clock Page",
-                           "Include monthly calendar grid and date tile in card carousel",
-                           self.sw_page_cal)
+        # Page switches stay addressable by their historical names
+        self.sw_page_media = self.page_order_list.switch_for("media")
+        self.sw_page_cal = self.page_order_list.switch_for("calendar")
+        self.sw_page_weather = self.page_order_list.switch_for("weather")
+        self.sw_page_hw = self.page_order_list.switch_for("hardware")
+        self.sw_page_jarvis = self.page_order_list.switch_for("jarvis")
 
-        self.sw_page_weather = AppleSwitch(pages_map.get("weather", True))
-        self.sw_page_weather.toggled.connect(lambda v: _on_page_toggle("weather", v))
-        pages_card.add_row("Weather Forecast Page",
-                           "Include current conditions, temperature, and modular weather metrics",
-                           self.sw_page_weather)
+        # ── Hardware sensors ────────────────────────────────────────────────
+        sensors_card = GroupedCard()
+        self.sensors_card = sensors_card
 
-        self.sw_page_hw = AppleSwitch(pages_map.get("hardware", True))
-        self.sw_page_hw.toggled.connect(lambda v: _on_page_toggle("hardware", v))
-        pages_card.add_row("Hardware Monitor Page",
-                           "Include system resource and network performance telemetry",
-                           self.sw_page_hw)
-
-        self.sw_page_jarvis = AppleSwitch(pages_map.get("jarvis", True))
-        self.sw_page_jarvis.toggled.connect(lambda v: _on_page_toggle("jarvis", v))
-        pages_card.add_row("JARVIS Assistant Page",
-                           "Include assistant status, tracking quick toggle, and last directive",
-                           self.sw_page_jarvis)
-
-        # Hardware Sensor Toggles
         self.sw_hw_cpu = AppleSwitch(getattr(self.cfg, "island_hw_cpu", True))
         self.sw_hw_cpu.toggled.connect(lambda v: self._save("island_hw_cpu", v))
-        pages_card.add_row("CPU Telemetry Sensor",
-                           "Sample processor utilization percentage and clock frequency",
-                           self.sw_hw_cpu)
+        sensors_card.add_row("CPU Telemetry Sensor",
+                             "Show processor utilization percentage",
+                             self.sw_hw_cpu)
 
         self.sw_hw_ram = AppleSwitch(getattr(self.cfg, "island_hw_ram", True))
         self.sw_hw_ram.toggled.connect(lambda v: self._save("island_hw_ram", v))
-        pages_card.add_row("RAM Telemetry Sensor",
-                           "Sample active memory usage, availability, and total capacity",
-                           self.sw_hw_ram)
+        sensors_card.add_row("RAM Telemetry Sensor",
+                             "Show memory used and total in GB, and usage percentage",
+                             self.sw_hw_ram)
 
         self.sw_hw_gpu = AppleSwitch(getattr(self.cfg, "island_hw_gpu", True))
         self.sw_hw_gpu.toggled.connect(lambda v: self._save("island_hw_gpu", v))
-        pages_card.add_row("GPU Telemetry Sensor",
-                           "Sample dedicated graphics processor load and temperature",
-                           self.sw_hw_gpu)
+        sensors_card.add_row("GPU Telemetry Sensor",
+                             "Show graphics processor utilization percentage",
+                             self.sw_hw_gpu)
 
         self.sw_hw_net = AppleSwitch(getattr(self.cfg, "island_hw_net", True))
         self.sw_hw_net.toggled.connect(lambda v: self._save("island_hw_net", v))
-        pages_card.add_row("Network Telemetry Sensor",
-                           "Sample real-time upstream and downstream network bandwidth",
-                           self.sw_hw_net)
+        sensors_card.add_row("Network Telemetry Sensor",
+                             "Show upload and download throughput",
+                             self.sw_hw_net)
 
         self.sw_hw_disk = AppleSwitch(getattr(self.cfg, "island_hw_disk", True))
         self.sw_hw_disk.toggled.connect(lambda v: self._save("island_hw_disk", v))
-        pages_card.add_row("Disk Telemetry Sensor",
-                           "Sample primary drive utilization and storage capacity",
-                           self.sw_hw_disk)
+        sensors_card.add_row("Disk Telemetry Sensor",
+                             "Show system drive used percentage",
+                             self.sw_hw_disk)
 
-        pages_card.set_footnote("Disabled pages are skipped during mouse wheel and page dot navigation.")
-        layout.addWidget(pages_card)
+        sensors_card.set_footnote("Sensors are sampled only while the Hardware Monitor page is visible.")
+        layout.addWidget(sensors_card)
 
         # Direct property aliases for test compatibility
         self.media_switch = self.sw_page_media
@@ -2344,7 +2386,7 @@ class SettingsWindow(QDialog):
         def _info_lbl(text: str) -> QLabel:
             l = QLabel(text)
             l.setFont(qfont(TYPE.body))
-            l.setStyleSheet(f"color: {T.color.secondary_label.resolve(self._dark).name()};")
+            l.setStyleSheet(f"color: {glass.label_color('secondary_label', self._dark).name()};")
             return l
 
         info_card.add_row("Version",    "", _info_lbl(f"v{APP_VERSION}"))
@@ -2360,7 +2402,7 @@ class SettingsWindow(QDialog):
             self.btn_restart.setVisible(False)
             self.lbl_up_status = QLabel(f"Current version is v{APP_VERSION}.")
             self.lbl_up_status.setFont(qfont(TYPE.footnote))
-            self.lbl_up_status.setStyleSheet(f"color: {T.color.secondary_label.resolve(self._dark).name()};")
+            self.lbl_up_status.setStyleSheet(f"color: {glass.label_color('secondary_label', self._dark).name()};")
             self.prog_bar = QProgressBar()
             self.prog_bar.setRange(0, 100)
             self.prog_bar.setFixedHeight(4)
@@ -2651,6 +2693,7 @@ class SettingsWindow(QDialog):
                 pill.setVariant("success" if passed else "error")
                 pill.setText("Passed" if passed else "Failed")
                 pill.setToolTip(msg)
+                glass.attach_tooltips(pill)       # runtime tooltip -> glass tooltip too
 
 
     def _open_target_practice(self) -> None:
@@ -2659,6 +2702,42 @@ class SettingsWindow(QDialog):
         s = os.path.join(base, "..", "tests", "target_practice.py")
         if os.path.exists(s):
             subprocess.Popen([sys.executable, s, "--gui"])
+
+    # ── Glass setting helpers ─────────────────────────────────────────────
+
+    def _on_glass_transparency(self, v: float) -> None:
+        """Slider drag: apply live immediately (cheap), persist once the drag pauses."""
+        v = glass._clamp01(v)
+        self.glass_pct_label.setText(f"{int(round(v * 100))}%")
+        glass.configure(transparency=v)
+        try:
+            self.cfg.glass_transparency = v
+        except Exception:
+            pass
+        self._glass_save_timer.start()
+
+    def _flush_glass_save(self) -> None:
+        self._glass_save_timer.stop()
+        self._save("glass_transparency", round(glass.settings()[1], 3))
+
+    def _flush_city_save(self) -> None:
+        self._city_save_timer.stop()
+        if self._city_pending:
+            city, self._city_pending = self._city_pending, ""
+            self._save("island_weather_city", city)
+
+    def _refresh_glass_footnote(self) -> None:
+        card = getattr(self, "appearance_card", None)
+        if card is None:
+            return
+        if glass.transparency_enabled():
+            text = ("Glass blurs what is behind the window. Reduce Motion is also auto-detected from "
+                    "Windows Settings > Accessibility > Visual Effects.")
+        else:
+            text = ("Windows transparency effects are off, so Settings shows a solid surface with no blur. "
+                    "Turn them on in Windows Settings > Personalization > Colors.")
+        if getattr(card, "_footnote", "") != text:
+            card.set_footnote(text)
 
     def _save(self, key: str, value) -> None:
         if key != "groq_api_key" and any(s in key.lower() for s in ("secret", "token", "password")):
@@ -2705,6 +2784,11 @@ class SettingsWindow(QDialog):
         except Exception as exc:
             print(f"[settings] reload_config error: {exc}")
 
+        if key in ("glass_mode", "glass_transparency"):
+            glass.configure(self.cfg)                  # radial menu + tooltips + this window repaint live
+            if key == "glass_mode":
+                self._on_glass_changed()
+
         # 3. Live theme update on settings dialog itself
         if key == "theme_mode":
             try:
@@ -2722,7 +2806,14 @@ class SettingsWindow(QDialog):
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
+    def _flush_pending_saves(self) -> None:
+        if self._glass_save_timer.isActive():
+            self._flush_glass_save()
+        if self._city_save_timer.isActive():
+            self._flush_city_save()
+
     def closeEvent(self, event) -> None:
+        self._flush_pending_saves()
         if hasattr(self, "_mic_timer") and self._mic_timer.isActive():
             self._mic_timer.stop()
         if self.updater and hasattr(self, "_updater_cb"):
@@ -2734,6 +2825,7 @@ class SettingsWindow(QDialog):
         self.hide()
 
     def reject(self) -> None:
+        self._flush_pending_saves()
         if hasattr(self, "_mic_timer") and self._mic_timer.isActive():
             self._mic_timer.stop()
         if self.updater and hasattr(self, "_updater_cb"):

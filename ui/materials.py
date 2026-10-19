@@ -8,12 +8,17 @@ Provides:
   - extend_frame(hwnd)          → DwmExtendFrameIntoClientArea (full-window frame)
   - set_dark_titlebar(hwnd, dark) → DWMWA_USE_IMMERSIVE_DARK_MODE
   - set_rounded_corners(hwnd)   → DWMWA_WINDOW_CORNER_PREFERENCE = ROUND (Win11)
+  - resolve_material(role) / apply_material(hwnd, role, dark) → one entry point used by the glass layer
+  - apply_blur_behind(hwnd)     → Windows 10 accent-policy blur (ACCENT_ENABLE_BLURBEHIND)
   - fallback_solid_tint(widget, dark) → solid color for Win10 / transparency off
 
 Design rules:
   - Settings window → Mica + DwmExtendFrameIntoClientArea
   - Island → solid black, no backdrop (remove_backdrop clears any earlier blur); radial menu, tooltips → Acrylic
-  - Windows 10 or transparency-disabled → solid tinted surface fallback
+  - Windows 11: Mica (windows) / Acrylic (popups) via DWM system backdrop
+  - Windows 10: accent-policy blur
+  - Transparency effects OFF (HKCU ...\Personalize\EnableTransparency == 0) on ANY build → no blur at all,
+    solid tinted surface (the Win10 accent path is skipped too)
   - NEVER compute per-frame blur; the DWM material is always hardware-driven
 """
 
@@ -208,7 +213,11 @@ def apply_acrylic(hwnd: int, dark: bool = True, opacity: float = 1.0) -> bool:
     build = _build_number()
     clamped_op = max(0.0, min(1.0, float(opacity)))
 
-    if build >= 22621 and _transparency_enabled():
+    if not _transparency_enabled():
+        # Windows "Transparency effects" is OFF: never blur (also on the Win10 accent path).
+        return False
+
+    if build >= 22621:
         set_dark_titlebar(hwnd, dark)
         ok = _dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_ACRYLIC)
         if ok:
@@ -305,6 +314,10 @@ def apply_best_backdrop(
     Apply the best available backdrop for the given HWND.
     Returns one of: 'mica', 'acrylic', 'solid'
     """
+    if not _transparency_enabled():
+        remove_backdrop(hwnd)          # drop any blur applied before the user turned effects off
+        set_dark_titlebar(hwnd, dark)
+        return "solid"
     if prefer_mica and apply_mica(hwnd, dark):
         return "mica"
     if apply_acrylic(hwnd, dark, opacity=opacity):
@@ -312,6 +325,74 @@ def apply_best_backdrop(
     # Solid tinted fallback
     set_dark_titlebar(hwnd, dark)
     return "solid"
+
+
+def apply_blur_behind(hwnd: int) -> bool:
+    """
+    Windows 10 accent-policy blur (ACCENT_ENABLE_BLURBEHIND = 3): a plain backdrop blur with NO tint of its
+    own (the tint is painted by ui/glass.py so it can follow the glass setting live) and no acrylic noise,
+    which also keeps window dragging smooth. Refuses to blur when Windows transparency effects are off.
+    """
+    if sys.platform != "win32" or not _transparency_enabled():
+        return False
+    try:
+        class AccentPolicy(ctypes.Structure):
+            _fields_ = [("AccentState", ctypes.c_int), ("AccentFlags", ctypes.c_int),
+                        ("GradientColor", ctypes.c_int), ("AnimationId", ctypes.c_int)]
+
+        class WCA_DATA(ctypes.Structure):
+            _fields_ = [("Attribute", ctypes.c_int), ("Data", ctypes.c_void_p),
+                        ("SizeOfData", ctypes.c_size_t)]
+
+        fn = getattr(ctypes.windll.user32, "SetWindowCompositionAttribute", None)
+        if not fn:
+            return False
+        accent = AccentPolicy(3, 0, 0, 0)
+        data = WCA_DATA(19, ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p), ctypes.sizeof(accent))
+        return bool(fn(hwnd, ctypes.byref(data)))
+    except Exception:
+        return False
+
+
+def resolve_material(role: str = "window", build: Optional[int] = None,
+                     transparency: Optional[bool] = None) -> str:
+    """
+    Which backdrop a top-level window of ``role`` ("window" | "popup") gets on this machine.
+    Returns "mica" | "acrylic" | "blur" | "solid".  Pure function of (build, transparency flag).
+    """
+    if sys.platform != "win32":
+        return "solid"
+    if transparency is None:
+        transparency = _transparency_enabled()
+    if not transparency:
+        return "solid"
+    b = _build_number() if build is None else int(build)
+    if b >= 22621:
+        return "mica" if role == "window" else "acrylic"
+    if b >= 22000:
+        return "mica" if role == "window" else "blur"
+    return "blur" if b >= 17134 else "solid"
+
+
+def apply_material(hwnd: int, role: str = "window", dark: bool = True) -> str:
+    """Apply the best real backdrop for ``role`` and return what is actually active (or "solid")."""
+    mat = resolve_material(role)
+    ok = False
+    if mat == "mica":
+        ok = apply_mica(hwnd, dark)
+    elif mat == "acrylic":
+        ok = _dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_ACRYLIC)
+        if ok:
+            set_dark_titlebar(hwnd, dark)
+            extend_frame(hwnd, -1)
+    elif mat == "blur":
+        _dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_NONE)   # no DWM system backdrop under the accent blur
+        ok = apply_blur_behind(hwnd)
+    if not ok:
+        remove_backdrop(hwnd)
+        set_dark_titlebar(hwnd, dark)
+        return "solid"
+    return mat
 
 
 def set_interactive(hwnd: int, interactive: bool) -> None:

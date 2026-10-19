@@ -15,6 +15,12 @@ Components:
   - PrimaryButton / PlainButton / TintButton / DestructiveButton
   - StatusPill             (small rounded status badge)
   - MicLevelMeter          (real-time audio level bar)
+  - GlassLabel             (QLabel that gets a contrast plate when sitting loose on glass)
+  - PageOrderList          (reorderable, switchable list with up/down capsule buttons)
+
+Liquid Glass: cards, switches, segmented controls, sliders and buttons paint through ui/glass.py
+(cached tint/plate, specular + glow + hairline edge layer, cached soft shadows). Controls are capsules;
+inner radii are concentric (outer radius - padding). State changes are spring morphs (Spring).
 
 All widgets are theme-aware at construction time and recheck dark mode
 on each paintEvent so live system-theme changes are reflected without restart.
@@ -46,6 +52,7 @@ from ui.tokens import (
     SpringToken, SPRING_DT_MIN, SPRING_DT_MAX, REDUCE_MOTION_MS,
     squircle_bezier_factor, qfont
 )
+from ui import glass as _glass          # glass imports components lazily (inside functions) -> no cycle
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -322,22 +329,40 @@ class FocusRingMixin:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. AppleSwitch — 51×31 iOS-style toggle
+# 4. AppleSwitch — capsule toggle, glass thumb that stretches on press (spring)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class AppleSwitch(FocusRingMixin, QWidget):
-    """
-    51×31 px iOS/macOS-style animated toggle switch.
+class _SpringTicker:
+    """Shared 60 fps tick bookkeeping: real dt (clamped by Spring.update) and an on-demand timer."""
 
-    States: off (gray track), on (green track), hover (slightly brighter track),
-            pressed (track darkens), disabled (de-saturated), focus (accent ring).
-    Thumb animates with SPRING.fast spring.
+    def _init_ticker(self) -> None:
+        self._tick_last: Optional[float] = None
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def _wake(self) -> None:
+        if not self._timer.isActive():
+            self._tick_last = time.perf_counter()
+            self._timer.start(16)
+
+    def _dt(self) -> float:
+        now = time.perf_counter()
+        last = self._tick_last if self._tick_last is not None else now - 0.016
+        self._tick_last = now
+        return min(max(now - last, SPRING_DT_MIN), SPRING_DT_MAX)
+
+
+class AppleSwitch(FocusRingMixin, _SpringTicker, QWidget):
+    """
+    51x31 px capsule toggle (iOS/macOS 26 style): glass thumb with soft shadow that elongates while pressed.
+    The thumb x-position and the press-stretch are springs (SPRING.fast).
     """
     toggled = Signal(bool)
 
     W: int = SIZES.switch_w
     H: int = SIZES.switch_h
     THUMB: int = SIZES.switch_thumb
+    STRETCH: float = 7.0
 
     def __init__(self, checked: bool = False, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -350,14 +375,13 @@ class AppleSwitch(FocusRingMixin, QWidget):
         self._pressed  = False
         self._enabled  = True
 
-        # Spring drives thumb x-position in normalised [0, 1]
+        # Spring drives thumb x-position in normalised [0, 1]; second spring drives the press stretch
         self._spring   = Spring(1.0 if checked else 0.0)
         self._spring.k = SPRING.fast.stiffness
         self._spring.c = SPRING.fast.damping
+        self._press    = Spring(0.0, SPRING.fast.stiffness, SPRING.fast.damping)
         self._thumb_t  = 1.0 if checked else 0.0
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
+        self._init_ticker()
 
     # ── public interface ──────────────────────────────────────────────────
 
@@ -373,8 +397,7 @@ class AppleSwitch(FocusRingMixin, QWidget):
             return
         self._checked = checked
         self._spring.set_target(1.0 if checked else 0.0)
-        if not self._timer.isActive():
-            self._timer.start(16)
+        self._wake()
         if not silent:
             self.toggled.emit(checked)
         self.update()
@@ -391,12 +414,16 @@ class AppleSwitch(FocusRingMixin, QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if self._enabled:
             self._pressed = True
+            self._press.set_target(1.0)
+            self._wake()
             self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._enabled and self._pressed:
             self.setChecked(not self._checked)
         self._pressed = False
+        self._press.set_target(0.0)
+        self._wake()
         self.update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -415,19 +442,25 @@ class AppleSwitch(FocusRingMixin, QWidget):
         if self._hovered or self._pressed:
             self._hovered = False
             self._pressed = False
+            self._press.set_target(0.0)
+            self._wake()
             self.update()
 
     # ── animation ─────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
         reduce = T.reduce_motion()
-        new_t  = self._spring.update(0.016, reduce)
-        if abs(new_t - self._thumb_t) > 0.003:
+        dt = self._dt()
+        new_t = self._spring.update(dt, reduce)
+        self._press.update(dt, reduce)
+        if abs(new_t - self._thumb_t) > 0.003 or not self._press.settled:
             self._thumb_t = new_t
             self.update()
-        if self._spring.settled:
+        if self._spring.settled and self._press.settled:
             self._thumb_t = 1.0 if self._checked else 0.0
+            self._press.snap(1.0 if self._pressed else 0.0)
             self._timer.stop()
+            self.update()
 
     # ── painting ──────────────────────────────────────────────────────────
 
@@ -438,65 +471,51 @@ class AppleSwitch(FocusRingMixin, QWidget):
         dark = T.is_dark()
         w, h = float(self.W), float(self.H)
         r    = h / 2.0
+        t    = self._thumb_t          # 0.0 = off, 1.0 = on
+        dis  = not self._enabled
 
-        t   = self._thumb_t          # 0.0 = off, 1.0 = on
-        dis = not self._enabled
-
-        # Track color — interpolate between off-gray and on-green
         if dis:
-            if dark:
-                track_col = QColor("#3A3A3C")
-                track_col.setAlphaF(0.5)
-            else:
-                track_col = QColor("#C7C7CC")
-                track_col.setAlphaF(0.6)
+            track_col = QColor(120, 120, 128, 70 if dark else 60)
         else:
-            off_col = QColor("#3A3A3C") if dark else QColor("#E5E5EA")
+            off_col = QColor(120, 120, 128, 102 if dark else 82)
             on_col  = QColor("#30D158") if dark else QColor("#34C759")
-            # Lerp RGB
-            pr = off_col.red()   + (on_col.red()   - off_col.red())   * t
-            pg = off_col.green() + (on_col.green()  - off_col.green()) * t
-            pb = off_col.blue()  + (on_col.blue()   - off_col.blue())  * t
-            track_col = QColor(int(pr), int(pg), int(pb))
-
-            if self._pressed:
-                # Darken on press
-                track_col = track_col.darker(115)
-            elif self._hovered:
+            track_col = QColor(
+                int(off_col.red()   + (on_col.red()   - off_col.red())   * t),
+                int(off_col.green() + (on_col.green() - off_col.green()) * t),
+                int(off_col.blue()  + (on_col.blue()  - off_col.blue())  * t),
+                int(off_col.alpha() + (255 - off_col.alpha()) * t),
+            )
+            if self._hovered and not self._pressed:
                 track_col = track_col.lighter(108)
 
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(track_col))
         p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+        # hairline so the off track stays defined on glass
+        hl = QColor(255, 255, 255, 30) if dark else QColor(0, 0, 0, 26)
+        p.setPen(QPen(hl, 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), r - 0.5, r - 0.5)
 
-        # Thumb
+        # Thumb: capsule, elongates with the press spring; concentric with the track (r - margin)
         margin   = 2.0
-        travel   = w - self.THUMB - margin * 2
+        pv       = max(0.0, min(1.4, self._press.value))
+        tw       = self.THUMB + self.STRETCH * pv
+        th       = float(self.THUMB)
+        travel   = w - tw - margin * 2
         thumb_x  = margin + t * travel
         thumb_y  = margin
-        thumb_r  = self.THUMB / 2.0
+        thumb    = QRectF(thumb_x, thumb_y, tw, th)
 
-        # Soft shadow beneath thumb
-        p.setBrush(QBrush(QColor(0, 0, 0, 50 if not dis else 20)))
-        p.drawEllipse(QRectF(thumb_x, thumb_y + 1.2, self.THUMB, self.THUMB))
+        dpr = self.devicePixelRatioF()
+        if not dis:
+            _glass.paint_shadow(p, QRectF(thumb_x + (tw - th) / 2, thumb_y, th, th), th / 2,
+                                blur=6.0, alpha=0.30, dy=1.5, dpr=dpr, exclude_shape=False)
+        thumb_col = QColor(255, 255, 255, 255 if not dis else 190)
+        p.setPen(QPen(QColor(0, 0, 0, 22), 0.8))
+        p.setBrush(QBrush(thumb_col))
+        p.drawRoundedRect(thumb, th / 2.0, th / 2.0)
 
-        # White thumb
-        thumb_col = QColor("#FFFFFF") if not dis else QColor("#FFFFFF" if dark else "#FFFFFF")
-        if dis:
-            thumb_col.setAlphaF(0.7)
-        if self._pressed:
-            # Thumb slightly smaller when pressed (tactile feel)
-            shrink = 1.5
-            p.setBrush(QBrush(thumb_col))
-            p.drawEllipse(QRectF(
-                thumb_x + shrink * t, thumb_y + shrink,
-                self.THUMB - shrink * 2, self.THUMB - shrink * 2
-            ))
-        else:
-            p.setBrush(QBrush(thumb_col))
-            p.drawEllipse(QRectF(thumb_x, thumb_y, self.THUMB, self.THUMB))
-
-        # Focus ring
         self._draw_focus_ring(p, QRectF(0, 0, w, h), r)
 
     def sizeHint(self) -> QSize:
@@ -504,17 +523,18 @@ class AppleSwitch(FocusRingMixin, QWidget):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. SegmentedControl — sliding pill thumb
+# 5. SegmentedControl — capsule glass track, sliding glass thumb (spring morph)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class SegmentedControl(FocusRingMixin, QWidget):
+class SegmentedControl(FocusRingMixin, _SpringTicker, QWidget):
     """
-    macOS/iOS segmented control with an animated sliding pill thumb.
+    Capsule segmented control: recessed glass track, raised glass thumb with soft shadow. The thumb slides
+    on a spring and stretches with its velocity; pressing squeezes it (second spring).
     Options: list of (id: str, label: str).
-    Selected segment highlighted by a spring-animated squircle underlay.
-    Light + dark theme aware.
     """
     valueChanged = Signal(str)
+
+    PAD = 3.0          # track padding -> thumb radius is concentric: (h/2) - PAD
 
     def __init__(
         self,
@@ -529,6 +549,7 @@ class SegmentedControl(FocusRingMixin, QWidget):
 
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
         self.setFixedHeight(30)
         self.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
 
@@ -537,10 +558,9 @@ class SegmentedControl(FocusRingMixin, QWidget):
         self._spring = Spring(float(self._idx))
         self._spring.k = SPRING.fast.stiffness
         self._spring.c = SPRING.fast.damping
+        self._press = Spring(0.0, SPRING.fast.stiffness, SPRING.fast.damping)
         self._thumb_x  = float(self._idx)
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
+        self._init_ticker()
 
     def _index_of(self, oid: str) -> int:
         for i, (o, _) in enumerate(self.options):
@@ -558,20 +578,22 @@ class SegmentedControl(FocusRingMixin, QWidget):
         idx = self._index_of(oid)
         self._idx = idx
         self._spring.set_target(float(idx))
-        if not self._timer.isActive():
-            self._timer.start(16)
+        self._wake()
         if not silent:
             self.valueChanged.emit(oid)
         self.update()
 
     def _tick(self) -> None:
-        new_x = self._spring.update(0.016, T.reduce_motion())
-        if abs(new_x - self._thumb_x) > 0.002:
-            self._thumb_x = new_x
-            self.update()
-        if self._spring.settled:
+        reduce = T.reduce_motion()
+        dt = self._dt()
+        new_x = self._spring.update(dt, reduce)
+        self._press.update(dt, reduce)
+        self._thumb_x = new_x
+        self.update()
+        if self._spring.settled and self._press.settled:
             self._thumb_x = float(self._idx)
             self._timer.stop()
+            self.update()
 
     def _seg_rect(self, idx: int) -> QRectF:
         n   = len(self.options)
@@ -585,12 +607,18 @@ class SegmentedControl(FocusRingMixin, QWidget):
         idx = int(event.position().x() // seg)
         idx = max(0, min(idx, n - 1))
         oid = self.options[idx][0]
+        self._press.set_target(1.0)
+        self._wake()
         self.setValue(oid)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._press.set_target(0.0)
+        self._wake()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         n   = len(self.options)
         seg = self.width() / n
-        new_hov = int(event.position().x() // seg)
+        new_hov = max(0, min(n - 1, int(event.position().x() // seg)))
         if self._hovered != new_hov:
             self._hovered = new_hov
             self.update()
@@ -618,82 +646,90 @@ class SegmentedControl(FocusRingMixin, QWidget):
 
         dark  = T.is_dark()
         w, h  = float(self.width()), float(self.height())
-        n     = len(self.options)
+        n     = max(1, len(self.options))
         seg_w = w / n
-        hpad  = 3.0      # horizontal track padding
-        vpad  = 3.0      # vertical track padding
+        pad   = self.PAD
+        dpr   = self.devicePixelRatioF()
 
-        # Track background
-        track_col = QColor("#3A3A3C") if dark else QColor("#E5E5EA")
+        # Recessed glass track (capsule)
+        track_r = h / 2.0
+        track_col = QColor(255, 255, 255, 20) if dark else QColor(0, 0, 0, 16)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(track_col))
-        track_r = (h - vpad * 2) / 2.0
-        p.drawRoundedRect(QRectF(hpad, vpad, w - hpad * 2, h - vpad * 2), track_r, track_r)
+        p.drawRoundedRect(QRectF(0, 0, w, h), track_r, track_r)
+        p.setPen(QPen(QColor(255, 255, 255, 26) if dark else QColor(0, 0, 0, 22), 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), track_r - 0.5, track_r - 0.5)
 
-        # Animated pill thumb
-        thumb_w = seg_w - 4.0
-        thumb_h = h - vpad * 2 - 2.0
-        thumb_x = hpad + 2.0 + self._thumb_x * seg_w
-        thumb_y = vpad + 1.0
-        thumb_r = thumb_h / 2.0
+        # Raised thumb: stretches with spring velocity, squeezes when pressed
+        vel      = abs(self._spring.velocity) * seg_w * 0.035
+        stretch  = min(12.0, vel)
+        squeeze  = 2.0 * max(0.0, min(1.0, self._press.value))
+        base_w   = seg_w - 2 * pad
+        tw       = base_w + stretch - squeeze
+        th       = h - 2 * pad
+        tw = max(th, round(tw / 2.0) * 2.0)                       # quantised: bounded edge-layer cache
+        cx       = (self._thumb_x + 0.5) * seg_w
+        thumb    = QRectF(cx - tw / 2.0, pad, tw, th)
+        thumb_r  = _glass.concentric(track_r, pad)
 
-        # Drop shadow beneath thumb
-        p.setBrush(QBrush(QColor(0, 0, 0, 35)))
-        p.drawRoundedRect(QRectF(thumb_x, thumb_y + 1.0, thumb_w, thumb_h), thumb_r, thumb_r)
-
-        thumb_surface = QColor("#FFFFFF") if dark else QColor("#FFFFFF")
-        p.setBrush(QBrush(thumb_surface))
-        p.drawRoundedRect(QRectF(thumb_x, thumb_y, thumb_w, thumb_h), thumb_r, thumb_r)
+        _glass.paint_shadow(p, QRectF(cx - base_w / 2.0, pad, base_w, th), thumb_r, blur=8.0,
+                            alpha=0.32 if dark else 0.20, dy=2.0, dpr=dpr, exclude_shape=False)
+        thumb_col = QColor(255, 255, 255, 56) if dark else QColor(255, 255, 255, 255)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(thumb_col))
+        p.drawRoundedRect(thumb, thumb_r, thumb_r)
+        p.drawPixmap(thumb.topLeft(), _glass.edge_layer(int(round(tw)), int(round(th)), thumb_r, dark, dpr,
+                                                        specular=True, glow=False))
 
         # Hover hint
         if self._hovered is not None and self._hovered != self._idx:
-            hover_x = hpad + 2.0 + self._hovered * seg_w
-            hover_col = QColor(255, 255, 255, 15) if dark else QColor(0, 0, 0, 8)
+            hx = self._hovered * seg_w + pad
+            hover_col = QColor(255, 255, 255, 15) if dark else QColor(0, 0, 0, 10)
+            p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(hover_col))
-            p.drawRoundedRect(QRectF(hover_x, thumb_y, thumb_w, thumb_h), thumb_r, thumb_r)
+            p.drawRoundedRect(QRectF(hx, pad, base_w, th), thumb_r, thumb_r)
 
         # Labels
-        p.setPen(Qt.PenStyle.NoPen)
         label_font = qfont(TYPE.footnote)
-        label_font.setWeight(QFont.Weight.Medium)
-        p.setFont(label_font)
-
         for i, (oid, label) in enumerate(self.options):
             is_sel = (i == self._idx)
-            seg_x  = i * seg_w
-            text_col = QColor("#1C1C1E") if is_sel else (
-                QColor("#AEAEB2") if dark else QColor("#6C6C70")
-            )
-            if is_sel:
-                label_font.setWeight(QFont.Weight.DemiBold)
-                p.setFont(label_font)
-            else:
-                label_font.setWeight(QFont.Weight.Medium)
-                p.setFont(label_font)
+            label_font.setWeight(QFont.Weight.DemiBold if is_sel else QFont.Weight.Medium)
+            p.setFont(label_font)
+            p.setPen(_glass.label_color("label" if is_sel else "secondary_label", dark))
+            p.drawText(QRectF(i * seg_w, 0, seg_w, h), Qt.AlignmentFlag.AlignCenter, label)
 
-            p.setPen(text_col)
-            p.drawText(QRectF(seg_x, 0, seg_w, h), Qt.AlignmentFlag.AlignCenter, label)
+        self._draw_focus_ring(p, QRectF(0, 0, w, h), track_r)
 
-        self._draw_focus_ring(p, QRectF(hpad, vpad, w - hpad * 2, h - vpad * 2), track_r)
+    def _seg_width(self) -> int:
+        """Equal segments, each wide enough for the longest label (+ capsule padding)."""
+        f = qfont(TYPE.footnote)
+        f.setWeight(QFont.Weight.DemiBold)
+        fm = QFontMetrics(f)
+        widest = max((fm.horizontalAdvance(lbl) for _, lbl in self.options), default=40)
+        return max(64, widest + 28)
 
     def sizeHint(self) -> QSize:
-        return QSize(len(self.options) * 80, 30)
+        return QSize(len(self.options) * self._seg_width(), 30)
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. HSlider — 28 px thumb, live value label, focus ring
+# 6. HSlider — capsule track, glass capsule thumb (grows on press), live value
 # ──────────────────────────────────────────────────────────────────────────────
 
-class HSlider(FocusRingMixin, QWidget):
+class HSlider(FocusRingMixin, _SpringTicker, QWidget):
     """
-    Horizontal slider with a 28 px white thumb + soft shadow + focus ring.
-    Emits valueChanged(float) on each tick.
-    Optional unit suffix appended to the live label.
+    Horizontal slider: capsule track, glass capsule thumb with soft shadow (grows on press via spring),
+    focus ring. Emits valueChanged(float) on each change.
     """
     valueChanged = Signal(float)
 
-    THUMB = SIZES.slider_thumb
-    TRACK = SIZES.slider_track
+    THUMB = SIZES.slider_thumb            # thumb height
+    THUMB_W = SIZES.slider_thumb + 10     # capsule thumb width
+    TRACK = 6
 
     def __init__(
         self,
@@ -709,11 +745,20 @@ class HSlider(FocusRingMixin, QWidget):
         self._val  = max(minimum, min(maximum, value))
         self._unit = unit
         self._drag = False
+        self._press = Spring(0.0, SPRING.fast.stiffness, SPRING.fast.damping)
+        self._init_ticker()
         self.setFixedHeight(self.THUMB + 8)
         self.setMinimumWidth(100)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _tick(self) -> None:
+        self._press.update(self._dt(), T.reduce_motion())
+        self.update()
+        if self._press.settled:
+            self._press.snap(1.0 if self._drag else 0.0)
+            self._timer.stop()
 
     @property
     def value(self) -> float:
@@ -734,7 +779,7 @@ class HSlider(FocusRingMixin, QWidget):
 
     def _track_rect(self) -> Tuple[float, float, float]:
         """Returns (x_start, x_end, cy)."""
-        half_t = self.THUMB / 2.0
+        half_t = self.THUMB_W / 2.0
         x0 = half_t
         x1 = self.width() - half_t
         cy = self.height() / 2.0
@@ -748,6 +793,8 @@ class HSlider(FocusRingMixin, QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag = True
+            self._press.set_target(1.0)
+            self._wake()
             self.setValue(self._x_from_pos(event.position().x()))
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -756,6 +803,8 @@ class HSlider(FocusRingMixin, QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self._drag = False
+        self._press.set_target(0.0)
+        self._wake()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         step = (self._max - self._min) / 100.0
@@ -775,52 +824,91 @@ class HSlider(FocusRingMixin, QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         dark  = T.is_dark()
+        dpr   = self.devicePixelRatioF()
         x0, x1, cy = self._track_rect()
         frac  = self._frac()
         thumb_cx = x0 + frac * (x1 - x0)
-        half_th  = self.THUMB / 2.0
         half_tr  = self.TRACK / 2.0
 
-        # Track background
-        track_bg = QColor("#3A3A3C") if dark else QColor("#E5E5EA")
+        # Recessed capsule track
+        track_bg = QColor(120, 120, 128, 96 if dark else 70)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(track_bg))
-        p.drawRoundedRect(QRectF(x0, cy - half_tr, x1 - x0, self.TRACK), half_tr, half_tr)
+        p.drawRoundedRect(QRectF(x0 - half_tr, cy - half_tr, x1 - x0 + self.TRACK, self.TRACK), half_tr, half_tr)
 
         # Fill portion
         accent = T.color.accent.resolve(dark)
         p.setBrush(QBrush(accent))
-        fill_w = max(0.0, thumb_cx - x0)
-        p.drawRoundedRect(QRectF(x0, cy - half_tr, fill_w, self.TRACK), half_tr, half_tr)
+        fill_w = max(0.0, thumb_cx - x0) + half_tr
+        p.drawRoundedRect(QRectF(x0 - half_tr, cy - half_tr, fill_w, self.TRACK), half_tr, half_tr)
 
-        # Thumb shadow
-        p.setBrush(QBrush(QColor(0, 0, 0, 40)))
-        p.drawEllipse(QPointF(thumb_cx, cy + 1.2), half_th, half_th)
-
-        # Thumb
-        p.setBrush(QBrush(QColor("#FFFFFF")))
-        p.drawEllipse(QPointF(thumb_cx, cy), half_th, half_th)
+        # Glass capsule thumb (grows slightly on press)
+        pv = max(0.0, min(1.4, self._press.value))
+        tw = self.THUMB_W * (1.0 + 0.10 * pv)
+        th = self.THUMB * (1.0 + 0.10 * pv)
+        thumb = QRectF(thumb_cx - tw / 2.0, cy - th / 2.0, tw, th)
+        _glass.paint_shadow(p, QRectF(thumb_cx - self.THUMB_W / 2.0, cy - self.THUMB / 2.0,
+                                      self.THUMB_W, self.THUMB), self.THUMB / 2.0, blur=9.0,
+                            alpha=0.36 if dark else 0.24, dy=2.5, dpr=dpr, exclude_shape=False)
+        p.setPen(QPen(QColor(0, 0, 0, 26), 0.8))
+        p.setBrush(QBrush(QColor(255, 255, 255, 250)))
+        p.drawRoundedRect(thumb, th / 2.0, th / 2.0)
 
         # Focus ring around thumb
         if self._has_focus:
             ring_c = QColor(accent.red(), accent.green(), accent.blue(), SIZES.focus_ring_a)
             p.setPen(QPen(ring_c, SIZES.focus_ring_w))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(thumb_cx, cy), half_th + SIZES.focus_ring_w, half_th + SIZES.focus_ring_w)
+            g = SIZES.focus_ring_w
+            p.drawRoundedRect(thumb.adjusted(-g, -g, g, g), th / 2.0 + g, th / 2.0 + g)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7. GroupedCard
+# 7. GlassLabel + GroupedCard
 # ──────────────────────────────────────────────────────────────────────────────
+
+class GlassLabel(QLabel):
+    """
+    QLabel for text that sits directly on the window glass (page titles, subtitles, card footnotes).
+    Paints a tight tint plate behind the text whenever the glass setting needs one for 4.5:1 contrast
+    (plate alpha is solved in ui/glass.py; 0 on a tinted/solid window that already carries the text).
+    """
+    PAD_X = 8
+    PAD_Y = 3
+
+    def __init__(self, text: str = "", parent: Optional[QWidget] = None):
+        super().__init__(text, parent)
+        self.setContentsMargins(self.PAD_X, self.PAD_Y, self.PAD_X, self.PAD_Y)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        spec = _glass.current("window", T.is_dark())
+        if spec.label_alpha > 0.02 and self.text():
+            fm = self.fontMetrics()
+            avail = max(10, self.width() - 2 * self.PAD_X)
+            flags = int(Qt.TextFlag.TextWordWrap) if self.wordWrap() else 0
+            br = fm.boundingRect(0, 0, avail, 10000, flags, self.text())
+            tw = min(self.width(), br.width() + 2 * self.PAD_X)
+            th = min(self.height(), br.height() + 2 * self.PAD_Y)
+            rect = QRectF(0, 0, tw, th)
+            r = min(th / 2.0, 12.0)
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(spec.label_plate_color)
+            p.drawRoundedRect(rect, r, r)
+            p.end()
+        super().paintEvent(event)
+
 
 class GroupedCard(QWidget):
     """
-    Apple HIG System Settings inset grouped card.
-    Paint is done in paintEvent using QPainter (not QSS) for squircle corners.
-    Rows are separated by 1 px inset hairlines.
-    Each row = left-side title+description stack, right-side control widget.
-    Optional footnote text beneath the entire card.
+    Liquid-glass inset grouped card.
+    Painted with the cached glass layers (plate, soft shadow, specular + glow + hairline edge) — the plate
+    alpha follows the Clear/Tinted + Transparency setting and never drops below what 4.5:1 text needs.
+    Rows are separated by 1 px hairlines. Each row = title+description stack on the left, control on the right.
+    Optional footnote beneath the card.
     """
+    SHADOW_PAD = 8
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -830,8 +918,8 @@ class GroupedCard(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
 
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(6)
+        self._layout.setContentsMargins(0, 0, 0, self.SHADOW_PAD)
+        self._layout.setSpacing(4)
 
         self._inner = QWidget(self)
         self._inner.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
@@ -858,20 +946,7 @@ class GroupedCard(QWidget):
         accessory  — optional extra right widget (e.g., a small info label)
         """
         if self._rows:
-            # Inset hairline divider
-            div = QFrame(self._inner)
-            div.setFixedHeight(1)
-            # Hairline at ~8% alpha per spec
-            dark = T.is_dark()
-            div_color = "rgba(255, 255, 255, 20)" if dark else "rgba(0, 0, 0, 20)"
-            div.setStyleSheet(f"background: {div_color}; border: none;")
-            # Inset by left pad to match Apple's inset divider
-            div_container = QWidget(self._inner)
-            div_layout    = QHBoxLayout(div_container)
-            div_layout.setContentsMargins(0, 0, 0, 0)
-            div_layout.addSpacing(0)
-            div_layout.addWidget(div)
-            self._inner_layout.addWidget(div_container)
+            self._add_divider()
 
         row_widget  = QWidget(self._inner)
         row_layout  = QHBoxLayout(row_widget)
@@ -888,13 +963,13 @@ class GroupedCard(QWidget):
         title_font = qfont(TYPE.body)
         title_font.setWeight(QFont.Weight.DemiBold)
         lbl_title.setFont(title_font)
-        lbl_title.setStyleSheet(f"color: {T.color.label.resolve(dark).name()};")
+        lbl_title.setStyleSheet(f"color: {_glass.label_color('label', dark).name()};")
         text_col.addWidget(lbl_title)
 
         if description:
             lbl_desc = QLabel(description, row_widget)
             lbl_desc.setFont(qfont(TYPE.footnote))
-            lbl_desc.setStyleSheet(f"color: {T.color.secondary_label.resolve(dark).name()};")
+            lbl_desc.setStyleSheet(f"color: {_glass.label_color('secondary_label', dark).name()};")
             lbl_desc.setWordWrap(True)
             text_col.addWidget(lbl_desc)
 
@@ -907,52 +982,46 @@ class GroupedCard(QWidget):
         self._inner_layout.addWidget(row_widget)
         self._rows.append({"title": title, "widget": widget})
 
+    def add_widget(self, widget: QWidget, *, divider: bool = True) -> None:
+        """Add a full-width content widget (e.g. PageOrderList) as a row of its own."""
+        if self._rows and divider:
+            self._add_divider()
+        self._inner_layout.addWidget(widget)
+        self._rows.append({"title": "", "widget": widget})
+
+    def _add_divider(self) -> None:
+        div = QFrame(self._inner)
+        div.setFixedHeight(1)
+        dark = T.is_dark()
+        div_color = "rgba(255, 255, 255, 20)" if dark else "rgba(0, 0, 0, 20)"
+        div.setStyleSheet(f"background: {div_color}; border: none;")
+        self._inner_layout.addWidget(div)
+
     def set_footnote(self, text: str) -> None:
         """Add a footnote label beneath the card content."""
         self._footnote = text
         dark = T.is_dark()
         if self._footnote_label is None:
-            self._footnote_label = QLabel(self)
+            self._footnote_label = GlassLabel(parent=self)
             self._footnote_label.setFont(qfont(TYPE.footnote))
-            self._footnote_label.setContentsMargins(SPACING.md, 0, SPACING.md, 0)
+            self._footnote_label.setContentsMargins(SPACING.md, GlassLabel.PAD_Y,
+                                                    SPACING.md, GlassLabel.PAD_Y)
             self._footnote_label.setWordWrap(True)
             self._layout.addWidget(self._footnote_label)
         self._footnote_label.setText(text)
-        self._footnote_label.setStyleSheet(f"color: {T.color.secondary_label.resolve(dark).name()}; font-size: 11px;")
+        self._footnote_label.setStyleSheet(
+            f"color: {_glass.label_color('secondary_label', dark).name()}; font-size: 11px;")
 
     def paintEvent(self, event: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         dark = T.is_dark()
+        spec = _glass.current("window", dark)
         inner_geo = self._inner.geometry()
         rect = QRectF(inner_geo.x(), inner_geo.y(), inner_geo.width(), inner_geo.height())
-        r    = float(RADIUS.card)
-
-        # Shadow
-        path = create_squircle_path(rect, r)
-        draw_soft_shadow(p, path, SHADOW.card)
-
-        # Card fill
-        fill = T.color.card_background.resolve(dark)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(fill))
-        p.drawPath(path)
-
-        # Inner stroke (1 px hairline at ~8% alpha)
-        stroke_col = QColor(255, 255, 255, 20) if dark else QColor(0, 0, 0, 14)
-        p.setPen(QPen(stroke_col, 1.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        inner_rect = rect.adjusted(0.5, 0.5, -0.5, -0.5)
-        p.drawPath(create_squircle_path(inner_rect, r - 0.5))
-
-        # Top specular highlight
-        spec_grad = QLinearGradient(0, rect.top(), 0, rect.top() + min(16.0, rect.height() * 0.3))
-        spec_grad.setColorAt(0.0, QColor(255, 255, 255, 18 if dark else 50))
-        spec_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(spec_grad))
-        p.drawPath(create_squircle_path(rect.adjusted(1, 1, -1, rect.height()), r - 1))
+        _glass.paint_glass(p, rect, _glass.GLASS.card_radius, spec, fill="plate", shadow=True,
+                           dpr=self.devicePixelRatioF(), shadow_blur=12.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1044,12 +1113,17 @@ class AppleComboBox(QComboBox):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. Buttons
+# 9. Buttons — capsule glass, floating soft shadow, spring hover/press morph
 # ──────────────────────────────────────────────────────────────────────────────
 
-class _BaseButton(FocusRingMixin, QWidget):
-    """Internal base for all button variants."""
+class _BaseButton(FocusRingMixin, _SpringTicker, QWidget):
+    """
+    Internal base for all button variants. Capsule geometry; the widget is a few px larger than the
+    visible capsule so the cached soft shadow can float under it. Hover/press are springs.
+    """
     clicked = Signal()
+
+    PX, PT, PB = 2, 1, 3          # shadow room: left/right, top, bottom
 
     def __init__(
         self,
@@ -1062,13 +1136,17 @@ class _BaseButton(FocusRingMixin, QWidget):
         self._hovered = False
         self._pressed = False
         self._enabled = True
-        self.setFixedHeight(height)
+        self._vis_h   = height
+        self.setFixedHeight(height + self.PT + self.PB)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
         font = qfont(TYPE.body)
         font.setWeight(QFont.Weight.Medium)
         self._font = font
+        self._hv = Spring(0.0, SPRING.fast.stiffness, SPRING.fast.damping)   # hover amount 0..1
+        self._pv = Spring(0.0, SPRING.fast.stiffness, SPRING.fast.damping)   # press amount 0..1
+        self._init_ticker()
 
     def text(self) -> str:
         return self._label
@@ -1089,26 +1167,43 @@ class _BaseButton(FocusRingMixin, QWidget):
     def isEnabled(self) -> bool:
         return self._enabled
 
+    def _tick(self) -> None:
+        dt, rm = self._dt(), T.reduce_motion()
+        self._hv.update(dt, rm)
+        self._pv.update(dt, rm)
+        self.update()
+        if self._hv.settled and self._pv.settled:
+            self._timer.stop()
+
     def enterEvent(self, e) -> None:
         if not self._hovered:
             self._hovered = True
+            self._hv.set_target(1.0)
+            self._wake()
             self.update()
 
     def leaveEvent(self, e) -> None:
         if self._hovered or self._pressed:
             self._hovered = False
             self._pressed = False
+            self._hv.set_target(0.0)
+            self._pv.set_target(0.0)
+            self._wake()
             self.update()
 
     def mousePressEvent(self, e: QMouseEvent) -> None:
         if self._enabled and e.button() == Qt.MouseButton.LeftButton:
             self._pressed = True
+            self._pv.set_target(1.0)
+            self._wake()
             self.update()
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
         if self._enabled and self._pressed:
             self.clicked.emit()
         self._pressed = False
+        self._pv.set_target(0.0)
+        self._wake()
         self.update()
 
     def keyPressEvent(self, e: QKeyEvent) -> None:
@@ -1121,7 +1216,30 @@ class _BaseButton(FocusRingMixin, QWidget):
     def sizeHint(self) -> QSize:
         fm   = QFontMetrics(self._font)
         text_w = fm.horizontalAdvance(self._label)
-        return QSize(text_w + SPACING.xl * 2, self.height())
+        return QSize(text_w + SPACING.xl * 2 + 2 * self.PX, self.height())
+
+    # -- geometry / painting helpers shared by the variants --------------------------------------------
+    def _capsule(self) -> Tuple[QRectF, float]:
+        """Visible capsule rect (shrinks a hair while pressed) and its radius (h / 2)."""
+        pv = max(0.0, min(1.2, self._pv.value))
+        w, h = float(self.width()), float(self._vis_h)
+        rect = QRectF(self.PX, self.PT, w - 2 * self.PX, h)
+        k = 1.2 * pv
+        rect = rect.adjusted(k, k * 0.5, -k, -k * 0.5)
+        return rect, rect.height() / 2.0
+
+    def _paint_capsule(self, p: QPainter, rect: QRectF, r: float, fill: QColor, *,
+                       shadow: float = 0.0, glow: bool = False, specular: bool = True) -> None:
+        dark = T.is_dark()
+        dpr = self.devicePixelRatioF()
+        if shadow > 0.0 and self._enabled:
+            _glass.paint_shadow(p, rect, r, blur=8.0, alpha=shadow, dy=2.0, dpr=dpr, exclude_shape=False)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(fill))
+        p.drawRoundedRect(rect, r, r)
+        edge = _glass.edge_layer(int(round(rect.width())), int(round(rect.height())), r, dark, dpr,
+                                 specular=specular and self._enabled, glow=glow)
+        p.drawPixmap(rect.topLeft(), edge)
 
     def _draw_label(
         self,
@@ -1135,148 +1253,367 @@ class _BaseButton(FocusRingMixin, QWidget):
 
 
 class PrimaryButton(_BaseButton):
-    """Filled accent-color button (e.g., Save, Connect, Test)."""
+    """Filled accent capsule (e.g., Save, Connect, Test). Fill is tuned so the white label reads >= 4.5:1."""
 
     def paintEvent(self, event: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        dark   = T.is_dark()
-        w, h   = float(self.width()), float(self.height())
-        r      = float(RADIUS.control)
-        rect   = QRectF(0, 0, w, h)
-        path   = create_squircle_path(rect, r)
-        accent = T.color.accent.resolve(dark)
-
+        dark = T.is_dark()
+        rect, r = self._capsule()
+        fill = _glass.solid_fill_for_white(QColor(T.color.accent.resolve(dark)))
+        hv, pv = self._hv.value, self._pv.value
         if not self._enabled:
-            accent.setAlphaF(0.4)
-        elif self._pressed:
-            accent = accent.darker(120)
-        elif self._hovered:
-            accent = accent.lighter(110)
-
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(accent))
-        p.drawPath(path)
-
+            fill.setAlphaF(0.4)
+        else:
+            if hv > 0.001:
+                fill = fill.lighter(100 + int(7 * min(1.0, hv)))
+            if pv > 0.001:
+                fill = fill.darker(100 + int(12 * min(1.0, pv)))
+        self._paint_capsule(p, rect, r, fill, shadow=0.30 if dark else 0.22)
         text_col = QColor("#FFFFFF")
         if not self._enabled:
-            text_col.setAlphaF(0.55)
+            text_col.setAlphaF(0.7)
         self._draw_label(p, text_col, rect)
         self._draw_focus_ring(p, rect, r)
 
 
 class PlainButton(_BaseButton):
-    """Tinted glass button (default secondary style)."""
+    """Glass capsule (default secondary style)."""
 
     def paintEvent(self, event: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        dark  = T.is_dark()
-        w, h  = float(self.width()), float(self.height())
-        r     = float(RADIUS.control)
-        rect  = QRectF(0, 0, w, h)
-        path  = create_squircle_path(rect, r)
-
+        dark = T.is_dark()
+        rect, r = self._capsule()
+        hv, pv = min(1.0, self._hv.value), min(1.0, self._pv.value)
         if dark:
-            base = QColor(255, 255, 255, 22 if not self._pressed else 12)
-            if self._hovered and not self._pressed:
-                base = QColor(255, 255, 255, 32)
+            a = 24 + 12 * hv - 10 * pv
+            fill = QColor(255, 255, 255, int(a))
         else:
-            base = QColor(0, 0, 0, 14 if not self._pressed else 6)
-            if self._hovered and not self._pressed:
-                base = QColor(0, 0, 0, 22)
-
+            a = 14 + 8 * hv - 6 * pv
+            fill = QColor(0, 0, 0, int(a))
         if not self._enabled:
-            base.setAlphaF(base.alphaF() * 0.5)
-
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(base))
-        p.drawPath(path)
-
-        # Subtle border
-        border = QColor(255, 255, 255, 18) if dark else QColor(0, 0, 0, 14)
-        p.setPen(QPen(border, 1.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(create_squircle_path(rect.adjusted(0.5, 0.5, -0.5, -0.5), r))
-
-        text_col = T.color.label.resolve(dark)
+            fill.setAlphaF(fill.alphaF() * 0.5)
+        self._paint_capsule(p, rect, r, fill, shadow=0.0, glow=True)
+        text_col = _glass.label_color("label", dark)
         if not self._enabled:
-            text_col = T.color.tertiary_label.resolve(dark)
+            text_col = QColor(T.color.tertiary_label.resolve(dark))
         self._draw_label(p, text_col, rect)
         self._draw_focus_ring(p, rect, r)
 
 
 class DestructiveButton(_BaseButton):
-    """Tinted destructive/danger button (red)."""
+    """Tinted destructive/danger capsule (red); label colour is fitted to >= 4.5:1 on its own tint."""
 
     def paintEvent(self, event: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        dark  = T.is_dark()
-        w, h  = float(self.width()), float(self.height())
-        r     = float(RADIUS.control)
-        rect  = QRectF(0, 0, w, h)
-        path  = create_squircle_path(rect, r)
-        dest  = T.color.destructive.resolve(dark)
-
-        if self._pressed:
-            p.setBrush(QBrush(dest))
-            text_col = QColor("#FFFFFF")
-        elif self._hovered:
-            tint = QColor(dest.red(), dest.green(), dest.blue(), 50)
-            p.setBrush(QBrush(tint))
-            text_col = dest
+        dark = T.is_dark()
+        rect, r = self._capsule()
+        dest = T.color.destructive.resolve(dark)
+        hv, pv = min(1.0, self._hv.value), min(1.0, self._pv.value)
+        pressed_solid = pv > 0.5
+        tint = QColor(dest.red(), dest.green(), dest.blue(), 255 if pressed_solid else int(26 + 28 * hv))
+        self._paint_capsule(p, rect, r, tint, glow=True)
+        if pressed_solid:
+            text_col = _glass.readable_on(dest)
         else:
-            tint = QColor(dest.red(), dest.green(), dest.blue(), 25)
-            p.setBrush(QBrush(tint))
-            text_col = dest
-
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawPath(path)
-        border = QColor(dest.red(), dest.green(), dest.blue(), 80)
-        p.setPen(QPen(border, 1.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(create_squircle_path(rect.adjusted(0.5, 0.5, -0.5, -0.5), r))
-
+            plate = (30, 30, 35) if dark else (255, 255, 255)
+            text_col = _glass.fit_text(dest, plate)
         if not self._enabled:
-            text_col.setAlphaF(0.4)
+            text_col.setAlphaF(0.5)
         self._draw_label(p, text_col, rect)
         self._draw_focus_ring(p, rect, r)
 
 
 class SuccessButton(_BaseButton):
-    """Filled success/green button."""
+    """Filled success/green capsule; the label is whichever of white/ink reads best on the fill."""
 
     def paintEvent(self, event: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        dark    = T.is_dark()
-        w, h    = float(self.width()), float(self.height())
-        r       = float(RADIUS.control)
-        rect    = QRectF(0, 0, w, h)
-        path    = create_squircle_path(rect, r)
-        success = T.color.success.resolve(dark)
-
+        dark = T.is_dark()
+        rect, r = self._capsule()
+        success = QColor(T.color.success.resolve(dark))
+        hv, pv = self._hv.value, self._pv.value
         if not self._enabled:
             success.setAlphaF(0.4)
-        elif self._pressed:
-            success = success.darker(115)
-        elif self._hovered:
-            success = success.lighter(108)
-
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(success))
-        p.drawPath(path)
-
-        text_col = QColor("#FFFFFF")
+        else:
+            if hv > 0.001:
+                success = success.lighter(100 + int(6 * min(1.0, hv)))
+            if pv > 0.001:
+                success = success.darker(100 + int(10 * min(1.0, pv)))
+        self._paint_capsule(p, rect, r, success, shadow=0.26 if dark else 0.18)
+        text_col = _glass.readable_on(T.color.success.resolve(dark))
         if not self._enabled:
-            text_col.setAlphaF(0.5)
+            text_col.setAlphaF(0.6)
         self._draw_label(p, text_col, rect)
         self._draw_focus_ring(p, rect, r)
+
+
+class CapsuleIconButton(FocusRingMixin, _SpringTicker, QWidget):
+    """Round glass capsule with a chevron ("up" | "down"); used by PageOrderList. Hover/press are springs."""
+    clicked = Signal()
+
+    def __init__(self, kind: str = "up", size: int = 30, tip: str = "", parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._kind = kind
+        self._enabled = True
+        self._hovered = False
+        self._pressed = False
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        if tip:
+            self.setToolTip(tip)
+            self.setAccessibleName(tip)
+        self._hv = Spring(0.0, SPRING.fast.stiffness, SPRING.fast.damping)
+        self._pv = Spring(0.0, SPRING.fast.stiffness, SPRING.fast.damping)
+        self._init_ticker()
+
+    def setEnabled(self, v: bool) -> None:
+        if self._enabled == v:
+            return
+        self._enabled = v
+        self.setCursor(Qt.CursorShape.PointingHandCursor if v else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def isEnabled(self) -> bool:
+        return self._enabled
+
+    def _tick(self) -> None:
+        dt, rm = self._dt(), T.reduce_motion()
+        self._hv.update(dt, rm)
+        self._pv.update(dt, rm)
+        self.update()
+        if self._hv.settled and self._pv.settled:
+            self._timer.stop()
+
+    def enterEvent(self, e) -> None:
+        self._hovered = True
+        self._hv.set_target(1.0)
+        self._wake()
+
+    def leaveEvent(self, e) -> None:
+        self._hovered = self._pressed = False
+        self._hv.set_target(0.0)
+        self._pv.set_target(0.0)
+        self._wake()
+
+    def mousePressEvent(self, e: QMouseEvent) -> None:
+        if self._enabled and e.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self._pv.set_target(1.0)
+            self._wake()
+
+    def mouseReleaseEvent(self, e: QMouseEvent) -> None:
+        if self._enabled and self._pressed:
+            self.clicked.emit()
+        self._pressed = False
+        self._pv.set_target(0.0)
+        self._wake()
+
+    def keyPressEvent(self, e: QKeyEvent) -> None:
+        if e.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return) and self._enabled:
+            self.clicked.emit()
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        dark = T.is_dark()
+        dpr = self.devicePixelRatioF()
+        s = float(self.width())
+        hv, pv = min(1.0, self._hv.value), min(1.0, self._pv.value)
+        k = 1.0 * pv
+        rect = QRectF(k, k, s - 2 * k, s - 2 * k)
+        r = rect.height() / 2.0
+        a = (26 + 14 * hv - 10 * pv) if dark else (16 + 8 * hv - 6 * pv)
+        fill = QColor(255, 255, 255, int(a)) if dark else QColor(0, 0, 0, int(a))
+        if not self._enabled:
+            fill.setAlphaF(fill.alphaF() * 0.5)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        p.drawEllipse(rect)
+        p.drawPixmap(rect.topLeft(), _glass.edge_layer(int(round(rect.width())), int(round(rect.height())), r,
+                                                       dark, dpr, specular=self._enabled, glow=True))
+        col = _glass.label_color("label", dark)
+        if not self._enabled:
+            col.setAlphaF(0.35)
+        p.setPen(QPen(col, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        cx, cy = s / 2.0, s / 2.0
+        d = 3.2 if self._kind == "up" else -3.2
+        p.drawLine(QPointF(cx - 4.5, cy + d / 2), QPointF(cx, cy - d / 2))
+        p.drawLine(QPointF(cx, cy - d / 2), QPointF(cx + 4.5, cy + d / 2))
+        self._draw_focus_ring(p, QRectF(0, 0, s, s), s / 2.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9b. PageOrderList — reorderable list with on/off switches and up/down capsule buttons
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _PageRow(QWidget):
+    """One glass row inside PageOrderList; inner radius is concentric with the card (card radius - pad)."""
+
+    def __init__(self, pid: str, title: str, desc: str, enabled: bool, parent: QWidget):
+        super().__init__(parent)
+        self.pid = pid
+        self.setFixedHeight(PageOrderList.ROW_H)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 6, 10, 6)
+        lay.setSpacing(10)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        self.lbl_title = QLabel(title, self)
+        tf = qfont(TYPE.body)
+        tf.setWeight(QFont.Weight.DemiBold)
+        self.lbl_title.setFont(tf)
+        self.lbl_desc = QLabel(desc, self)
+        self.lbl_desc.setFont(qfont(TYPE.footnote))
+        col.addWidget(self.lbl_title)
+        col.addWidget(self.lbl_desc)
+        lay.addLayout(col, 1)
+        self.switch = AppleSwitch(enabled, self)
+        self.btn_up = CapsuleIconButton("up", 30, "Move up", self)
+        self.btn_down = CapsuleIconButton("down", 30, "Move down", self)
+        lay.addWidget(self.switch)
+        lay.addSpacing(4)
+        lay.addWidget(self.btn_up)
+        lay.addWidget(self.btn_down)
+        self.refresh_colors(enabled)
+
+    def refresh_colors(self, enabled: bool) -> None:
+        dark = T.is_dark()
+        pri = _glass.label_color("label", dark).name()
+        sec = _glass.label_color("secondary_label", dark).name()
+        self.lbl_title.setStyleSheet(f"color: {pri if enabled else sec}; background: transparent;")
+        self.lbl_desc.setStyleSheet(f"color: {sec}; background: transparent;")
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        dark = T.is_dark()
+        rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        r = _glass.concentric(_glass.GLASS.card_radius, 6.0)
+        p.setPen(QPen(QColor(255, 255, 255, 22) if dark else QColor(0, 0, 0, 18), 1.0))
+        p.setBrush(QColor(255, 255, 255, 12) if dark else QColor(0, 0, 0, 7))
+        p.drawRoundedRect(rect, r, r)
+
+
+class PageOrderList(QWidget):
+    """
+    Reorderable list of island card pages. Each row: title + footnote, on/off switch, up/down capsule buttons.
+    Reordering is a spring morph (rows glide to their new slots). Emits:
+        orderChanged(list[str])          — full page id order
+        enabledChanged(str, bool)        — page id, enabled
+    """
+    orderChanged = Signal(list)
+    enabledChanged = Signal(str, bool)
+
+    ROW_H = 54
+    GAP = 6
+
+    def __init__(self, pages: List[Tuple[str, str, str]], order: List[str], enabled: dict,
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._defs = {pid: (title, desc) for pid, title, desc in pages}
+        seen: List[str] = []
+        for pid in list(order) + [pid for pid, _, _ in pages]:
+            if pid in self._defs and pid not in seen:
+                seen.append(pid)
+        self._order = seen
+        self._enabled = {pid: bool(enabled.get(pid, True)) for pid in self._defs}
+        self.rows: dict = {}
+        self._ys: dict = {}
+        self._ticker = QTimer(self)
+        self._ticker.timeout.connect(self._tick)
+        self._last = time.perf_counter()
+        n = len(self._order)
+        self.setFixedHeight(n * self.ROW_H + max(0, n - 1) * self.GAP)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for pid in self._order:
+            title, desc = self._defs[pid]
+            row = _PageRow(pid, title, desc, self._enabled[pid], self)
+            row.switch.toggled.connect(lambda v, k=pid: self._on_toggle(k, v))
+            row.btn_up.clicked.connect(lambda k=pid: self.move_page(k, -1))
+            row.btn_down.clicked.connect(lambda k=pid: self.move_page(k, +1))
+            self.rows[pid] = row
+            self._ys[pid] = Spring(self._slot_y(self._order.index(pid)), SPRING.fast.stiffness, SPRING.fast.damping)
+        self._place(immediate=True)
+        self._sync_buttons()
+
+    # -- public ------------------------------------------------------------------------------------
+    def order(self) -> List[str]:
+        return list(self._order)
+
+    def enabled_map(self) -> dict:
+        return dict(self._enabled)
+
+    def switch_for(self, pid: str) -> AppleSwitch:
+        return self.rows[pid].switch
+
+    def move_page(self, pid: str, delta: int) -> bool:
+        if pid not in self._order:
+            return False
+        i = self._order.index(pid)
+        j = i + int(delta)
+        if j < 0 or j >= len(self._order):
+            return False
+        self._order[i], self._order[j] = self._order[j], self._order[i]
+        for k, name in enumerate(self._order):
+            self._ys[name].set_target(self._slot_y(k))
+        self._sync_buttons()
+        if not self._ticker.isActive():
+            self._last = time.perf_counter()
+            self._ticker.start(16)
+        self.orderChanged.emit(list(self._order))
+        return True
+
+    # -- internals ---------------------------------------------------------------------------------
+    def _slot_y(self, index: int) -> float:
+        return float(index * (self.ROW_H + self.GAP))
+
+    def _on_toggle(self, pid: str, v: bool) -> None:
+        self._enabled[pid] = bool(v)
+        self.rows[pid].refresh_colors(bool(v))
+        self.enabledChanged.emit(pid, bool(v))
+
+    def _sync_buttons(self) -> None:
+        n = len(self._order)
+        for i, pid in enumerate(self._order):
+            self.rows[pid].btn_up.setEnabled(i > 0)
+            self.rows[pid].btn_down.setEnabled(i < n - 1)
+            self.rows[pid].btn_up.update()
+            self.rows[pid].btn_down.update()
+
+    def _place(self, immediate: bool = False) -> None:
+        w = self.width()
+        for pid, row in self.rows.items():
+            if immediate:
+                self._ys[pid].snap(self._slot_y(self._order.index(pid)))
+            row.setGeometry(0, int(round(self._ys[pid].value)), w, self.ROW_H)
+
+    def resizeEvent(self, event) -> None:
+        self._place()
+        super().resizeEvent(event)
+
+    def _tick(self) -> None:
+        now = time.perf_counter()
+        dt = min(max(now - self._last, SPRING_DT_MIN), SPRING_DT_MAX)
+        self._last = now
+        rm = T.reduce_motion()
+        done = True
+        for pid, sp in self._ys.items():
+            sp.update(dt, rm)
+            if not sp.settled:
+                done = False
+        self._place()
+        if done:
+            for pid, sp in self._ys.items():
+                sp.snap(sp.target)
+            self._place()
+            self._ticker.stop()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1333,19 +1670,19 @@ class StatusPill(QWidget):
         v = self._variant
         if v == "success":
             bg  = T.color.success.resolve(dark)
-            tc  = QColor("#FFFFFF")
+            tc  = _glass.readable_on(bg)
         elif v == "warning":
             bg  = T.color.warning.resolve(dark)
-            tc  = QColor("#000000") if not dark else QColor("#1C1C1E")
+            tc  = _glass.readable_on(bg)
         elif v == "error":
-            bg  = T.color.destructive.resolve(dark)
+            bg  = _glass.solid_fill_for_white(T.color.destructive.resolve(dark))
             tc  = QColor("#FFFFFF")
         elif v == "accent":
-            bg  = T.color.accent.resolve(dark)
+            bg  = _glass.solid_fill_for_white(T.color.accent.resolve(dark))
             tc  = QColor("#FFFFFF")
         else:
             bg  = QColor(120, 120, 128, 50)
-            tc  = T.color.secondary_label.resolve(dark)
+            tc  = _glass.label_color("secondary_label", dark)
 
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(bg))
@@ -1553,18 +1890,27 @@ def make_scroll_page(title: str, subtitle: str) -> Tuple[QWidget, QVBoxLayout]:
     content        = QWidget()
     content_layout = QVBoxLayout(content)
     content_layout.setContentsMargins(SPACING.xl, SPACING.xl, SPACING.xl, SPACING.xl)
-    content_layout.setSpacing(SPACING.lg)
+    content_layout.setSpacing(SPACING.md + 2)      # cards add their own 8 px shadow room
 
-    # Large Title
-    lbl_title = QLabel(title)
+    def _flush_left(lbl: QWidget) -> None:
+        # GlassLabel has plate padding; a negative-margin row keeps the text flush with the cards
+        row = QHBoxLayout()
+        row.setContentsMargins(-GlassLabel.PAD_X, 0, -GlassLabel.PAD_X, 0)
+        row.addWidget(lbl)
+        row.addStretch()
+        content_layout.addLayout(row)
+
+    # Large Title (text sits loose on the window -> GlassLabel gives it a contrast plate when needed)
+    lbl_title = GlassLabel(title)
     lbl_title.setFont(qfont(TYPE.large_title))
-    content_layout.addWidget(lbl_title)
+    _flush_left(lbl_title)
 
     if subtitle:
-        lbl_sub = QLabel(subtitle)
+        lbl_sub = GlassLabel(subtitle)
         lbl_sub.setFont(qfont(TYPE.callout))
-        content_layout.addWidget(lbl_sub)
-        content_layout.addSpacing(SPACING.sm)
+        lbl_sub.setStyleSheet(f"color: {_glass.label_color('secondary_label', T.is_dark()).name()};")
+        _flush_left(lbl_sub)
+        content_layout.addSpacing(SPACING.xxs)
 
     scroll.setWidget(content)
     page_layout.addWidget(scroll)
@@ -1598,7 +1944,8 @@ def slider_card_row(
     lbl_val = QLabel(f"{value:.2f} {unit}")
     lbl_val.setFont(qfont(TYPE.metric))
     lbl_val.setStyleSheet(
-        f"color: {T.color.accent.resolve(dark).name()}; min-width: 56px;"
+        f"color: {_glass.fit_text(T.color.accent.resolve(dark), (30, 30, 35) if dark else (255, 255, 255)).name()};"
+        " min-width: 56px;"
     )
     lbl_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
