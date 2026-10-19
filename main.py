@@ -691,6 +691,7 @@ def main():
     hardware_feed.start()
     start_fullscreen_watcher(ctx, overlay, stop)
     _jlog.start_heartbeat_monitor()
+    _jlog.start_thread_cpu_sampler(interval=10.0)
 
     # 1 s worker-health poll (supervisor monitor thread); posts to the overlay only on change.
     supervisor.start_health_monitor(

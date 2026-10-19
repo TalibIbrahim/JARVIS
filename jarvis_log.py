@@ -336,6 +336,103 @@ def stop_heartbeat_monitor(timeout: float = 2.0) -> None:
         t.join(timeout)
 
 
+# --------------------------------------------------------------------------- per-thread CPU sampler
+
+_cpu_thread: Optional[threading.Thread] = None
+_cpu_lock = threading.Lock()
+_cpu_stop = threading.Event()
+
+
+def _native_thread_description(tid: int) -> str:
+    """OS-level thread name (GetThreadDescription, Win10 1607+); '' when unavailable."""
+    if sys.platform != "win32":
+        return ""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenThread.restype = wintypes.HANDLE
+    k32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.OpenThread(0x0400, False, tid)  # THREAD_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        fn = k32.GetThreadDescription
+        fn.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+        fn.restype = ctypes.c_long
+        out = ctypes.c_wchar_p()
+        if fn(h, ctypes.byref(out)) < 0 or not out.value:
+            return ""
+        val = out.value
+        k32.LocalFree.argtypes = [ctypes.c_void_p]
+        k32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
+        return val
+    finally:
+        k32.CloseHandle(h)
+
+
+def _cpu_sampler_loop(interval: float, top: int) -> None:
+    import psutil
+    log = get_logger("cpu")
+    proc = psutil.Process()
+    ncpu = psutil.cpu_count() or 1
+    prev: Dict[int, float] = {}
+    first_seen: Dict[int, int] = {}
+    desc: Dict[int, str] = {}
+    order = itertools.count(1)
+    prev_t = time.perf_counter()
+    for t in proc.threads():
+        prev[t.id] = t.user_time + t.system_time
+        first_seen[t.id] = next(order)
+    proc.cpu_percent(None)
+    psutil.cpu_percent(None)
+    while not _cpu_stop.wait(interval):
+        try:
+            now = time.perf_counter()
+            dt = max(now - prev_t, 1e-6)
+            prev_t = now
+            names = {t.native_id: t.name for t in threading.enumerate()}
+            cur: Dict[int, float] = {}
+            rows = []
+            for t in proc.threads():
+                cpu = t.user_time + t.system_time
+                cur[t.id] = cpu
+                if t.id not in first_seen:
+                    first_seen[t.id] = next(order)
+                pct = (cpu - prev.get(t.id, cpu)) / dt * 100.0
+                if pct <= 1.0:
+                    continue
+                name = names.get(t.id)
+                if name is None:
+                    if t.id not in desc:
+                        try:
+                            desc[t.id] = _native_thread_description(t.id)
+                        except Exception as exc:
+                            desc[t.id] = ""
+                            log.warning("GetThreadDescription failed tid=%s: %s", t.id, exc)
+                    d = desc[t.id]
+                    name = f"native:{t.id}#{first_seen[t.id]}" + (f"({d})" if d else "")
+                rows.append((pct, name))
+            prev = cur
+            rows.sort(reverse=True)
+            body = " ".join(f"{n}={p:.0f}%" for p, n in rows[:top])
+            log.info("cpu total=%.0f%% (%d cores, 100%%=1 core) system=%.0f%% threads=%d top: %s",
+                     proc.cpu_percent(None), ncpu, psutil.cpu_percent(None), len(cur), body or "-")
+        except Exception as exc:
+            log.warning("cpu sampler error: %s: %s", type(exc).__name__, exc)
+
+
+def start_thread_cpu_sampler(interval: float = 10.0, top: int = 10) -> None:
+    global _cpu_thread
+    with _cpu_lock:
+        if _cpu_thread is not None and _cpu_thread.is_alive():
+            return
+        _cpu_stop.clear()
+        _cpu_thread = threading.Thread(
+            target=_cpu_sampler_loop, args=(interval, top), name="CpuSampler", daemon=True)
+        _cpu_thread.start()
+
+
 # --------------------------------------------------------------------------- thread lifecycle
 
 def thread_started(name: str, **fields) -> None:
