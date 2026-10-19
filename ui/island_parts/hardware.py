@@ -1,6 +1,8 @@
-"""ui/island_parts/hardware.py - Hardware grid and strip renderers plus adapter lifecycle (verbatim move from island.py)."""
+"""ui/island_parts/hardware.py - Hardware grid and strip renderers ."""
 
 from __future__ import annotations
+
+import time
 
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -8,27 +10,33 @@ from ui.island_parts.common import create_cached_squircle_path
 
 
 class HardwarePageMixin:
-    """Hardware grid and strip renderers plus adapter lifecycle (verbatim move from island.py).
+    """Hardware grid and strip renderers .
     Methods only; all state lives on the AppleDynamicIsland instance."""
 
-    def _sync_hardware_adapter_lifecycle(self, now: float) -> None:
-        """Polls hardware adapter only while hardware page is active; pauses when collapsed or on other pages."""
-        is_hw_active = (
-            self.expanded_card in ("hardware", "hardware_grid", "hardware_strip")
-            and (getattr(self, "pin_open", False) or now < self.expanded_until)
-        )
-        try:
-            from hardware_adapter import get_hardware_adapter
-            adapter = get_hardware_adapter()
-            if is_hw_active:
-                if adapter.is_paused():
-                    adapter.resume()
-                self._cached_hardware_metrics = adapter.get_metrics()
-            else:
-                if not adapter.is_paused():
-                    adapter.pause()
-        except Exception:
-            pass
+    _HW_STALE_S = 6.0  # a sample older than this (feed paused / stopped) is shown as unavailable
+
+    def _hw_sample(self) -> dict:
+        """Latest hardware_state sample (dict) or {} when none / stale. Values may be None (= unavailable)."""
+        st = self.hardware_state
+        if not st or (time.time() - self.hardware_state_t) > self._HW_STALE_S:
+            return {}
+        return st
+
+    def _hw_enabled(self, key: str) -> bool:
+        cfg = getattr(self.mgr, "cfg", None)
+        return bool(getattr(cfg, f"island_hw_{key}", True))
+
+    @staticmethod
+    def _hw_pct(v):
+        return None if v is None else max(0.0, min(100.0, float(v)))
+
+    @staticmethod
+    def _hw_pct_text(v) -> str:
+        return "--" if v is None else f"{round(v):.0f}%"
+
+    @staticmethod
+    def _hw_bar_color(v, normal: str) -> str:
+        return "#F0443A" if (v is not None and v > 90) else normal
 
     def _draw_hardware_tile_icon(self, p: QPainter, icon_name: str, cx: float, cy: float, size: float, color: QColor) -> None:
         """Renders vector hardware icon for grid and strip tiles."""
@@ -94,28 +102,21 @@ class HardwarePageMixin:
         """
         scale = self._get_size_scale()
 
-        m = self._cached_hardware_metrics
-        if not m:
-            try:
-                from hardware_adapter import get_hardware_adapter
-                m = get_hardware_adapter().get_metrics()
-            except Exception:
-                m = None
-
-        cpu_val = (m.cpu_percent if m and m.cpu_percent > 0 else 38.0)
-        ram_used = (m.ram_used_gb if m and m.ram_used_gb > 0 else 8.2)
-        ram_total = (m.ram_total_gb if m and m.ram_total_gb > 0 else 16.0)
-        ram_pct = (m.ram_percent if m and m.ram_percent > 0 else (ram_used / ram_total * 100.0))
-        gpu_pct = (m.gpu_percent if m and m.gpu_percent is not None else 24.0)
-        disk_val = (m.disk_percent if m and m.disk_percent > 0 else 54.0)
+        hw = self._hw_sample()
+        cpu_val = self._hw_pct(hw.get("cpu"))
+        ram_pct = self._hw_pct(hw.get("ram_pct"))
+        gpu_pct = self._hw_pct(hw.get("gpu"))
+        disk_val = self._hw_pct(hw.get("disk_pct"))
+        ram_used, ram_total = hw.get("ram_used_gb"), hw.get("ram_total_gb")
+        ram_text = f"{ram_used:.1f} / {ram_total:.1f} GB" if (ram_used is not None and ram_total) else "--"
 
         try:
             from hardware_adapter import format_speed
-            net_up_str = format_speed(m.net_up_bytes_sec) if m and m.net_up_bytes_sec > 0 else "1.2 MB/s"
-            net_down_str = format_speed(m.net_down_bytes_sec) if m and m.net_down_bytes_sec > 0 else "14.5 MB/s"
         except Exception:
-            net_up_str = "1.2 MB/s"
-            net_down_str = "14.5 MB/s"
+            format_speed = lambda v: f"{v:.0f} B/s"  # noqa: E731
+        up, down = hw.get("net_up_bps"), hw.get("net_down_bps")
+        net_up_str = "--" if up is None else format_speed(up)
+        net_down_str = "--" if down is None else format_speed(down)
 
         tile_w = 108.0 * scale
         tile_h = 68.0 * scale
@@ -124,16 +125,24 @@ class HardwarePageMixin:
         gap_y = 10.0 * scale
 
         margin_x = 18.0 * scale
-        margin_y = (h - (2.0 * tile_h + gap_y)) / 2.0
 
-        tiles_data = [
-            ("cpu", "CPU", f"{round(cpu_val):.0f}%", cpu_val, True, "#F0443A" if cpu_val > 90 else "#45C1EE"),
-            ("ram", "RAM", f"{ram_used:.1f} / {ram_total:.1f} GB", ram_pct, True, "#F0443A" if ram_pct > 90 else "#F5A524"),
-            ("gpu", "GPU", f"{round(gpu_pct):.0f}%" if gpu_pct is not None else "--", gpu_pct if gpu_pct is not None else 0.0, True, "#F0443A"),
-            ("net_up", "NET UP", net_up_str, 0.0, False, ""),
-            ("net_down", "NET DOWN", net_down_str, 0.0, False, ""),
-            ("disk", "DISK", f"{round(disk_val):.0f}%", disk_val, True, "#F0443A" if disk_val > 90 else "#45C1EE"),
+        all_tiles = [
+            ("cpu", "CPU", self._hw_pct_text(cpu_val), cpu_val, True, self._hw_bar_color(cpu_val, "#45C1EE")),
+            ("ram", "RAM", ram_text, ram_pct, True, self._hw_bar_color(ram_pct, "#F5A524")),
+            ("gpu", "GPU", self._hw_pct_text(gpu_pct), gpu_pct, True, "#F0443A"),
+            ("net_up", "NET UP", net_up_str, None, False, ""),
+            ("net_down", "NET DOWN", net_down_str, None, False, ""),
+            ("disk", "DISK", self._hw_pct_text(disk_val), disk_val, True, self._hw_bar_color(disk_val, "#45C1EE")),
         ]
+        cfg_key = {"cpu": "cpu", "ram": "ram", "gpu": "gpu", "net_up": "net", "net_down": "net", "disk": "disk"}
+        tiles_data = [t for t in all_tiles if self._hw_enabled(cfg_key[t[0]])]
+        if not tiles_data:
+            p.setFont(QFont("Segoe UI Variable Text", int(10.5 * scale), QFont.Weight.Normal))
+            p.setPen(QColor("#8E9094"))
+            p.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "No sensors enabled")
+            return
+        n_rows = (len(tiles_data) + 2) // 3
+        margin_y = (h - (n_rows * tile_h + (n_rows - 1) * gap_y)) / 2.0
 
         tile_bg = QColor(255, 255, 255, 23 if dark else 55)
         tile_border = QColor(255, 255, 255, 10 if dark else 25)
@@ -181,7 +190,7 @@ class HardwarePageMixin:
                 p.setBrush(QBrush(QColor(255, 255, 255, 22 if dark else 40)))
                 p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2.0 * scale, 2.0 * scale)
 
-                fill_w = bar_w * min(1.0, max(0.0, pct / 100.0))
+                fill_w = bar_w * min(1.0, max(0.0, (pct or 0.0) / 100.0))
                 if fill_w > 0:
                     p.setBrush(QBrush(QColor(bar_color)))
                     p.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 2.0 * scale, 2.0 * scale)
@@ -196,32 +205,25 @@ class HardwarePageMixin:
         """
         scale = self._get_size_scale()
 
-        m = self._cached_hardware_metrics
-        if not m:
-            try:
-                from hardware_adapter import get_hardware_adapter
-                m = get_hardware_adapter().get_metrics()
-            except Exception:
-                m = None
+        hw = self._hw_sample()
+        fps_val = hw.get("fps")
+        cpu_val = self._hw_pct(hw.get("cpu"))
+        ram_pct = self._hw_pct(hw.get("ram_pct"))
+        gpu_pct = self._hw_pct(hw.get("gpu"))
+        disk_val = self._hw_pct(hw.get("disk_pct"))
 
-        fps_val = (m.fps if m and m.fps > 0 else 60.0)
-        cpu_val = (m.cpu_percent if m and m.cpu_percent > 0 else 38.0)
-        ram_used = (m.ram_used_gb if m and m.ram_used_gb > 0 else 8.2)
-        ram_total = (m.ram_total_gb if m and m.ram_total_gb > 0 else 16.0)
-        ram_pct = (m.ram_percent if m and m.ram_percent > 0 else (ram_used / ram_total * 100.0))
-        gpu_pct = (m.gpu_percent if m and m.gpu_percent is not None else 24.0)
-        disk_val = (m.disk_percent if m and m.disk_percent > 0 else 54.0)
-
-        segments = [
-            ("FPS", f"{round(fps_val)} FPS", "#45C1EE"),
-            ("CPU", f"{round(cpu_val):.0f}%", "#F0443A" if cpu_val > 90 else "#45C1EE"),
-            ("RAM", f"{round(ram_pct):.0f}%", "#F0443A" if ram_pct > 90 else "#F5A524"),
-            ("GPU", f"{round(gpu_pct):.0f}%" if gpu_pct is not None else "--", "#F0443A"),
-            ("DISK", f"{round(disk_val):.0f}%", "#F0443A" if disk_val > 90 else "#45C1EE"),
-        ]
+        segments = [("FPS", "--" if not fps_val else f"{round(fps_val)} FPS", "#45C1EE")]
+        if self._hw_enabled("cpu"):
+            segments.append(("CPU", self._hw_pct_text(cpu_val), self._hw_bar_color(cpu_val, "#45C1EE")))
+        if self._hw_enabled("ram"):
+            segments.append(("RAM", self._hw_pct_text(ram_pct), self._hw_bar_color(ram_pct, "#F5A524")))
+        if self._hw_enabled("gpu"):
+            segments.append(("GPU", self._hw_pct_text(gpu_pct), "#F0443A"))
+        if self._hw_enabled("disk"):
+            segments.append(("DISK", self._hw_pct_text(disk_val), self._hw_bar_color(disk_val, "#45C1EE")))
 
         mx = 14.0 * scale
-        seg_w = (w - 2.0 * mx) / 5.0
+        seg_w = (w - 2.0 * mx) / len(segments)
         line_col = QColor(255, 255, 255, 10 if dark else 25)
 
         for idx, (label, val_text, accent_hex) in enumerate(segments):

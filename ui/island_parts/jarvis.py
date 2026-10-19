@@ -1,4 +1,4 @@
-"""ui/island_parts/jarvis.py - JARVIS status card renderer (verbatim move from island.py)."""
+"""ui/island_parts/jarvis.py - JARVIS status card renderer ."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from ui.island_parts.common import create_cached_squircle_path
 
 
 class JarvisPageMixin:
-    """JARVIS status card renderer (verbatim move from island.py).
+    """JARVIS status card renderer .
     Methods only; all state lives on the AppleDynamicIsland instance."""
 
     def _draw_jarvis_card(self, p: QPainter, w: float, h: float,
@@ -28,6 +28,9 @@ class JarvisPageMixin:
         lx = 22.0 * scale
         content_w = (w - 28.0 * scale) - lx
         tile_r = 17.0 * scale
+
+        # Real data: ctx.assistant_status() (state, last_command, last_result) + camera FPS from hardware_state
+        status = self._assistant_status()
 
         tile_bg = QColor(255, 255, 255, 23 if dark else 55)
         tile_border = QColor(255, 255, 255, 10 if dark else 25)
@@ -76,7 +79,11 @@ class JarvisPageMixin:
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "ASSISTANT STATUS")
 
         # Status metrics
-        is_tracking = self.active and not getattr(self, "tracking_paused", False)
+        ctx = self._ctx()
+        if ctx is not None and hasattr(ctx, "is_tracking_paused"):
+            is_tracking = not self._tracking_is_paused()
+        else:
+            is_tracking = self.active and not self._tracking_is_paused()
         # Tracking indicator dot + text
         track_dot_y = ty1 + 30.0 * scale
         track_dot_col = QColor("#34C759") if is_tracking else QColor("#FF9F0A")
@@ -93,7 +100,10 @@ class JarvisPageMixin:
         # Camera & Mic indicators
         p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.Normal))
         p.setPen(QColor("#8E9094"))
-        cam_mic_txt = "Camera: 60 FPS   •   Mic: Online"
+        hw = self.hardware_state or {}
+        fps = hw.get("fps")
+        cam_txt = f"Camera: {round(fps)} FPS" if fps else "Camera: --"
+        cam_mic_txt = f"{cam_txt}   •   {str(status.get('state', 'idle')).capitalize()}"
         if self.worker_health_state == "down":
             p.setPen(QColor("#FF453A"))
             cam_mic_txt = "Down: " + (self.worker_health_reason or "worker stopped")
@@ -104,7 +114,7 @@ class JarvisPageMixin:
         b_rect = QRectF(btn_x, ty1, btn_w, th1)
         b_path = create_cached_squircle_path(b_rect, tile_r)
 
-        is_hover = (self._hovered_btn == "jarvis_toggle_tracking")
+        is_hover = (self._hovered_btn in ("jarvis_toggle_tracking", "jarvis_pause"))
         is_flash = (now < self._btn_flash_until and is_hover)
 
         if is_flash:
@@ -177,30 +187,51 @@ class JarvisPageMixin:
         p.drawText(QRectF(lx + 12.0 * scale, ty2 + 7.0 * scale, 140.0 * scale, 14.0 * scale),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "LAST COMMAND")
 
-        # Pill badge on right: "✓ Executed"
+        last_cmd = str(status.get("last_command", "") or "").strip()
+        last_res = str(status.get("last_result", "") or "")
+
+        if not last_cmd:
+            # Empty state: nothing has been executed yet
+            p.setFont(QFont("Segoe UI Variable Text", int(10.5 * scale), QFont.Weight.Normal))
+            p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
+            p.drawText(QRectF(lx + 12.0 * scale, ty2 + 24.0 * scale, content_w - 24.0 * scale, 22.0 * scale),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "No commands yet")
+            return
+
+        ok = last_res != "fail"
+        badge_col = QColor(52, 199, 89) if ok else QColor(255, 69, 58)
         badge_w = 78.0 * scale
         badge_h = 17.0 * scale
         badge_rx = lx + content_w - badge_w - 10.0 * scale
         badge_ry = ty2 + 6.0 * scale
         bdg_rect = QRectF(badge_rx, badge_ry, badge_w, badge_h)
         bdg_path = create_cached_squircle_path(bdg_rect, badge_h / 2.0)
-        p.fillPath(bdg_path, QBrush(QColor(52, 199, 89, 35)))
-        p.strokePath(bdg_path, QPen(QColor(52, 199, 89, 90), 1.0))
+        p.fillPath(bdg_path, QBrush(QColor(badge_col.red(), badge_col.green(), badge_col.blue(), 35)))
+        p.strokePath(bdg_path, QPen(QColor(badge_col.red(), badge_col.green(), badge_col.blue(), 90), 1.0))
 
         p.setFont(QFont("Segoe UI Variable Text", int(8.5 * scale), QFont.Weight.DemiBold))
-        p.setPen(QColor("#34C759"))
-        p.drawText(bdg_rect, Qt.AlignmentFlag.AlignCenter, "✓ Executed")
+        p.setPen(badge_col)
+        p.drawText(bdg_rect, Qt.AlignmentFlag.AlignCenter, "Executed" if ok else "Failed")
 
         # Command text
         p.setFont(QFont("Segoe UI Variable Display", int(11.5 * scale), QFont.Weight.Bold))
         p.setPen(QColor("#F5F5F7" if dark else "#1C1C1E"))
-        user_cmd = f"“{self.user_prompt or 'Run system diagnostic'}”"
         p.drawText(QRectF(lx + 12.0 * scale, ty2 + 22.0 * scale, content_w - 24.0 * scale, 18.0 * scale),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, user_cmd)
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, last_cmd.capitalize())
 
         # Result summary
         p.setFont(QFont("Segoe UI Variable Text", int(9.5 * scale), QFont.Weight.Normal))
         p.setPen(QColor("#8E9094" if dark else "#6B6E76"))
-        reply_txt = self.say_text or "All core subsystems nominal, sir."
         p.drawText(QRectF(lx + 12.0 * scale, ty2 + 39.0 * scale, content_w - 24.0 * scale, 15.0 * scale),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, reply_txt)
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "Completed" if ok else "Did not complete")
+
+    def _assistant_status(self) -> dict:
+        """ctx.assistant_status() or an idle default when no ctx is wired."""
+        ctx = self._ctx()
+        if ctx is not None and hasattr(ctx, "assistant_status"):
+            try:
+                return dict(ctx.assistant_status())
+            except Exception:
+                pass
+        return {"state": "idle", "last_command": "", "last_result": ""}

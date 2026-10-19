@@ -78,9 +78,12 @@ except ImportError:
     DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
 
 try:
-    from config import get_config_path
+    from config import get_config_path, _atomic_write_json, Config as _ConfigCls
+    _CONFIG_FIELDS = frozenset(_ConfigCls.__dataclass_fields__)
 except ImportError:
     get_config_path = lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jarvis_config.json")
+    _atomic_write_json = None
+    _CONFIG_FIELDS = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1881,42 +1884,40 @@ class SettingsWindow(QDialog):
             ("small",  "Small (0.85x)"),
             ("medium", "Medium (1.0x)"),
             ("large",  "Large (1.15x)"),
-        ], current=getattr(self.cfg, "island_size_scale", getattr(self.cfg, "island_size", "medium")))
+        ], current=getattr(self.cfg, "island_size_scale", "medium"))
         self.size_seg = self.island_size_control
-        def _on_size_changed(v):
-            self._save("island_size_scale", v)
-            self._save("island_size", v)
-        self.island_size_control.valueChanged.connect(_on_size_changed)
+        self.island_size_control.valueChanged.connect(lambda v: self._save("island_size_scale", v))
         island_card.add_row("Size Scale",
                             "Overall scale factor for Dynamic Island capsule and expanded cards",
                             self.island_size_control)
 
-        # 3. Compact Content (Time + Weather vs Media-Aware vs Time)
+        # 3. Compact Content (Time + Weather / Time Only / Off) + Now Playing takeover toggle
         self.compact_content_control = SegmentedControl([
             ("time_weather", "Time + Weather"),
-            ("media_aware",  "Media-Aware"),
             ("time",         "Time Only"),
-        ], current=getattr(self.cfg, "island_compact_mode", getattr(self.cfg, "island_idle_display", "time_weather")))
+            ("off",          "Off"),
+        ], current=getattr(self.cfg, "island_idle_display", "time_weather"))
         self.compact_seg = self.compact_content_control
-        def _on_compact_changed(v):
-            self._save("island_compact_mode", v)
-            self._save("island_idle_display", v)
-        self.compact_content_control.valueChanged.connect(_on_compact_changed)
+        self.compact_content_control.valueChanged.connect(lambda v: self._save("island_idle_display", v))
         island_card.add_row("Compact Content",
                             "Standby resting presentation when no assistant interaction is active",
                             self.compact_content_control)
+
+        self.now_playing_pill_switch = AppleSwitch(bool(getattr(self.cfg, "island_show_now_playing", True)))
+        self.sw_now_playing_pill = self.now_playing_pill_switch
+        self.now_playing_pill_switch.toggled.connect(lambda v: self._save("island_show_now_playing", v))
+        island_card.add_row("Show Now Playing",
+                            "While media is playing, show the track in the compact island instead of the clock",
+                            self.now_playing_pill_switch)
 
         # 4. 12/24 h Format
         self.clock_format_control = SegmentedControl([
             ("auto", "Auto"),
             ("12h",  "12-Hour"),
             ("24h",  "24-Hour"),
-        ], current=getattr(self.cfg, "island_time_format", getattr(self.cfg, "island_clock_format", "12h")))
+        ], current=getattr(self.cfg, "island_clock_format", "auto"))
         self.fmt_seg = self.clock_format_control
-        def _on_clock_changed(v):
-            self._save("island_time_format", v)
-            self._save("island_clock_format", v)
-        self.clock_format_control.valueChanged.connect(_on_clock_changed)
+        self.clock_format_control.valueChanged.connect(lambda v: self._save("island_clock_format", v))
         island_card.add_row("12/24 h Format",
                             "Clock display format for compact time and expanded card",
                             self.clock_format_control)
@@ -1934,7 +1935,7 @@ class SettingsWindow(QDialog):
                             self.first_weekday_control)
 
         # 6. City Input Field / Searchable Dropdown
-        city_default = getattr(self.cfg, "island_weather_city", getattr(self.cfg, "weather_city", "Lahore, Punjab, Pakistan"))
+        city_default = getattr(self.cfg, "island_weather_city", "New York")
         self.city_combo = QComboBox()
         self.city_combo.setEditable(True)
         self.city_combo.setFixedWidth(230)
@@ -2038,7 +2039,6 @@ class SettingsWindow(QDialog):
             cleaned = v.strip()
             if cleaned:
                 self._save("island_weather_city", cleaned)
-                self._save("weather_city", cleaned)
                 self._city_search_timer.start()
 
         self.city_search_edit.textChanged.connect(_on_city_text_edited)
@@ -2048,7 +2048,6 @@ class SettingsWindow(QDialog):
             if val:
                 self._city_search_timer.stop()
                 self._save("island_weather_city", val)
-                self._save("weather_city", val)
 
         self.city_combo.activated.connect(_on_city_activated)
 
@@ -2061,12 +2060,9 @@ class SettingsWindow(QDialog):
             ("auto",       "Auto"),
             ("celsius",    "Celsius (°C, km/h)"),
             ("fahrenheit", "Fahrenheit (°F, mph)"),
-        ], current=getattr(self.cfg, "island_weather_units", getattr(self.cfg, "weather_units", "auto")))
+        ], current=getattr(self.cfg, "island_weather_units", "auto"))
         self.units_seg = self.units_control
-        def _on_units_changed(v):
-            self._save("island_weather_units", v)
-            self._save("weather_units", v)
-        self.units_control.valueChanged.connect(_on_units_changed)
+        self.units_control.valueChanged.connect(lambda v: self._save("island_weather_units", v))
         island_card.add_row("Weather Units",
                             "Temperature and wind speed units for weather metrics",
                             self.units_control)
@@ -2081,28 +2077,6 @@ class SettingsWindow(QDialog):
         island_card.add_row("Hardware Layout",
                             "Display style: 2x3 modular tile grid or compact widescreen strip",
                             self.hw_layout_control)
-
-        # 9. Backdrop Glass Blur (toggle)
-        self.backdrop_blur_switch = AppleSwitch(bool(getattr(self.cfg, "island_backdrop_blur", False)))
-        self.sw_island_blur = self.backdrop_blur_switch
-        self.backdrop_blur_switch.toggled.connect(lambda v: self._save("island_backdrop_blur", v))
-        island_card.add_row("Backdrop Blur",
-                            "Enable hardware-accelerated Windows Acrylic blur (may show rectangular DWM border on Windows 11)",
-                            self.backdrop_blur_switch)
-
-        # 10. Backdrop Opacity Slider
-        cur_op = float(getattr(self.cfg, "island_backdrop_opacity", 0.95))
-        self.slider_backdrop_opacity = slider_card_row(
-            island_card,
-            "Backdrop Opacity",
-            "Surface glass tint opacity from translucent to deep obsidian",
-            cur_op,
-            0.20,
-            1.00,
-            "",
-            lambda v: self._save("island_backdrop_opacity", round(v, 2)),
-        )
-        self.slider_island_opacity = self.slider_backdrop_opacity
 
         # 11. Pin Open Toggle
         self.pin_open_switch = AppleSwitch(getattr(self.cfg, "island_pin_open", False))
@@ -2258,12 +2232,9 @@ class SettingsWindow(QDialog):
                             wf_container)
 
         # 14. Hide during Fullscreen Apps
-        self.hide_fullscreen_switch = AppleSwitch(getattr(self.cfg, "island_hide_fullscreen", getattr(self.cfg, "hide_fullscreen", True)))
+        self.hide_fullscreen_switch = AppleSwitch(getattr(self.cfg, "island_hide_fullscreen", True))
         self.sw_fs = self.hide_fullscreen_switch
-        def _on_fs_toggled(v):
-            self._save("island_hide_fullscreen", v)
-            self._save("hide_fullscreen", v)
-        self.hide_fullscreen_switch.toggled.connect(_on_fs_toggled)
+        self.hide_fullscreen_switch.toggled.connect(lambda v: self._save("island_hide_fullscreen", v))
         island_card.add_row("Hide during Fullscreen Apps",
                             "Automatically hide the island when playing games or running full-screen apps",
                             self.hide_fullscreen_switch)
@@ -2352,7 +2323,7 @@ class SettingsWindow(QDialog):
         # Direct property aliases for test compatibility
         self.media_switch = self.sw_page_media
         self.weather_switch = self.sw_page_weather
-        self.show_now_playing_switch = self.sw_page_media
+        self.show_now_playing_switch = self.now_playing_pill_switch
         self.show_weather_switch = self.sw_page_weather
         self.city_search_btn = self.city_search_edit
         self.units_combo = self.units_control
@@ -2692,16 +2663,11 @@ class SettingsWindow(QDialog):
     def _save(self, key: str, value) -> None:
         if key != "groq_api_key" and any(s in key.lower() for s in ("secret", "token", "password")):
             return
+        if _CONFIG_FIELDS is not None and key not in _CONFIG_FIELDS:
+            print(f"[settings] ignoring non-Config key: {key}")
+            return
         try:
             setattr(self.cfg, key, value)
-            if key == "island_weather_city":
-                setattr(self.cfg, "weather_city", value)
-            elif key == "weather_city":
-                setattr(self.cfg, "island_weather_city", value)
-            elif key == "island_weather_units":
-                setattr(self.cfg, "weather_units", value)
-            elif key == "weather_units":
-                setattr(self.cfg, "island_weather_units", value)
         except Exception:
             pass
         try:
@@ -2710,17 +2676,14 @@ class SettingsWindow(QDialog):
             if os.path.exists(cfg_path):
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
             data[key] = value
-            if key == "island_weather_city":
-                data["weather_city"] = value
-            elif key == "weather_city":
-                data["island_weather_city"] = value
-            elif key == "island_weather_units":
-                data["weather_units"] = value
-            elif key == "weather_units":
-                data["island_weather_units"] = value
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
+            if _atomic_write_json is not None:
+                _atomic_write_json(cfg_path, data)  # tmp + fsync + .bak + os.replace
+            else:
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4)
         except Exception as exc:
             print(f"[settings] save error: {exc}")
         try:
@@ -2750,7 +2713,7 @@ class SettingsWindow(QDialog):
                 pass
 
         # 4. Immediate weather refresh if weather settings changed
-        if key in ("island_weather_city", "weather_city", "island_weather_units", "weather_units"):
+        if key in ("island_weather_city", "island_weather_units"):
             try:
                 from weather_client import trigger_weather_refresh
                 trigger_weather_refresh()

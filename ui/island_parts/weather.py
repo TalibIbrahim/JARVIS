@@ -15,7 +15,7 @@ class WeatherPageMixin:
 
     def format_temp(self, temp_val: float) -> str:
         cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
-        units = getattr(cfg, "island_weather_units", getattr(cfg, "weather_units", "auto")).lower()
+        units = str(getattr(cfg, "island_weather_units", "auto")).lower()
         current_sym = getattr(self, "weather_unit_symbol", None)
 
         if current_sym == "°F" and units == "celsius":

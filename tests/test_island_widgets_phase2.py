@@ -287,10 +287,9 @@ class TestIslandWidgetsPhase2(unittest.TestCase):
         self.assertTrue(any("Lahore" in c for c in all_cities))
         self.assertTrue(any("London" in c for c in all_cities))
 
-        # Test selecting a city saves both island_weather_city and weather_city
+        # Selecting a city saves the canonical island_weather_city key
         dlg._save("island_weather_city", "Lahore, Punjab, Pakistan")
-        self.assertEqual(getattr(self.cfg, "island_weather_city"), "Lahore, Punjab, Pakistan")
-        self.assertEqual(getattr(self.cfg, "weather_city"), "Lahore, Punjab, Pakistan")
+        self.assertEqual(self.cfg.island_weather_city, "Lahore, Punjab, Pakistan")
     def test_13_media_dynamic_gradient_and_dominant_color(self):
         """Verify media player card color dynamically samples album cover gradient/dominant color instead of fixed purple."""
         import io

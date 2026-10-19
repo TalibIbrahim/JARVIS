@@ -372,43 +372,16 @@ class Controller:
         # 2. Overlay / Island UI Hit Test
         if self.overlay and hasattr(self.overlay, "island"):
             island = self.overlay.island
-            if hasattr(island, "get_island_button_at"):
-                try:
-                    res = island.get_island_button_at(x, y)
-                    if res:
-                        return res
-                except Exception:
-                    pass
-
-            # Map screen (x, y) into local island coordinates
-            try:
-                geom = getattr(island, "geometry", None)
-                if callable(geom):
-                    g = geom()
-                    gx, gy = float(g.x()), float(g.y())
-                    gw, gh = float(g.width()), float(g.height())
-                else:
-                    gx, gy = float(getattr(island, "x", 0)), float(getattr(island, "y", 0))
-                    gw, gh = float(getattr(island, "width", self.sw)), float(getattr(island, "height", 220))
-
-                if gx <= x <= (gx + gw) and gy <= y <= (gy + gh):
-                    local_x = x - gx
-                    local_y = y - gy
-                    from collections import namedtuple
-                    Pt = namedtuple("Pt", ["x", "y"])
-                    pt = Pt(local_x, local_y)
-
-                    if hasattr(island, "_button_at"):
-                        btn = island._button_at(pt)
-                        if btn:
-                            return btn
-
-                    if hasattr(island, "_dot_at"):
-                        dot = island._dot_at(pt)
-                        if dot is not None:
-                            return f"dot_{dot}"
-            except Exception:
-                pass
+            if hasattr(island, "hit_test"):
+                # Thread-safe: reads an immutable snapshot published during paint.
+                res = island.hit_test(x, y)
+                if res:
+                    return res
+            else:
+                self._warn_island_fallback_once()
+                res = self._legacy_island_hit(island, x, y)
+                if res:
+                    return res
 
         # 3. Default Geometry Fallback for Top-Screen Expanded Island
         # Centered horizontally at top of primary screen (y: 0 to 220)
@@ -437,6 +410,51 @@ class Controller:
 
         return None
 
+    def _warn_island_fallback_once(self):
+        if not getattr(self, "_island_fallback_warned", False):
+            self._island_fallback_warned = True
+            jarvis_log.get_logger("controller").warning(
+                "island.hit_test missing; falling back to direct island calls from cursor thread")
+
+    def _legacy_island_hit(self, island, x: float, y: float) -> Optional[str]:
+        if hasattr(island, "get_island_button_at"):
+            try:
+                res = island.get_island_button_at(x, y)
+                if res:
+                    return res
+            except Exception:
+                pass
+    # Map screen (x, y) into local island coordinates (legacy path only)
+        try:
+            geom = getattr(island, "geometry", None)
+            if callable(geom):
+                g = geom()
+                gx, gy = float(g.x()), float(g.y())
+                gw, gh = float(g.width()), float(g.height())
+            else:
+                gx, gy = float(getattr(island, "x", 0)), float(getattr(island, "y", 0))
+                gw, gh = float(getattr(island, "width", self.sw)), float(getattr(island, "height", 220))
+
+            if gx <= x <= (gx + gw) and gy <= y <= (gy + gh):
+                local_x = x - gx
+                local_y = y - gy
+                from collections import namedtuple
+                Pt = namedtuple("Pt", ["x", "y"])
+                pt = Pt(local_x, local_y)
+
+                if hasattr(island, "_button_at"):
+                    btn = island._button_at(pt)
+                    if btn:
+                        return btn
+
+                if hasattr(island, "_dot_at"):
+                    dot = island._dot_at(pt)
+                    if dot is not None:
+                        return f"dot_{dot}"
+        except Exception:
+            pass
+        return None
+
     def trigger_island_button(self, btn: str) -> bool:
         """
         Triggers an interactive island button action.
@@ -451,6 +469,37 @@ class Controller:
                 self.overlay.post("island_button_click", button=btn)
             except Exception:
                 pass
+
+        # Thread-safe path: island exposes hit_test -> all island effects go via overlay.post
+        island = getattr(self.overlay, "island", None) if self.overlay else None
+        if island is not None and hasattr(island, "hit_test") and hasattr(self.overlay, "post"):
+            action = {"prev": "media_prev", "previous": "media_prev", "media_prev": "media_prev",
+                      "play_pause": "media_toggle", "play/pause": "media_toggle",
+                      "media_toggle": "media_toggle",
+                      "next": "media_next", "media_next": "media_next"}.get(btn)
+            if action:
+                self.overlay.post("island_action", action=action)
+                return True
+            page = None
+            if btn.startswith("dot:"):
+                page = btn[4:]
+            elif btn.startswith("dot_"):
+                try:
+                    idx = int(btn.split("_")[1])
+                except Exception:
+                    idx = 0
+                pages = ["media", "time", "weather", "hardware", "jarvis"]
+                page = pages[idx] if 0 <= idx < len(pages) else None
+            elif btn in ("page_dots", "page_dot"):
+                page = "media"
+            if btn.startswith("dot") or btn in ("page_dots", "page_dot"):
+                if page:
+                    self.overlay.post("island_action", action="show_page", page=page)
+                return True
+            if btn in ("pause_tracking_toggle", "tracking_toggle", "pause tracking toggle", "jarvis_pause"):
+                return self._toggle_tracking_from_island()
+            self.overlay.post("island_action", action="button", target=btn)
+            return True
 
         # Direct execution on island or media adapter
         if btn in ("prev", "previous"):
@@ -524,6 +573,18 @@ class Controller:
 
         return False
 
+    def _toggle_tracking_from_island(self) -> bool:
+        if hasattr(self, "engine") and hasattr(self.engine, "request_toggle"):
+            self.engine.request_toggle()
+        else:
+            self.active = not self.active
+        if self.overlay and hasattr(self.overlay, "post"):
+            try:
+                self.overlay.post("toggle_tracking", active=self.active)
+            except Exception:
+                pass
+        return True
+
     def island_page_step(self, direction: int = 1):
         """Triggers island page step (1 = next, -1 = prev) via overlay."""
         if self.overlay and hasattr(self.overlay, "post"):
@@ -531,16 +592,6 @@ class Controller:
                 self.overlay.post("island_page_step", direction=direction)
             except Exception:
                 pass
-        if self.overlay and hasattr(self.overlay, "island"):
-            island = self.overlay.island
-            if hasattr(island, "expand_card") and hasattr(island, "card_pages"):
-                try:
-                    curr = getattr(island, "expanded_card", "weather") or "weather"
-                    pages = getattr(island, "card_pages", ["media", "time", "weather", "hardware", "jarvis"])
-                    idx = pages.index(curr) if curr in pages else 0
-                    island.expand_card(pages[(idx + direction) % len(pages)])
-                except Exception:
-                    pass
 
     def _get_lookback_position(self, lookback_ms):
         """Returns the cursor position from lookback_ms before now."""

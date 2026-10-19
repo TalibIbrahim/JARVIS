@@ -688,10 +688,15 @@ class TestDynamicIslandGestureHooks(unittest.TestCase):
         self.assertEqual(step_act.n, -1)
 
     def test_controller_island_page_step_handling(self):
-        """Controller routes island_page_step action to overlay and expands next card."""
+        """Controller (worker thread) only posts island_page_step; the GUI-side drain moves the island page."""
+        import queue
+        from types import SimpleNamespace
         from controller import Controller
+        from overlay import Overlay
         cfg = Config()
+        q = queue.Queue()
         mock_overlay = MagicMock()
+        mock_overlay.post.side_effect = lambda kind, **d: q.put((kind, d))
         island_mock = MagicMock()
         island_mock.expanded_card = "media"
         island_mock.card_pages = ["media", "time", "weather", "hardware", "jarvis"]
@@ -701,12 +706,41 @@ class TestDynamicIslandGestureHooks(unittest.TestCase):
         try:
             ctrl.handle(Action("island_page_step", n=1))
             mock_overlay.post.assert_any_call("island_page_step", direction=1)
-            island_mock.expand_card.assert_called_with("time")
-
             ctrl.handle(Action("island_page_step", n=-1))
             mock_overlay.post.assert_any_call("island_page_step", direction=-1)
+            # Worker thread must not touch island widget methods directly.
+            island_mock.expand_card.assert_not_called()
+            island_mock.page_step.assert_not_called()
+            island_mock.show_page.assert_not_called()
         finally:
             ctrl.shutdown()
+
+        # GUI side: Overlay._drain routes the queued events to island.page_step.
+        pages = ["media", "time", "weather", "hardware", "jarvis"]
+        state = {"cur": "media"}
+
+        def page_step(direction=1):
+            state["cur"] = pages[(pages.index(state["cur"]) + direction) % len(pages)]
+            return state["cur"]
+
+        gui_island = MagicMock()
+        gui_island.page_step.side_effect = page_step
+        gui = SimpleNamespace(q=q, island=gui_island)
+        steps = [k for k, _ in list(q.queue) if k == "island_page_step"]
+        self.assertGreaterEqual(len(steps), 2)
+        # Drain only the first (direction=+1) event first.
+        first = q.get_nowait()
+        q2 = queue.Queue()
+        q2.put(first)
+        gui.q = q2
+        Overlay._drain(gui, time.time())
+        gui_island.page_step.assert_called_once_with(1)
+        self.assertEqual(state["cur"], "time")
+        # Then the direction=-1 event steps back.
+        gui.q = q
+        Overlay._drain(gui, time.time())
+        gui_island.page_step.assert_called_with(-1)
+        self.assertEqual(state["cur"], "media")
 
     def test_dwell_over_island_buttons_triggers_click(self):
         """Dwell over interactive island buttons (prev, play_pause, next, page dots, pause tracking) triggers click."""

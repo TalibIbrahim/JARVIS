@@ -378,14 +378,7 @@ class AppleDynamicIsland(QWidget):
         if sys.platform != "win32":
             return
         try:
-            user32 = ctypes.windll.user32
-            hwnd = int(self.winId())
-            style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-            cfg = getattr(self.mgr, "cfg", None)
-            if getattr(cfg, "island_backdrop_blur", False):
-                apply_glass_backdrop(hwnd, dark=self.dark_mode)
-            else:
-                remove_backdrop(hwnd)
+            remove_backdrop(int(self.winId()))  # solid black island: no DWM backdrop
         except Exception as exc:
             print(f"[overlay] backdrop error: {exc}")
 
@@ -3083,6 +3076,32 @@ class Overlay:
                         if "feels_like" in d: self.island.weather_feels_like = float(d["feels_like"])
                         if "city" in d: self.island.weather_city = str(d["city"])
                         if "hourly" in d: self.island.weather_hourly = list(d["hourly"])
+                        if d.get("wind_kmh") is not None: self.island.weather_wind_kmh = float(d["wind_kmh"])
+                        if d.get("wind_dir_deg") is not None: self.island.weather_wind_dir_deg = float(d["wind_dir_deg"])
+                        if d.get("humidity") is not None: self.island.weather_humidity = int(round(float(d["humidity"])))
+                        if "stale" in d: self.island.weather_stale = bool(d["stale"])
+                        if d.get("updated_at") is not None: self.island.weather_updated_at = float(d["updated_at"])
+                elif kind == "hardware_state":
+                    # None values mean "sensor unavailable"; the island renders them as "--"
+                    self.island.hardware_state = {
+                        k: d.get(k) for k in ("cpu", "ram_used_gb", "ram_total_gb", "ram_pct", "gpu",
+                                              "net_up_bps", "net_down_bps", "disk_pct", "fps")
+                    }
+                    self.island.hardware_state_t = time.time()
+                    if hasattr(self.island, "update"):
+                        self.island.update()
+                elif kind in ("island_page_step", "island_show_page", "island_expand", "island_collapse", "island_action"):
+                    isl = self.island
+                    if kind == "island_page_step" and hasattr(isl, "page_step"):
+                        isl.page_step(int(d.get("direction", 1) or 1))
+                    elif kind == "island_show_page" and hasattr(isl, "show_page"):
+                        isl.show_page(d.get("page", "weather"))
+                    elif kind == "island_expand" and hasattr(isl, "expand"):
+                        isl.expand(d.get("page"))
+                    elif kind == "island_collapse" and hasattr(isl, "collapse_card"):
+                        isl.collapse_card()
+                    elif kind == "island_action" and hasattr(isl, "perform_action"):
+                        isl.perform_action(d.get("action", ""), **{k: v for k, v in d.items() if k != "action"})
                 elif kind == "timer_state":
                     if hasattr(self.island, "timer_active"):
                         if "active" in d: self.island.timer_active = bool(d["active"])

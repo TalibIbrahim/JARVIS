@@ -23,6 +23,24 @@ Features:
 - Assistant States:
     * WAKE, LISTENING (Siri orb + 7-bar waveform + live transcript), THINKING (accelerated orb + shimmer),
       RESULT (13 pt card + icon), NO_SPEECH (nope wiggle), ERROR, TRACKING, GESTURE, PROMPT, SPEAKING.
+- Page model (single source of truth):
+    * `card_pages` holds the enabled logical pages in configured order (island_pages + island_pages_enabled):
+      "media", "time" (calendar), "weather", "hardware", "jarvis". The expanded id actually rendered is
+      "media" | "time" | "weather" | "hardware_grid"/"hardware_strip" | "jarvis".
+    * `page_step(direction)` and `show_page(name)` are THE ONLY page-change methods. Voice names
+      ("weather", "hardware", "media", "calendar", "jarvis") and renderer ids are both accepted.
+- Thread-safe control contract (worker threads, e.g. controller.py):
+    * overlay.post("island_action", action=<media_prev|media_toggle|media_next|page_step|show_page|expand|
+      collapse|button|seek>, **args) -> run on the GUI thread via `island.perform_action`.
+      args: page_step(direction=+1/-1), show_page(page=<name>), button(button=<target id>), seek(ratio=0..1).
+    * Hit testing: paint publishes an immutable `island._hit_snapshot = (generation, ((x, y, w, h), target_id), ...)`
+      in GLOBAL screen coordinates; `island.hit_test(gx, gy) -> target_id | None` reads only that attribute
+      (atomic read, no Qt calls) so it is safe from any thread.
+      target_id: "media_prev", "media_toggle", "media_next", "dot:<page>", "jarvis_pause", "timer_cancel",
+      "timer_pause_resume", "card" (card body, always last). Pass button ids to the "button" action
+      (media ones also map to the media_* actions).
+- Data is pushed in through Overlay.post: hardware_state, weather_state, media_state, fullscreen.
+- Solid black island: no DWM backdrop; remove_backdrop() is called once so any earlier blur is cleared.
 - Performance: 60 FPS locked, DPI-safe, multi-monitor aware, cached vector pixmaps, spring physics only.
 """
 
@@ -48,7 +66,7 @@ from ui.tokens import (
     T, TYPE, COLOR, qfont, REDUCE_MOTION_MS,
     SPRING_DT_MIN, SPRING_DT_MAX, RADIUS, GEOMETRY
 )
-from ui.materials import apply_acrylic, make_click_through, set_interactive
+from ui.materials import remove_backdrop, make_click_through, set_interactive
 from ui.components import Spring, create_squircle_path
 
 from ui.island_parts.common import (  # noqa: F401  (re-exported for existing importers)
@@ -206,6 +224,10 @@ class AppleDynamicIsland(
         self.weather_wind_speed: float = 12.0
         self.weather_wind_direction: str = "NW"
         self.weather_humidity: int = 48
+        self.weather_wind_kmh: Optional[float] = None       # real data (weather_state); None = not received yet
+        self.weather_wind_dir_deg: Optional[float] = None
+        self.weather_stale: bool = False
+        self.weather_updated_at: Optional[float] = None
         self.weather_hourly: list[dict] = [
             {"time": "Now",  "temp": 72.0, "icon": "partly_cloudy"},
             {"time": "1 PM", "temp": 74.0, "icon": "sunny"},
@@ -216,7 +238,12 @@ class AppleDynamicIsland(
         ]
 
         # Hardware metrics state & lifecycle
-        self._cached_hardware_metrics: Optional[Any] = None
+        # Real hardware sample pushed by main.py HardwareFeed via overlay "hardware_state"; None = no sample yet.
+        self.hardware_state: Optional[dict] = None
+        self.hardware_state_t: float = 0.0
+        # Thread-safe hit-test snapshot published during paint (see module docstring).
+        self._hit_snapshot: tuple = (0, ())
+        self._notified_page = False  # sentinel: last page reported to ctx.set_visible_page
 
         # Media state
         self.media_active: bool = False
@@ -345,7 +372,7 @@ class AppleDynamicIsland(
                             self.mgr.shape_style = IslandShapeStyle.from_str(val)
                         except Exception:
                             pass
-            city = getattr(cfg, "island_weather_city", getattr(cfg, "weather_city", None))
+            city = getattr(cfg, "island_weather_city", None)
             if city:
                 self.weather_city = city
             self.pin_open = bool(getattr(cfg, "island_pin_open", self.pin_open))
@@ -370,11 +397,7 @@ class AppleDynamicIsland(
 
             if sys.platform == "win32" and hasattr(self, "winId"):
                 try:
-                    from ui.materials import apply_acrylic, remove_backdrop
-                    if getattr(cfg, "island_backdrop_blur", False):
-                        apply_acrylic(int(self.winId()), dark=self.dark_mode)
-                    else:
-                        remove_backdrop(int(self.winId()))
+                    remove_backdrop(int(self.winId()))  # solid black island: clear any earlier blur
                 except Exception:
                     pass
 
@@ -424,13 +447,7 @@ class AppleDynamicIsland(
         if sys.platform != "win32":
             return
         try:
-            hwnd = int(self.winId())
-            from ui.materials import apply_acrylic, remove_backdrop
-            cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
-            if getattr(cfg, "island_backdrop_blur", False):
-                apply_acrylic(hwnd, self.dark_mode)
-            else:
-                remove_backdrop(hwnd)
+            remove_backdrop(int(self.winId()))
         except Exception as exc:
             print(f"[island] backdrop error: {exc}")
 
@@ -740,7 +757,7 @@ class AppleDynamicIsland(
         self.expanded_until = now + 4.0
         self._card_expand_t = now
         self.set_interactive(True)
-        self._sync_hardware_adapter_lifecycle(now)
+        self._notify_visible_page()
         self.spring_w.vel = max(self.spring_w.vel, 60.0)
         self.spring_h.vel = max(self.spring_h.vel, 60.0)
 
@@ -751,7 +768,7 @@ class AppleDynamicIsland(
         self._opened_via_hover = False
         self._hover_leave_t = 0.0
         self.set_interactive(False)
-        self._sync_hardware_adapter_lifecycle(time.time())
+        self._notify_visible_page()
 
     @staticmethod
     def _candidate_title(cand: any) -> str:
@@ -888,7 +905,7 @@ class AppleDynamicIsland(
     def set_fullscreen(self, is_fs: bool) -> None:
         """Handles fullscreen suppression auto-hide and restore."""
         cfg = getattr(self.mgr, "cfg", None)
-        if not getattr(cfg, "island_hide_fullscreen", getattr(cfg, "hide_fullscreen", False)):
+        if not getattr(cfg, "island_hide_fullscreen", True):
             return
         if self.is_fullscreen_suppressed != is_fs:
             self.is_fullscreen_suppressed = is_fs
@@ -1023,7 +1040,7 @@ class AppleDynamicIsland(
 
     def _get_size_scale(self) -> float:
         cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
-        size_mode = getattr(cfg, "island_size_scale", getattr(cfg, "island_size", "medium")).lower()
+        size_mode = str(getattr(cfg, "island_size_scale", "medium")).lower()
         if size_mode in ("compact", "small"):
             return 0.85
         elif size_mode == "large":
@@ -1185,7 +1202,7 @@ class AppleDynamicIsland(
 
         # Interaction & Auto-collapse checks
         self._update_interaction(now, dt)
-        self._sync_hardware_adapter_lifecycle(now)
+        self._notify_visible_page()
 
         state = self._resolve_state(now)
         tw, th = self._target_size(state, now)
@@ -1364,31 +1381,17 @@ class AppleDynamicIsland(
                     self._hover_enter_t = now
                 thresh = 0.25 if expand_trig == "hover" else 1.0
                 if now - self._hover_enter_t >= thresh:
-                    cm = self._get_current_compact_mode()
-                    if self.media_playing or self.media_active or getattr(self, "media_title", ""):
-                        card = "media"
-                    elif cm == "timer" or self.timer_active:
-                        card = "timer"
-                    else:
-                        card = "weather"
                     self._opened_via_hover = True
                     self._hover_leave_t = 0.0
-                    self.expand_card(card)
+                    self.expand_card(self._default_card())
                     self._hover_enter_t = 0.0
             else:
                 self._hover_enter_t = 0.0
 
             # Hand-tracking fist-click trigger
             if is_hovering and self.label == "CLICK" and self._prev_active_gesture != "CLICK":
-                cm = self._get_current_compact_mode()
-                if self.media_playing or self.media_active or getattr(self, "media_title", ""):
-                    card = "media"
-                elif cm == "timer" or self.timer_active:
-                    card = "timer"
-                else:
-                    card = "weather"
                 self._opened_via_hover = False
-                self.expand_card(card)
+                self.expand_card(self._default_card())
 
         # 2. Expanded Card Interaction & Auto-collapse
         elif self.expanded_card:
@@ -1500,7 +1503,7 @@ class AppleDynamicIsland(
         if self.expanded_card:
             dot_idx = self._dot_at(pos)
             if dot_idx is not None and dot_idx < len(self.card_pages):
-                self.expand_card(self.card_pages[dot_idx])
+                self.show_page(self.card_pages[dot_idx])
                 return
 
         if self.expanded_card == "media":
@@ -1527,15 +1530,8 @@ class AppleDynamicIsland(
                 return
 
         elif self.expanded_card is None:
-            cm = self._get_current_compact_mode()
-            if self.media_playing or self.media_active or getattr(self, "media_title", ""):
-                card = "media"
-            elif cm == "timer" or self.timer_active:
-                card = "timer"
-            else:
-                card = "weather"
             self._opened_via_hover = False
-            self.expand_card(card)
+            self.expand_card(self._default_card())
 
         super().mousePressEvent(event)
 
@@ -1609,20 +1605,13 @@ class AppleDynamicIsland(
 
     def _trigger_button(self, btn: str) -> None:
         self.expanded_until = time.time() + 4.0
-        if btn == "jarvis_toggle_tracking":
-            is_paused = getattr(self, "tracking_paused", False)
-            self.tracking_paused = not is_paused
-            self.active = not self.tracking_paused
-            if hasattr(self.mgr, "toggle_tracking"):
-                self.mgr.toggle_tracking()
-            elif hasattr(self.mgr, "set_tracking_paused"):
-                self.mgr.set_tracking_paused(self.tracking_paused)
-            self.update()
-        elif btn == "play_pause":
+        if btn in ("jarvis_toggle_tracking", "jarvis_pause"):
+            self.toggle_tracking_paused()
+        elif btn in ("play_pause", "media_toggle"):
             self.media_toggle_play()
-        elif btn == "prev":
+        elif btn in ("prev", "media_prev"):
             self.media_prev()
-        elif btn == "next":
+        elif btn in ("next", "media_next"):
             self.media_next()
         elif btn == "timer_pause_resume":
             if self.timer_active:
@@ -1879,15 +1868,12 @@ class AppleDynamicIsland(
 
             # ── 2. Glass tint fill (Obsidian gradient) ────────────────────────
             bg_grad = QLinearGradient(0, 2, 0, h - 2)
-            cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
-            op = float(getattr(cfg, "island_backdrop_opacity", 0.95)) if cfg else 0.95
-            op_scale = max(0.05, min(1.0, op / 0.95))
             if dark:
-                bg_grad.setColorAt(0.0, QColor(19, 22, 23, int(round(245 * op_scale))))
-                bg_grad.setColorAt(1.0, QColor(10, 10, 10, int(round(250 * op_scale))))
+                bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
+                bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
             else:
-                bg_grad.setColorAt(0.0, QColor(248, 248, 252, int(round(240 * op_scale))))
-                bg_grad.setColorAt(1.0, QColor(230, 230, 238, int(round(248 * op_scale))))
+                bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
+                bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
 
             p.fillPath(squircle, QBrush(bg_grad))
         else:
@@ -1905,15 +1891,12 @@ class AppleDynamicIsland(
 
             # ── 2. Glass tint fill (Obsidian gradient) ────────────────────────
             bg_grad = QLinearGradient(0, -16, 0, h)
-            cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
-            op = float(getattr(cfg, "island_backdrop_opacity", 0.95)) if cfg else 0.95
-            op_scale = max(0.05, min(1.0, op / 0.95))
             if dark:
-                bg_grad.setColorAt(0.0, QColor(19, 22, 23, int(round(245 * op_scale))))
-                bg_grad.setColorAt(1.0, QColor(10, 10, 10, int(round(250 * op_scale))))
+                bg_grad.setColorAt(0.0, QColor(19, 22, 23, 245))
+                bg_grad.setColorAt(1.0, QColor(10, 10, 10, 250))
             else:
-                bg_grad.setColorAt(0.0, QColor(248, 248, 252, int(round(240 * op_scale))))
-                bg_grad.setColorAt(1.0, QColor(230, 230, 238, int(round(248 * op_scale))))
+                bg_grad.setColorAt(0.0, QColor(248, 248, 252, 240))
+                bg_grad.setColorAt(1.0, QColor(230, 230, 238, 248))
 
             p.fillPath(squircle, QBrush(bg_grad))
 
@@ -2136,6 +2119,9 @@ class AppleDynamicIsland(
             IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS
         ):
             self._draw_page_dots(p, w, h, dark)
+
+        # Publish the thread-safe hit-test snapshot (global coordinates) for worker threads
+        self._publish_hit_snapshot(w, h, state)
 
     def _draw_disambiguation_card(self, p: QPainter, w: float, h: float,
                                   now: float, t: float, dark: bool,

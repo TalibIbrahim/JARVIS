@@ -12,7 +12,7 @@ Provides:
 
 Design rules:
   - Settings window → Mica + DwmExtendFrameIntoClientArea
-  - Island, radial menu, tooltips → Acrylic
+  - Island → solid black, no backdrop (remove_backdrop clears any earlier blur); radial menu, tooltips → Acrylic
   - Windows 10 or transparency-disabled → solid tinted surface fallback
   - NEVER compute per-frame blur; the DWM material is always hardware-driven
 """
