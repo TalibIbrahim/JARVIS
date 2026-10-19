@@ -1375,6 +1375,13 @@ def execute_whitelisted_action(action: str, args: Dict[str, Any], ctx: Any) -> T
     Returns (executed: bool, message: str) and notifies overlay on completion.
     """
     import jarvis_log
+    if action in ("shutdown_system", "restart_system", "sleep_system", "clean_slate", "close_window"):
+        from commands import destructive_action_gate
+        utt = (args or {}).get("_utterance") or getattr(ctx, "_current_utterance", None)
+        allowed, args = destructive_action_gate(action, args, utt)
+        if not allowed:
+            jarvis_log.utterance_event(jarvis_log.DECISION, tier="system2", action=f"{action}(blocked)")
+            return False, f"{action} blocked: utterance is not an explicit command for it"
     jarvis_log.utterance_event(jarvis_log.DISPATCH, action=action)
     executed, msg = _execute_whitelisted_action_impl(action, args, ctx)
     jarvis_log.utterance_event(jarvis_log.RESULT, action=action, ok=executed, msg=jarvis_log.redact(str(msg)[:60]))

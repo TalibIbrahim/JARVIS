@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.parse
 import webbrowser
 from typing import Any, Dict, List, Optional, Tuple
@@ -76,15 +77,49 @@ POWER_STANDBY = frozenset({"go to sleep", "sleep mode", "sleep", "take a nap", "
                            "go to standby", "rest", "rest mode", "standby mode"})
 POWER_WAKE = frozenset({"wake up", "activate", "come online", "i'm back", "im back", "online"})
 
+# Destructive phrases: like POWER_QUIT/STANDBY they run ONLY as the whole utterance, never inside a chain.
+CONFIRM_SHUTDOWN = ("yes confirm shutdown", "confirm shutdown")
+CONFIRM_RESTART = ("yes confirm restart", "confirm restart")
+CONFIRM_CLOSE = ("confirm close", "force close", "close anyway")
+SHUTDOWN_PHRASES = ("shut down the pc", "shut down pc", "shut down computer", "turn off pc", "turn off the pc",
+                    "power off pc", "shutdown pc", "shutdown computer")
+RESTART_PHRASES = ("restart pc", "restart the pc", "restart computer", "reboot pc", "reboot computer",
+                   "reboot the computer")
+SLEEP_SYSTEM_PHRASES = ("sleep system", "sleep pc", "sleep computer", "put pc to sleep", "put computer to sleep")
+CLEAN_SLATE_PHRASES = ("clean slate", "clean slate protocol", "protocol clean slate", "execute clean slate",
+                       "execute clean slate protocol")
+_PENDING_CONFIRM_WORDS = ("yes", "confirm", "proceed", "do it", "sure", "affirmative", "yes please", "yes confirm",
+                          "confirm this", "yes confirm shutdown", "confirm shutdown", "yes confirm restart",
+                          "confirm restart", "confirm close", "yes confirm close", "force close")
+
+MAX_UTTERANCE_CHARS = 500   # voice/command entry cap: no legitimate command is longer
+_MAX_FILLER_PEELS = 8       # bounded filler peeling keeps _power_forms linear on hostile input
+SKIPPED_IN_CHAIN_NOTE = "I'll only do that on its own, sir."
+
+
+def _norm_text(text) -> str:
+    """The ONE normalization for wake/power matching: NFKC then casefold. Confusable letters that
+    survive it (dotless i, ...) are non-ASCII and therefore never match an ASCII wake word."""
+    return unicodedata.normalize("NFKC", str(text or "")).casefold()
+
+
+def cap_utterance(text):
+    """Truncate an over-long utterance to MAX_UTTERANCE_CHARS (logged)."""
+    if isinstance(text, str) and len(text) > MAX_UTTERANCE_CHARS:
+        _jl.get_logger("commands").warning("utterance truncated from %d to %d chars", len(text), MAX_UTTERANCE_CHARS)
+        return text[:MAX_UTTERANCE_CHARS]
+    return text
+
 
 def _power_forms(text) -> list:
-    """Normalized candidate forms of an utterance: lowercase, punctuation stripped, then
-    leading please/jarvis and trailing please/now/jarvis peeled off step by step."""
-    s = str(text or "").lower().replace("’", "'")
+    """Normalized candidate forms of an utterance: normalized lowercase, punctuation stripped, then
+    leading please/jarvis and trailing please/now/jarvis peeled off step by step (bounded)."""
+    s = _norm_text(cap_utterance(str(text or ""))).replace("\u2019", "'")
     s = " ".join(re.sub(r"[^\w\s']", " ", s).split())
     forms = [s]
-    changed = True
-    while changed and s:
+    for _ in range(_MAX_FILLER_PEELS):
+        if not s:
+            break
         changed = False
         for f in _LEAD_FILLER:
             if s == f:
@@ -101,7 +136,9 @@ def _power_forms(text) -> list:
                     s = s[:-(len(f) + 1)]
                     changed = True
                     break
-        if changed and s:
+        if not changed:
+            break
+        if s:
             forms.append(s)
     return forms
 
@@ -118,12 +155,64 @@ def is_power_phrase(text, kind: str) -> bool:
     return _exact(text, *table.get(kind, ()))
 
 
-_WAKE_PREFIX_RE = re.compile(r"^(?:(?:hey|ok|okay)\s+)?jarvis(?!\w)[\s,.:;!?-]*(?=\S)", re.I)
+_WAKE_PREFIX_RE = re.compile(r"^(?:(?:hey|ok|okay)\s+)?jarvis(?!\w)[\s,.:;!?-]*(?=\S)", re.ASCII)
 
 
 def strip_wake_prefix(t: str) -> str:
-    """Drop a leading '[hey|ok|okay] jarvis' when a command follows it; else return t unchanged."""
-    return _WAKE_PREFIX_RE.sub("", t, count=1).strip() or t
+    """Drop a leading '[hey|ok|okay] jarvis' when a command follows it; else return t unchanged.
+    Matches on the same NFKC+casefold normalization as is_power_phrase (ASCII-only wake word), so the
+    dispatcher and the power gate always agree."""
+    n = _norm_text(cap_utterance(t))
+    if not _WAKE_PREFIX_RE.match(n):
+        return t.strip() or t
+    return _WAKE_PREFIX_RE.sub("", n, count=1).strip() or t
+
+
+def is_chain_gated(text) -> bool:
+    """True if `text` is a power/standby/quit or destructive command (or a confirmation of one).
+    Such commands execute only when they are the whole utterance, never as part of a chain."""
+    gated = (POWER_QUIT | POWER_STANDBY | frozenset(
+        CONFIRM_SHUTDOWN + CONFIRM_RESTART + CONFIRM_CLOSE + SHUTDOWN_PHRASES + RESTART_PHRASES
+        + SLEEP_SYSTEM_PHRASES + CLEAN_SLATE_PHRASES + ("shutdown", "restart", "reboot")))
+    if _PENDING_CONFIRMATION:
+        gated = gated | frozenset(_PENDING_CONFIRM_WORDS)
+    for base in (text, strip_wake_prefix(text)):
+        for f in _power_forms(base):
+            if f in gated:
+                return True
+            f2 = re.sub(r"^(?:can you\s+(?:please\s+)?|could you\s+(?:please\s+)?|would you\s+(?:please\s+)?|hey\s+|ok\s+|okay\s+|just\s+)", "", f)
+            if f2 in gated:
+                return True
+    n = " ".join(re.sub(r"[^\w\s']", " ", _norm_text(cap_utterance(text))).split())
+    return _any(n, "clean slate", "confirm shutdown", "confirm restart", "confirm close")
+
+
+# Destructive actions: action -> allowed-utterance phrases. The LLM (System 2) and the System 1 engine
+# may NEVER confirm; these run only when the user's own words are one of the exact phrases.
+# None = never runnable through execute_whitelisted_action (the local Tier-1 "confirm ..." phrases do it).
+DESTRUCTIVE_ACTIONS = {
+    "shutdown_system": None,
+    "restart_system": None,
+    "sleep_system": frozenset(SLEEP_SYSTEM_PHRASES),
+    "clean_slate": frozenset(CLEAN_SLATE_PHRASES),
+    "close_window": frozenset(CONFIRM_CLOSE),   # only when confirm=True; confirm=False merely asks
+}
+
+
+def destructive_action_gate(action, args, utterance):
+    """Returns (allowed, args). shutdown/restart: allowed but `confirmed` forced False (the existing flow
+    asks the user to say 'confirm shutdown'/'confirm restart'). Others: allowed only on an exact phrase."""
+    if action not in DESTRUCTIVE_ACTIONS:
+        return True, args
+    args = dict(args or {})
+    if action in ("shutdown_system", "restart_system"):
+        args["confirmed"] = False
+        return True, args
+    if action == "close_window" and not args.get("confirm"):
+        return True, args
+    phrases = DESTRUCTIVE_ACTIONS[action]
+    ok = isinstance(utterance, str) and _exact(utterance, *phrases)
+    return ok, args
 
 
 def power_action_allowed(args, utterance) -> bool:
@@ -431,6 +520,7 @@ def handle_island_voice_command(text: str, ctx: Any = None) -> Optional[str]:
 
 def run_command(text, ctx):
     """Returns the reply Jarvis should speak, or None if nothing matched."""
+    text = cap_utterance(text)
     # 0. Check chained / compound commands (e.g. 'volume up and maximize window')
     try:
         import chained_commands
@@ -440,6 +530,7 @@ def run_command(text, ctx):
                 compound_text=text,
                 ctx=ctx,
                 execute_single_fn=_run_single_command,
+                is_gated_fn=is_chain_gated,
             )
             return combined_reply
     except Exception as exc:
@@ -451,6 +542,7 @@ def run_command(text, ctx):
 def _run_single_command(text, ctx):
     """Internal single-command evaluator."""
     import pyautogui
+    text = cap_utterance(text)
     t = text.lower().strip(" ,.!?")
     # Strip conversational filler prefixes
     clean_t = re.sub(r"^(?:please\s+|can you\s+(?:please\s+)?|could you\s+(?:please\s+)?|would you\s+(?:please\s+)?|hey\s+|ok\s+|okay\s+|just\s+)", "", t).strip()
@@ -491,6 +583,9 @@ def _run_single_command(text, ctx):
         if w_ans:
             _post_action(ctx, "wiki", True, text=text)
             return w_ans
+        if not quick_answers._ai_allowed(ctx):
+            _post_action(ctx, "wiki", False, text=text)
+            return "I couldn't find that on Wikipedia, sir, and AI is off in Settings."
 
     if ctx:
         try:
@@ -587,21 +682,21 @@ def _run_single_command(text, ctx):
         return "Tracking paused, sir." if _trk else "Tracking resumed, sir."
 
     # Direct verbal confirmations
-    if _exact(clean_t, "yes confirm shutdown", "confirm shutdown"):
+    if _exact(clean_t, *CONFIRM_SHUTDOWN):
         _PENDING_CONFIRMATION = None
         import system_control
         ok, msg = system_control.shutdown_system(confirmed=True)
         _post_action(ctx, "shutdown_system", ok, text=text)
         return msg
 
-    if _exact(clean_t, "yes confirm restart", "confirm restart"):
+    if _exact(clean_t, *CONFIRM_RESTART):
         _PENDING_CONFIRMATION = None
         import system_control
         ok, msg = system_control.restart_system(confirmed=True)
         _post_action(ctx, "restart_system", ok, text=text)
         return msg
 
-    if _exact(clean_t, "confirm close", "force close", "close anyway"):
+    if _exact(clean_t, *CONFIRM_CLOSE):
         _PENDING_CONFIRMATION = None
         import system_control
         ok, msg = system_control.close_window(confirm=True)
@@ -609,14 +704,14 @@ def _run_single_command(text, ctx):
         return "Window closed, sir."
 
     # Destructive actions gates
-    if _exact(clean_t, "shut down the pc", "shut down pc", "shut down computer", "turn off pc", "turn off the pc", "power off pc", "shutdown pc", "shutdown computer"):
+    if _exact(clean_t, *SHUTDOWN_PHRASES):
         _PENDING_CONFIRMATION = "shutdown"
         return "Shutdown requires confirmation, sir. Please say 'confirm shutdown' to proceed."
     if clean_t == "shutdown":
         _PENDING_CONFIRMATION = "shutdown"
         return "Shutdown requires confirmation, sir. Please say 'confirm shutdown' to proceed."
 
-    if _exact(clean_t, "restart pc", "restart the pc", "restart computer", "reboot pc", "reboot computer", "reboot the computer"):
+    if _exact(clean_t, *RESTART_PHRASES):
         _PENDING_CONFIRMATION = "restart"
         return "Restart requires confirmation, sir. Please say 'confirm restart' to proceed."
     if clean_t in ("restart", "reboot"):
@@ -624,7 +719,7 @@ def _run_single_command(text, ctx):
         return "Restart requires confirmation, sir. Please say 'confirm restart' to proceed."
 
     # --- power / mode ---
-    if _exact(clean_t, "sleep system", "sleep pc", "sleep computer", "put pc to sleep", "put computer to sleep"):
+    if _exact(clean_t, *SLEEP_SYSTEM_PHRASES):
         import system_control
         ok, msg = system_control.sleep_system()
         _post_action(ctx, "sleep_system", ok, text=text)
@@ -692,7 +787,7 @@ def _run_single_command(text, ctx):
         pyautogui.hotkey("win", "down", _pause=False)
         _post_action(ctx, "stealth_mode", True)
         return "Stealth mode engaged, sir. Audio muted and visual signatures minimized."
-    if _any(clean_t, "clean slate protocol", "clean slate", "protocol clean slate", "wrap it up"):
+    if _exact(clean_t, *CLEAN_SLATE_PHRASES):
         pyautogui.hotkey("win", "d", _pause=False)
         reset_ai_history()
         if ctx:
@@ -910,7 +1005,8 @@ def _run_single_command(text, ctx):
                     return res.message
     m = re.match(r"(?:search(?: for)?|google|look up)\s+(.+)", clean_t)
     if m:
-        webbrowser.open("https://www.google.com/search?q=" + m.group(1).strip().replace(" ", "+"))
+        _q = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", m.group(1)).split())
+        webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(_q))
         _post_action(ctx, "search", True, args={"query": m.group(1).strip()}, text=text)
         return f"Searching for {m.group(1).strip()}."
 

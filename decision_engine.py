@@ -395,6 +395,10 @@ _READ_ONLY_CUES: Dict[str, "re.Pattern[str]"] = {k: re.compile(v) for k, v in {
     "island_show_page": r"\b(?:" + _PAGES + r")\b",
     "island_toggle_expand": r"\b(?:island|card|expand|collapse)\b",
 }.items()}
+# Not read-only, but clean_slate hides every window and enters standby (BUG-F2): it needs one of its own
+# explicit phrases in the utterance, never a fuzzy near-match such as a bare "execute".
+_READ_ONLY_CUES["clean_slate"] = re.compile(
+    r"\b(?:" + "|".join(re.escape(_p.lower()) for _p in INTENT_PROTOTYPES["clean_slate"]) + r")\b")
 _RE_WEATHER_CUE = _READ_ONLY_CUES["weather"]
 
 
@@ -1504,7 +1508,12 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
         args = {"location": clean}
         reply = "World time retrieved, sir."
 
-    # Execute whitelisted desktop action
+    # Execute whitelisted desktop action (destructive ones are gated on the user's own words)
+    if ctx is not None:
+        try:
+            ctx._current_utterance = user_text
+        except Exception:
+            pass
     executed, msg = execute_whitelisted_action(action, args, ctx)
     if executed:
         if ctx and hasattr(ctx, "overlay") and ctx.overlay:

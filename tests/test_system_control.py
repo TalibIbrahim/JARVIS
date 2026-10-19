@@ -503,7 +503,12 @@ class TestWhitelistActionsAndSchemas(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(mock_window.last_snap, "left")
 
-            # sleep_system
+            # sleep_system: blocked unless the user's own words are the exact phrase
+            ctx._current_utterance = "bye"
+            ok, msg = execute_whitelisted_action("sleep_system", {}, ctx)
+            self.assertFalse(ok)
+            self.assertFalse(mock_power.slept)
+            ctx._current_utterance = "sleep pc"
             ok, msg = execute_whitelisted_action("sleep_system", {}, ctx)
             self.assertTrue(ok)
             self.assertTrue(mock_power.slept)
@@ -513,9 +518,12 @@ class TestWhitelistActionsAndSchemas(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("requires confirmation", msg)
 
-            # shutdown_system confirmed
+            # shutdown_system confirmed=True from the model is forced to unconfirmed by the gate
             ok, msg = execute_whitelisted_action("shutdown_system", {"confirmed": True}, ctx)
-            self.assertTrue(ok)
+            self.assertFalse(ok)
+            self.assertFalse(mock_power.shutdown_executed)
+            # the user's own confirmation phrase still shuts down (local Tier-1 path)
+            run_command("confirm shutdown", ctx)
             self.assertTrue(mock_power.shutdown_executed)
         finally:
             reset_system_control()

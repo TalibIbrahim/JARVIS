@@ -18,6 +18,11 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, List, Optional, Tuple
 
+import jarvis_log as _jl
+
+
+MAX_CHAIN_COMMANDS = 5
+SKIPPED_NOTE = "I'll only do that on its own, sir."
 
 # Command prefixes whose arguments must never be split by conjunctions
 _UNSPLITTABLE_PREFIXES = (
@@ -139,9 +144,12 @@ def execute_chained_commands(
     compound_text: str,
     ctx: Any,
     execute_single_fn: Callable[[str, Any], Optional[str]],
+    is_gated_fn: Optional[Callable[[str], bool]] = None,
 ) -> Tuple[bool, str, List[Tuple[str, str]]]:
     """
     Splits compound text and executes each sub-command sequentially via execute_single_fn.
+    Power/standby/quit and destructive sub-commands (is_gated_fn True) are NEVER executed inside a
+    chain: they are skipped with a short spoken note. At most MAX_CHAIN_COMMANDS run.
     Returns (success: bool, combined_reply: str, execution_log: List[(command, reply)]).
     """
     commands = split_chained_commands(compound_text)
@@ -149,10 +157,26 @@ def execute_chained_commands(
         reply = execute_single_fn(compound_text, ctx)
         return bool(reply), reply or "", [(compound_text, reply or "")]
 
+    if is_gated_fn is None:
+        from commands import is_chain_gated as is_gated_fn
+
+    if len(commands) > MAX_CHAIN_COMMANDS:
+        _jl.get_logger("commands").warning(
+            "chain of %d sub-commands capped at %d", len(commands), MAX_CHAIN_COMMANDS)
+        commands = commands[:MAX_CHAIN_COMMANDS]
+
     replies: List[str] = []
     log: List[Tuple[str, str]] = []
+    skipped_noted = False
 
     for cmd in commands:
+        if is_gated_fn(cmd):
+            _jl.get_logger("commands").warning("power/destructive sub-command skipped in chain")
+            log.append((cmd, SKIPPED_NOTE))
+            if not skipped_noted:
+                replies.append(SKIPPED_NOTE)
+                skipped_noted = True
+            continue
         try:
             cmd_reply = execute_single_fn(cmd, ctx)
             if cmd_reply:

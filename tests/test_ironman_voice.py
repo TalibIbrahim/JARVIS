@@ -180,10 +180,20 @@ class TestIronManAIWhitelistedActions(unittest.TestCase):
 
     @patch("pyautogui.hotkey")
     def test_execute_clean_slate_action(self, mock_hotkey):
+        # Destructive gate: runs only when the user's own words are the exact phrase.
+        self.ctx._current_utterance = "execute clean slate"
         ok, msg = execute_whitelisted_action("clean_slate", {}, self.ctx)
         self.assertTrue(ok)
         mock_hotkey.assert_called_with("win", "d", _pause=False)
         self.ctx.set_active.assert_called_with(False)
+
+    @patch("pyautogui.hotkey")
+    def test_execute_clean_slate_action_blocked_without_phrase(self, mock_hotkey):
+        self.ctx._current_utterance = "bye"
+        ok, msg = execute_whitelisted_action("clean_slate", {}, self.ctx)
+        self.assertFalse(ok)
+        mock_hotkey.assert_not_called()
+        self.ctx.set_active.assert_not_called()
 
     @patch("webbrowser.open")
     def test_execute_target_practice_action(self, mock_web):
