@@ -46,6 +46,29 @@ from jarvis_log import redact
 _vlog = jarvis_log.get_logger("voice")
 
 _PORTAUDIO_LOCK = jarvis_log.InstrumentedRLock("portaudio", warn_wait_ms=50, warn_hold_ms=250)
+
+
+def _import_openwakeword_lean():
+    """Import openwakeword without its unused training module.
+
+    openwakeword/__init__.py imports openwakeword.custom_verifier_model, which
+    pulls in sklearn and scipy.stats (~3 s and ~69 MB RSS) only to train custom
+    verifiers, which JARVIS never does. Pre-register a minimal stub so that
+    import is skipped. openwakeword.model does not reference the module.
+    """
+    name = "openwakeword.custom_verifier_model"
+    if name not in sys.modules:
+        import types
+
+        def train_custom_verifier(*_a, **_k):
+            raise NotImplementedError("custom verifier models are not supported in JARVIS")
+
+        stub = types.ModuleType(name)
+        stub.train_custom_verifier = train_custom_verifier
+        sys.modules[name] = stub
+    import openwakeword
+    return openwakeword
+
 set_audio_lock(_PORTAUDIO_LOCK)
 
 
@@ -178,6 +201,7 @@ class VADDetector:
 
     def _init_vad(self):
         try:
+            _import_openwakeword_lean()
             from openwakeword.vad import VAD
             self._vad = VAD()
         except Exception as exc:
@@ -1233,6 +1257,7 @@ class WakeWordDetector(threading.Thread):
             self._aec = aec
             self._aec_vad = VADDetector(cfg=self.cfg)
             if self.model is not None:
+                _import_openwakeword_lean()
                 from openwakeword.model import Model
                 self._aec_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
             _vlog.info("voice over music: echo canceller started")
@@ -1407,6 +1432,7 @@ class WakeWordDetector(threading.Thread):
 
     def _init_model(self):
         try:
+            _import_openwakeword_lean()
             from openwakeword.model import Model
             self.model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
         except Exception as e:
