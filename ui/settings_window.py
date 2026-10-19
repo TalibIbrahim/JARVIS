@@ -51,33 +51,87 @@ from ui.components import (
     SidebarSearchField, AppleComboBox, PageOrderList,
 )
 
-try:
-    from updater import APP_VERSION
-except ImportError:
-    APP_VERSION = "2.2.0"
+# voice / tracker / ai / updater are heavy (openwakeword, mediapipe, ...); they are
+# imported lazily at the point of use so the island can come up without them.
+def _app_version():
+    try:
+        from updater import APP_VERSION
+        return APP_VERSION
+    except ImportError:
+        return "2.2.0"
 
-try:
-    from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
-except ImportError:
-    list_microphones = lambda: []
-    find_best_microphone = lambda cfg=None: (None, "Default Microphone")
-    probe_mic_level = lambda dev=None: (0.0, 0.0)
-    test_microphone_recognition = lambda dev=None, duration=3.5: {"success": False, "error": "Voice module unavailable"}
 
-try:
-    from tracker import list_cameras
-except ImportError:
-    list_cameras = lambda force_refresh=False: [{"index": 0, "name": "Default Camera", "working": True}]
+def list_microphones():
+    try:
+        from voice import list_microphones as _f
+    except ImportError:
+        return []
+    return _f()
 
-try:
-    from ai import get_api_key, set_api_key, delete_api_key, GroqClient, DEFAULT_LLM_MODEL, DEFAULT_STT_MODEL
-except ImportError:
-    get_api_key = lambda cfg=None: None
-    set_api_key = lambda k, **kw: None
-    delete_api_key = lambda: None
-    GroqClient = None
-    DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
-    DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
+
+def find_best_microphone(cfg=None):
+    try:
+        from voice import find_best_microphone as _f
+    except ImportError:
+        return (None, "Default Microphone")
+    return _f(cfg)
+
+
+def probe_mic_level(dev=None):
+    try:
+        from voice import probe_mic_level as _f
+    except ImportError:
+        return (0.0, 0.0)
+    return _f(dev)
+
+
+def test_microphone_recognition(*a, **kw):
+    try:
+        from voice import test_microphone_recognition as _f
+    except ImportError:
+        return {"success": False, "error": "Voice module unavailable"}
+    return _f(*a, **kw)
+
+
+def list_cameras(force_refresh=False):
+    try:
+        from tracker import list_cameras as _f
+    except ImportError:
+        return [{"index": 0, "name": "Default Camera", "working": True}]
+    return _f(force_refresh=force_refresh)
+
+
+def get_api_key(cfg=None):
+    try:
+        from ai import get_api_key as _f
+    except ImportError:
+        return None
+    return _f(cfg)
+
+
+def set_api_key(k, **kw):
+    try:
+        from ai import set_api_key as _f
+    except ImportError:
+        return None
+    return _f(k, **kw)
+
+
+def delete_api_key():
+    try:
+        from ai import delete_api_key as _f
+    except ImportError:
+        return None
+    return _f()
+
+
+def _groq_client_cls():
+    try:
+        from ai import GroqClient
+        return GroqClient
+    except ImportError:
+        return None
+
 
 try:
     from config import get_config_path, _atomic_write_json, Config as _ConfigCls
@@ -1141,15 +1195,49 @@ class SettingsWindow(QDialog):
         self.stack = self._stack
         root.addWidget(self._stack, stretch=1)
 
-        # Build pages in order matching _CATEGORIES
-        self._build_general_page()
-        self._build_gestures_page()
-        self._build_pointer_page()
-        self._build_voice_page()
-        self._build_ai_page()
-        self._build_display_page()
-        self._build_commands_page()
-        self._build_about_page()
+        # Pages are built lazily: only the default tab at construction, the rest on first
+        # selection (or via build_next_pending_page() while idle).  Placeholders keep the
+        # stack indices aligned with _CATEGORIES.
+        self._page_builders = {
+            "General": self._build_general_page,
+            "Gestures": self._build_gestures_page,
+            "Pointer": self._build_pointer_page,
+            "Voice": self._build_voice_page,
+            "AI": self._build_ai_page,
+            "Display": self._build_display_page,
+            "Commands": self._build_commands_page,
+            "About": self._build_about_page,
+        }
+        for _cid in _CATEGORIES:
+            self._stack.addWidget(QWidget())
+        self._pending_pages = list(_CATEGORIES)
+        # Attributes created by lazily built pages and used by code outside that page's builder.
+        # (Names only probed with hasattr() as a "page is built" test -- _mic_timer, _updater_cb,
+        # _mic_meter, btn_chk, btn_diag_health, pill_* -- are deliberately NOT declared.)
+        self._cmd_page = None
+        self._cmd_rows = []
+        self._cmd_groups = {}
+        self._cmd_caps = {}
+        self._cmd_empty = None
+        self._cmd_search = None
+        self._cmd_filter = "All"
+        self.glass_pct_label = None
+        self.lyrics_pill_switch = None
+        self.mic_combo = None
+        self.key_input = None
+        self.llm_combo = None
+        self.stt_combo = None
+        self.lbl_conn_status = None
+        self.lbl_test_result = None
+        self.btn_test_conn = None
+        self.btn_test_mic = None
+        try:
+            from command_catalog import get_catalog, CATEGORIES
+            self._cmd_catalog = (list(get_catalog()), [str(c) for c in CATEGORIES])
+        except Exception:
+            self._cmd_catalog = ([], [])
+        self._building_cid = None
+        self._ensure_page(_CATEGORIES[0])
 
         # Theme polling timer (live Windows theme detection every 2 s)
         self._theme_timer = QTimer(self)
@@ -1158,9 +1246,52 @@ class SettingsWindow(QDialog):
 
         # Initial selection
         self._sidebar.select(_CATEGORIES[0])
-        for btn in self.findChildren(PrimaryButton):
+        glass.attach_tooltips(self)                # glass tooltips (pages built later attach their own)
+
+    # ── Lazy page construction ────────────────────────────────────────────
+
+    def _ensure_page(self, cid: str) -> None:
+        pending = self.__dict__.get("_pending_pages")
+        if not pending or cid not in pending:
+            return
+        pending.remove(cid)
+        prev = self._building_cid
+        self._building_cid = cid
+        try:
+            self._page_builders[cid]()
+        finally:
+            self._building_cid = prev
+        page = self._stack.widget(_CATEGORIES.index(cid))
+        for btn in page.findChildren(PrimaryButton):
             btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        glass.attach_tooltips(self)                # glass tooltips for every widget that has one
+        if self.__dict__.get("_tooltips_attached", True) and cid != _CATEGORIES[0]:
+            glass.attach_tooltips(page)
+
+    def _add_page(self, page: QWidget) -> None:
+        """Swap the placeholder of the page being built for the real page (keeps index + current)."""
+        idx = _CATEGORIES.index(self._building_cid)
+        cur = self._stack.currentIndex()
+        old = self._stack.widget(idx)
+        self._stack.removeWidget(old)
+        old.deleteLater()
+        self._stack.insertWidget(idx, page)
+        if cur >= 0:
+            self._stack.setCurrentIndex(cur)
+
+    def build_next_pending_page(self) -> bool:
+        """Build one not-yet-built page (idle prewarm).  Returns True while more remain."""
+        pending = self.__dict__.get("_pending_pages")
+        if pending:
+            self._ensure_page(pending[0])
+        return bool(self.__dict__.get("_pending_pages"))
+
+    def build_all_pages(self) -> None:
+        while self.build_next_pending_page():
+            pass
+
+    def ensure_all_pages(self) -> None:
+        """Public: build every tab now (tests / callers that inspect widgets of unbuilt tabs)."""
+        self.build_all_pages()
 
     # ── Backdrop ─────────────────────────────────────────────────────────
 
@@ -1300,6 +1431,7 @@ class SettingsWindow(QDialog):
     def _on_nav(self, category_id: str) -> None:
         try:
             idx = _CATEGORIES.index(category_id)
+            self._ensure_page(category_id)
             self._stack.setCurrentIndex(idx)
             # Start/stop mic meter
             voice_idx = _CATEGORIES.index("Voice")
@@ -1710,7 +1842,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(sys_card)
 
         layout.addStretch()
-        self._stack.addWidget(page)
+        self._add_page(page)
 
     def _build_gestures_page(self) -> None:
         page, layout = make_scroll_page("Gestures", "Hand tracking schemes and recognition thresholds")
@@ -1825,7 +1957,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(adv_card)
 
         layout.addStretch()
-        self._stack.addWidget(page)
+        self._add_page(page)
 
     def _build_pointer_page(self) -> None:
         page, layout = make_scroll_page("Pointer & Dwell", "Cursor tracking, acceleration, and hover-to-click")
@@ -1887,7 +2019,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(act_card)
 
         layout.addStretch()
-        self._stack.addWidget(page)
+        self._add_page(page)
 
     def _build_voice_page(self) -> None:
         page, layout = make_scroll_page("Voice", "Speech recognition and audio input")
@@ -2023,7 +2155,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(meter_card)
 
         layout.addStretch()
-        self._stack.addWidget(page)
+        self._add_page(page)
         self.voice_page = page
 
         # Mic polling timer
@@ -2176,7 +2308,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(models_card)
 
         layout.addStretch()
-        self._stack.addWidget(page)
+        self._add_page(page)
 
     def _build_display_page(self) -> None:
         page, layout = make_scroll_page("Display", "Appearance, materials, and animations")
@@ -2716,7 +2848,7 @@ class SettingsWindow(QDialog):
         self.idle_combo = self.compact_content_control
 
         layout.addStretch()
-        self._stack.addWidget(page)
+        self._add_page(page)
 
     def _build_commands_page(self) -> None:
         page, layout = make_scroll_page("Commands", "Everything J.A.R.V.I.S. can do by voice or gesture")
@@ -2727,12 +2859,8 @@ class SettingsWindow(QDialog):
         self._cmd_caps: dict = {}
         self._cmd_filter = "All"
 
-        try:
-            from command_catalog import get_catalog, CATEGORIES
-            specs = list(get_catalog())
-            cats = [str(c) for c in CATEGORIES]
-        except Exception:
-            specs, cats = [], []
+        specs, cats = self._cmd_catalog        # captured at construction (page itself builds lazily)
+        specs, cats = list(specs), list(cats)
 
         def _empty(text: str) -> None:
             lbl = QLabel(text)
@@ -2746,7 +2874,7 @@ class SettingsWindow(QDialog):
             self._cmd_search = None
             _empty("Command list unavailable")
             layout.addStretch()
-            self._stack.addWidget(page)
+            self._add_page(page)
             return
 
         for s in specs:                                   # categories missing from CATEGORIES still show up
@@ -2813,9 +2941,10 @@ class SettingsWindow(QDialog):
         layout.addStretch()
         self._cmd_caps["All"].set_active(True)
         self._apply_cmd_filter()
-        self._stack.addWidget(page)
+        self._add_page(page)
 
     def _on_cmd_filter(self, key: str) -> None:
+        self._ensure_page("Commands")
         self._cmd_filter = key
         for k, cap in self._cmd_caps.items():
             cap.set_active(k == key)
@@ -2870,7 +2999,7 @@ class SettingsWindow(QDialog):
             l.setStyleSheet(f"color: {glass.label_color('secondary_label', self._dark).name()};")
             return l
 
-        info_card.add_row("Version",    "", _info_lbl(f"v{APP_VERSION}"))
+        info_card.add_row("Version",    "", _info_lbl(f"v{_app_version()}"))
         info_card.add_row("Platform",   "", _info_lbl(f"Windows 64-bit  |  Python {sys.version.split()[0]}"))
         info_card.add_row("Design",     "Apple Human Interface Guidelines", _info_lbl("Liquid Glass"))
         info_card.add_row("Architecture","Touchless hand-gesture PC control", _info_lbl("120 Hz decoupled, sub-ms latency"))
@@ -2881,7 +3010,7 @@ class SettingsWindow(QDialog):
             self.btn_chk     = PrimaryButton("Check for Updates")
             self.btn_restart = SuccessButton("Restart to Apply")
             self.btn_restart.setVisible(False)
-            self.lbl_up_status = QLabel(f"Current version is v{APP_VERSION}.")
+            self.lbl_up_status = QLabel(f"Current version is v{_app_version()}.")
             self.lbl_up_status.setFont(qfont(TYPE.footnote))
             self.lbl_up_status.setStyleSheet(f"color: {glass.label_color('secondary_label', self._dark).name()};")
             self.prog_bar = QProgressBar()
@@ -2914,6 +3043,21 @@ class SettingsWindow(QDialog):
             self._updater_cb = _updater_cb
             self.updater.add_listener(_updater_cb)
 
+            # The tab may be built long after updater events fired: render its current state now.
+            try:
+                _st = getattr(self.updater, "status", "idle")
+                if _st == "downloading":
+                    self._on_updater_event_gui(_st, {"percent": getattr(self.updater, "download_progress", 0)})
+                elif _st == "available":
+                    self._on_updater_event_gui(_st, {"info": getattr(self.updater, "latest_info", None)})
+                elif _st in ("checking", "downloaded"):
+                    self._on_updater_event_gui(_st, {})
+                elif _st == "up-to-date":
+                    self._on_updater_event_gui(_st, {"current": _app_version()})
+                # "error" carries only a transient message (not stored by AutoUpdater): not replayed.
+            except Exception:
+                pass
+
         if getattr(self.cfg, "show_health_panel", True):
             hdr_health = QLabel("SYSTEM PRE-FLIGHT HEALTH")
             hdr_health.setFont(qfont(TYPE.caption_2))
@@ -2943,7 +3087,7 @@ class SettingsWindow(QDialog):
             layout.addWidget(health_card)
 
         layout.addStretch()
-        self._stack.addWidget(page)
+        self._add_page(page)
 
     # ── Event handlers ────────────────────────────────────────────────────
 
@@ -3026,6 +3170,7 @@ class SettingsWindow(QDialog):
         self.lbl_conn_status.setStyleSheet(f"color: {T.color.accent.resolve(self._dark).name()};")
 
         def worker():
+            GroqClient = _groq_client_cls()
             if GroqClient is None:
                 self.bridge.test_conn_result.emit(False, "AI module unavailable", {})
                 return
@@ -3066,7 +3211,7 @@ class SettingsWindow(QDialog):
             self.lbl_up_status.setStyleSheet(f"color: {T.color.accent.resolve(self._dark).name()};")
         elif state == "up-to-date":
             self.btn_chk.setEnabled(True)
-            self.lbl_up_status.setText(f"Jarvis is up to date (v{APP_VERSION}).")
+            self.lbl_up_status.setText(f"Jarvis is up to date (v{_app_version()}).")
             self.lbl_up_status.setStyleSheet(f"color: {T.color.success.resolve(self._dark).name()};")
             self.btn_restart.setVisible(False)
             self.prog_bar.setVisible(False)

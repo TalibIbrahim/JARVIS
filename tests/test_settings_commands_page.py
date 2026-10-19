@@ -19,7 +19,9 @@ def app():
 def _window(app):
     ctx = MagicMock()
     ctx.update_setting = MagicMock()
-    return SettingsWindow(Config(), ctx)
+    dlg = SettingsWindow(Config(), ctx)
+    dlg.ensure_all_pages()
+    return dlg
 
 
 def _visible_rows(dlg):

@@ -50,40 +50,86 @@ except ImportError:
     PYSIDE6_AVAILABLE = False
     import tkinter as tk
 
-try:
-    from updater import APP_VERSION
-except ImportError:
-    APP_VERSION = "2.6.0"
+# voice / tracker / ai / updater are heavy (openwakeword, mediapipe, ...); they are
+# imported lazily at the point of use so the island can come up without them.
+def _app_version():
+    try:
+        from updater import APP_VERSION
+        return APP_VERSION
+    except ImportError:
+        return "2.6.0"
 
-try:
-    from voice import list_microphones, find_best_microphone, probe_mic_level, test_microphone_recognition
-except ImportError:
-    list_microphones = lambda: []
-    find_best_microphone = lambda cfg=None: (None, "Default Microphone")
-    probe_mic_level = lambda dev=None: (0.0, 0.0)
-    test_microphone_recognition = lambda dev=None: {"success": False, "error": "Voice module unavailable"}
 
-try:
-    from tracker import list_cameras
-except ImportError:
-    list_cameras = lambda force_refresh=False: [{"index": 0, "name": "Default Camera (Camera 0)", "working": True}]
+def list_microphones():
+    try:
+        from voice import list_microphones as _f
+    except ImportError:
+        return []
+    return _f()
 
-try:
-    from ai import (
-        get_api_key,
-        set_api_key,
-        delete_api_key,
-        GroqClient,
-        DEFAULT_LLM_MODEL,
-        DEFAULT_STT_MODEL,
-    )
-except ImportError:
-    get_api_key = lambda: None
-    set_api_key = lambda k: None
-    delete_api_key = lambda: None
-    GroqClient = None
-    DEFAULT_LLM_MODEL = "llama-3.1-8b-instant"
-    DEFAULT_STT_MODEL = "whisper-large-v3-turbo"
+
+def find_best_microphone(cfg=None):
+    try:
+        from voice import find_best_microphone as _f
+    except ImportError:
+        return (None, "Default Microphone")
+    return _f(cfg)
+
+
+def probe_mic_level(dev=None):
+    try:
+        from voice import probe_mic_level as _f
+    except ImportError:
+        return (0.0, 0.0)
+    return _f(dev)
+
+
+def test_microphone_recognition(*a, **kw):
+    try:
+        from voice import test_microphone_recognition as _f
+    except ImportError:
+        return {"success": False, "error": "Voice module unavailable"}
+    return _f(*a, **kw)
+
+
+def list_cameras(force_refresh=False):
+    try:
+        from tracker import list_cameras as _f
+    except ImportError:
+        return [{"index": 0, "name": "Default Camera (Camera 0)", "working": True}]
+    return _f(force_refresh=force_refresh)
+
+
+def get_api_key(cfg=None):
+    try:
+        from ai import get_api_key as _f
+    except ImportError:
+        return None
+    return _f(cfg)
+
+
+def set_api_key(k, **kw):
+    try:
+        from ai import set_api_key as _f
+    except ImportError:
+        return None
+    return _f(k, **kw)
+
+
+def delete_api_key():
+    try:
+        from ai import delete_api_key as _f
+    except ImportError:
+        return None
+    return _f()
+
+
+def _groq_client_cls():
+    try:
+        from ai import GroqClient
+        return GroqClient
+    except ImportError:
+        return None
 
 
 # ── New UI subpackage (imported after PySide6 is confirmed available) ────────
@@ -1666,7 +1712,7 @@ class SettingsWindow(QDialog):
             self.btn_chk.setEnabled(True)
             self.btn_restart.setVisible(False)
             self.prog_bar.setVisible(False)
-            self.lbl_up_status.setText(f"Jarvis is up to date (v{APP_VERSION}).")
+            self.lbl_up_status.setText(f"Jarvis is up to date (v{_app_version()}).")
             self.lbl_up_status.setStyleSheet("font-size: 11px; color: #34c759;")
         elif state == "available":
             self.btn_chk.setEnabled(True)
@@ -2345,6 +2391,7 @@ class SettingsWindow(QDialog):
             lbl_conn_status.setStyleSheet("font-size: 11px; color: #007aff;")
 
             def worker():
+                GroqClient = _groq_client_cls()
                 client = GroqClient(api_key=key_to_test, timeout=8)
                 ok, message = client.validate_key()
                 models_data = None
@@ -2405,7 +2452,7 @@ class SettingsWindow(QDialog):
         page, layout = self._build_page_container("About", "J.A.R.V.I.S. System Information")
         card = GroupedCard()
 
-        card.add_row("Version", "", QLabel(f"v{APP_VERSION}"))
+        card.add_row("Version", "", QLabel(f"v{_app_version()}"))
         card.add_row("Platform", "", QLabel(f"{sys.platform.capitalize()} 64-bit"))
         card.add_row("Design Philosophy", "Apple Human Interface Guidelines (macOS / visionOS)", QLabel("Installed"))
 
@@ -2427,7 +2474,7 @@ class SettingsWindow(QDialog):
             btn_restart.setProperty("accent", "success")
             btn_restart.setVisible(False)
 
-            lbl_up_status = QLabel(f"Current version is v{APP_VERSION}.")
+            lbl_up_status = QLabel(f"Current version is v{_app_version()}.")
             lbl_up_status.setStyleSheet("font-size: 11px; color: #8e8e93;")
 
             prog_bar = QProgressBar()
@@ -2729,10 +2776,55 @@ class Overlay:
             self.timer.timeout.connect(self._tick)
             self.timer.start(16)
 
-            # Pre-create SettingsWindow hidden when idle after startup (< 150 ms latency target)
-            QTimer.singleShot(1500, self._prewarm_settings)
+            # Pre-create SettingsWindow hidden once the GUI has been idle for a while (never in the
+            # first 5 s of startup); opening Settings earlier simply builds it on demand.
+            self._prewarm_started = time.monotonic()
+            QTimer.singleShot(5000, self._prewarm_poll)
         else:
             self._init_tk_fallback()
+
+    _PREWARM_IDLE_S = 3.0
+    _PREWARM_FORCE_S = 40.0
+
+    def _gui_idle_seconds(self):
+        """Seconds since the last user input or island repaint request (0.0 if unknown/busy)."""
+        idle = time.monotonic() - getattr(self.island, "_last_activity_t", 0.0)
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class _LII(ctypes.Structure):
+                    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+                lii = _LII()
+                lii.cbSize = ctypes.sizeof(_LII)
+                if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                    in_idle = (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
+                    idle = min(idle, max(0.0, in_idle))
+            except Exception:
+                pass
+        return idle
+
+    def _prewarm_poll(self):
+        """Idle-gated prewarm: build Settings (then its remaining tabs, one per idle poll)."""
+        if not PYSIDE6_AVAILABLE or not self.cfg or not self.ctx or self.stop.is_set():
+            return
+        waited = time.monotonic() - getattr(self, "_prewarm_started", time.monotonic())
+        idle_ok = self._gui_idle_seconds() >= self._PREWARM_IDLE_S or waited >= self._PREWARM_FORCE_S
+        dlg = self.settings_dlg
+        if dlg is None:
+            if idle_ok:
+                self._prewarm_settings()
+        elif idle_ok and not dlg.isVisible() and hasattr(dlg, "build_next_pending_page"):
+            try:
+                if not dlg.build_next_pending_page():
+                    return                              # everything built
+            except Exception as exc:
+                print(f"[overlay] prewarm settings page failed: {exc}")
+                return
+        elif not hasattr(dlg, "build_next_pending_page"):
+            return
+        QTimer.singleShot(1000, self._prewarm_poll)
 
     def _prewarm_settings(self):
         """Pre-creates the SettingsWindow hidden when idle to eliminate opening latency."""

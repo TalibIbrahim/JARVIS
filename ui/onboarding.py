@@ -30,17 +30,37 @@ from ui.components import (
     MicLevelMeter, SensitivityPreviewWidget, create_squircle_path
 )
 
-try:
-    from tracker import list_cameras
-except ImportError:
-    list_cameras = lambda force_refresh=False: [{"index": 0, "name": "Default Camera", "working": True}]
+# tracker / voice are heavy; import them lazily at the point of use.
+def list_cameras(force_refresh=False):
+    try:
+        from tracker import list_cameras as _f
+    except ImportError:
+        return [{"index": 0, "name": "Default Camera", "working": True}]
+    return _f(force_refresh=force_refresh)
 
-try:
-    from voice import list_microphones, find_best_microphone, probe_mic_level
-except ImportError:
-    list_microphones = lambda: []
-    find_best_microphone = lambda cfg=None: (None, "Default Microphone")
-    probe_mic_level = lambda dev=None: (0.0, 0.0)
+
+def list_microphones():
+    try:
+        from voice import list_microphones as _f
+    except ImportError:
+        return []
+    return _f()
+
+
+def find_best_microphone(cfg=None):
+    try:
+        from voice import find_best_microphone as _f
+    except ImportError:
+        return (None, "Default Microphone")
+    return _f(cfg)
+
+
+def probe_mic_level(dev=None):
+    try:
+        from voice import probe_mic_level as _f
+    except ImportError:
+        return (0.0, 0.0)
+    return _f(dev)
 
 
 class OnboardingDialog(QDialog):

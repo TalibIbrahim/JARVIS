@@ -278,6 +278,7 @@ class TestIslandWidgetsPhase2(unittest.TestCase):
     def test_12_city_dropdown_in_settings_window(self):
         """Verify city selection uses a searchable QComboBox dropdown."""
         dlg = SettingsWindow(self.cfg)
+        dlg.ensure_all_pages()
         self.assertTrue(hasattr(dlg, "city_combo"))
         self.assertTrue(dlg.city_combo.isEditable())
         self.assertGreater(dlg.city_combo.count(), 5)
@@ -544,6 +545,7 @@ class TestIslandWidgetsPhase2(unittest.TestCase):
 
         # 3. Live settings reload via SettingsWindow
         dlg = SettingsWindow(cfg=self.cfg)
+        dlg.ensure_all_pages()
         try:
             dlg.sidebar.setCurrentRow(4)  # Island tab
             self.app.processEvents()

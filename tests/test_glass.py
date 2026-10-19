@@ -213,6 +213,7 @@ class TestSettingsGlassWiring(unittest.TestCase):
         from ui.settings_window import SettingsWindow
         self.cfg = Config()
         self.dlg = SettingsWindow(cfg=self.cfg)
+        self.dlg.ensure_all_pages()
         self.saved = {}
         self.dlg._save = lambda k, v: (self.saved.__setitem__(k, v), setattr(self.cfg, k, v),
                                        glass.configure(self.cfg) if k.startswith("glass_") else None)
