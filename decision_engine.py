@@ -138,7 +138,7 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
     ],
     "wake_mode": [
         "wake up", "wake up jarvis", "wake mode", "reactivate system",
-        "come online", "activate systems", "resume tracking", "back online"
+        "come online", "activate systems", "back online"
     ],
     "open_app": [
         "launch application", "open program", "start chrome", "bring up edge",
@@ -197,8 +197,8 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "toggle island", "expand card", "collapse card", "toggle expand", "toggle island expand"
     ],
     "island_toggle_tracking": [
-        "toggle tracking", "pause tracking", "resume tracking", "toggle hand tracking",
-        "stop tracking", "start tracking", "toggle gesture tracking", "switch tracking"
+        "toggle tracking", "toggle hand tracking",
+        "toggle gesture tracking", "switch tracking"
     ],
     "island_set_pin": [
         "pin island", "unpin island", "pin card", "keep island open",

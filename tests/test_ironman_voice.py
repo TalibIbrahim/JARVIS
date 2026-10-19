@@ -317,11 +317,48 @@ class TestVoiceProfileAndSpeakerVerification(unittest.TestCase):
         self.assertFalse(match_other)
         self.assertLess(score_other, 0.55)
 
-    def test_train_my_voice_command(self):
-        raw = self._generate_synthetic_voice(f0=130.0)
-        Voice._last_raw_audio = raw
-        reply = run_command("train my voice", self.ctx)
-        self.assertIn("calibrated", reply.lower())
+    def _speech_like_voice(self, f0=130.0, duration=1.0, sr=16000):
+        """Harmonic series (1/k rolloff) up to 4 kHz with formant bumps near 700/1200/2600 Hz."""
+        import numpy as np
+        t = np.arange(int(sr * duration)) / sr
+        sig = np.zeros_like(t)
+        k = 1
+        while f0 * k < 4000:
+            f = f0 * k
+            amp = 1.0 / k
+            for fc, bw in ((700.0, 150.0), (1200.0, 200.0), (2600.0, 300.0)):
+                amp += 1.5 * np.exp(-((f - fc) / bw) ** 2)
+            sig += amp * np.sin(2 * np.pi * f * t)
+            k += 1
+        sig = sig / np.max(np.abs(sig))
+        return (sig * 20000).astype(np.int16).tobytes()
+
+    def _run_train(self, raw, verification):
+        from voice import Voice as _V
+        prev = getattr(_V, "_last_raw_audio", None)
+        _V._last_raw_audio = raw
+        self.ctx.engine.cfg.voice_speaker_verification = verification
+        try:
+            with patch("voice_profile.get_voice_profile", return_value=self.vpm):
+                return run_command("train my voice", self.ctx)
+        finally:
+            _V._last_raw_audio = prev
+
+    def test_train_my_voice_command_verification_on(self):
+        reply = self._run_train(self._speech_like_voice(), True)
+        self.assertIn("respond only to your voice", reply)
+        self.assertTrue(self.vpm.is_enrolled)
+
+    def test_train_my_voice_command_verification_off(self):
+        reply = self._run_train(self._speech_like_voice(), False)
+        self.assertIn("saved a sample of your voice", reply)
+        self.assertIn("verification is off", reply.lower())
+        self.assertTrue(self.vpm.is_enrolled)
+
+    def test_train_my_voice_rejects_pure_hum(self):
+        reply = self._run_train(self._generate_synthetic_voice(f0=130.0), True)
+        self.assertIn("couldn't hear your voice clearly", reply)
+        self.assertFalse(self.vpm.is_enrolled)
 
     def test_passive_monitoring_does_not_popup_transcribing(self):
         """When user has not said Jarvis, background audio worker does not leave transcribing on overlay."""

@@ -472,13 +472,16 @@ def _run_single_command(text, ctx):
     # Phase 7 Screen Awareness (explicit user queries)
     import screen_awareness
     if screen_awareness.is_screen_query(clean_t):
-        return screen_awareness.analyze_screen(text, ctx)
+        _screen_reply = screen_awareness.analyze_screen(text, ctx)
+        _post_action(ctx, "screen_query", bool(_screen_reply), text=text)
+        return _screen_reply
 
     # Phase 7 World Time Lookups (System 1 Reflex: <1 ms)
     import quick_answers
     if quick_answers.is_timezone_query(clean_t):
         tz_reply = quick_answers.get_world_time(clean_t, ctx)
         if tz_reply:
+            _post_action(ctx, "world_time", True, text=text)
             return tz_reply
 
     # Phase 7 Explicit Wikipedia queries
@@ -486,6 +489,7 @@ def _run_single_command(text, ctx):
     if m_wiki:
         w_ans = quick_answers.get_quick_answer(clean_t, ctx)
         if w_ans:
+            _post_action(ctx, "wiki", True, text=text)
             return w_ans
 
     if ctx:
@@ -570,6 +574,17 @@ def _run_single_command(text, ctx):
                 ok, msg = window_resolver.close_this(confirm=True)
                 _post_action(ctx, "close_this", ok, text=text)
                 return msg
+
+    # Tier-1 exact phrases: explicit tracking pause/resume (no "did you mean" disambiguation)
+    _trk = None
+    if _exact(clean_t, "resume tracking", "start tracking"):
+        _trk = False
+    elif _exact(clean_t, "pause tracking", "stop tracking"):
+        _trk = True
+    if _trk is not None and ctx is not None and hasattr(ctx, "set_tracking_paused"):
+        ctx.set_tracking_paused(_trk)
+        _post_action(ctx, "tracking_paused" if _trk else "tracking_resumed", True, text=text)
+        return "Tracking paused, sir." if _trk else "Tracking resumed, sir."
 
     # Direct verbal confirmations
     if _exact(clean_t, "yes confirm shutdown", "confirm shutdown"):
@@ -702,12 +717,30 @@ def _run_single_command(text, ctx):
             vp = get_voice_profile()
             latest = getattr(Voice, "_last_raw_audio", None)
             if latest:
+                feat = vp.extract_features(latest)
+                bands = None if feat is None else [float(x) for x in feat[1:9]]
+                total = sum(bands) if bands else 0.0
+                # Speech has energy above 550 Hz (bands 3-8); hum/rumble does not.
+                if not bands or total <= 0.0 or sum(bands[2:]) / total < 0.01:
+                    _post_action(ctx, "train_voice", False, text=text)
+                    return "I couldn't hear your voice clearly, sir. Please say a full sentence after asking me to learn your voice."
                 ok, msg = vp.enroll([latest])
                 if ok:
                     vp.enabled = True
-                    return "Voice profile successfully calibrated, sir. I have committed your vocal signature to memory and will listen specifically for you."
+                    cfg = getattr(getattr(ctx, "engine", None), "cfg", None)
+                    if getattr(cfg, "voice_speaker_verification", False):
+                        _post_action(ctx, "train_voice", True, text=text)
+                        return "Voice sample saved, sir. I'll now respond only to your voice."
+                    _post_action(ctx, "train_voice", True, text=text)
+                    return ("I've saved a sample of your voice, sir. Speaker verification is off, so I'll "
+                            "still respond to anyone; you can enable it in Settings, Voice.")
+                _post_action(ctx, "train_voice", False, text=text)
+                return "I couldn't hear your voice clearly, sir. Please say a full sentence after asking me to learn your voice."
+            _post_action(ctx, "train_voice", True, text=text)
             return "Vocal training mode active, sir. Speak a sentence clearly and I will calibrate to your voice."
-        except Exception:
+        except Exception as exc:
+            print(f"[commands] voice training note: {exc}")
+            _post_action(ctx, "train_voice", False, text=text)
             return "Voice training calibration encountered an issue, sir."
 
     # --- routines (Phase 6) ---
@@ -758,10 +791,13 @@ def _run_single_command(text, ctx):
 
     # --- chatter & diagnostics ---
     if _any(clean_t, "diagnostic", "diagnostics", "run diagnostic", "run diagnostics", "system diagnostic", "suit diagnostic", "suit status", "power level", "power levels", "arc reactor", "telemetry"):
+        _post_action(ctx, "diagnostics", True, text=text)
         return get_system_telemetry(ctx)
     if clean_t in ("hello", "hi", "hey", "good morning", "good evening", "good afternoon"):
+        _post_action(ctx, "small_talk", True, text=text)
         return "Welcome back, sir."
     if _any(clean_t, "status", "report", "how are you"):
+        _post_action(ctx, "diagnostics", True, text=text)
         return get_system_telemetry(ctx)
     if _any(clean_t, "what's the weather", "weather forecast"):
         from weather_client import get_weather_client
@@ -802,12 +838,16 @@ def _run_single_command(text, ctx):
         _post_action(ctx, "time", True)
         return f"It is {now_str}, sir."
     if _any(clean_t, "date", "what day"):
+        _post_action(ctx, "date", True, text=text)
         return "Today is " + datetime.datetime.now().strftime("%A, %B %d") + "."
     if _any(clean_t, "thank you jarvis", "thanks jarvis", "good job jarvis", "well done jarvis", "nice work jarvis"):
+        _post_action(ctx, "small_talk", True, text=text)
         return "Always a pleasure watching you work, sir."
     if _any(clean_t, "who are you", "what are you"):
+        _post_action(ctx, "small_talk", True, text=text)
         return "I am J.A.R.V.I.S., Just A Rather Very Intelligent System. Configured to manage your computing environment and tactical telemetry, sir."
     if _any(clean_t, "are you there", "you there jarvis"):
+        _post_action(ctx, "small_talk", True, text=text)
         return "For you, sir, always."
 
     # --- files and folders (Phase 4) ---
@@ -905,13 +945,19 @@ def _run_single_command(text, ctx):
         return "Volume down."
 
     if re.search(r"\b(mute|unmute)\b", clean_t):
-        try:
-            import system_control
-            system_control.mute(True)
-        except Exception:
-            pass
-        pyautogui.press("volumemute", _pause=False)
-        _post_action(ctx, "mute", True, text=text)
+        # Explicit state, never the volumemute key (it toggles). "toggle mute" toggles.
+        import system_control
+        if re.search(r"\btoggle\b", clean_t):
+            _ok, _msg = system_control.mute(True)
+            _post_action(ctx, "mute", _ok, args={"mode": "toggle"}, text=text)
+            return _msg
+        if re.search(r"\bunmute\b", clean_t):
+            if system_control.get_system_control().audio.is_muted():
+                system_control.mute(True)  # currently muted: one toggle -> unmuted
+            _post_action(ctx, "mute", True, args={"mode": "unmute"}, text=text)
+            return "Unmuted."
+        system_control.mute(False)  # toggle=False -> force muted
+        _post_action(ctx, "mute", True, args={"mode": "mute"}, text=text)
         return "Muted."
 
     # Brightness & Night Light
@@ -950,6 +996,7 @@ def _run_single_command(text, ctx):
     if m_spot:
         query = m_spot.group(1).strip()
         ok, reply = play_media(query, platform="spotify")
+        _post_action(ctx, "play_music", ok)
         return reply
 
     m_yt = re.match(r"(?:play|put on|listen to|search for)\s+(.+?)\s+(?:on|in)\s+youtube\b", clean_t)
