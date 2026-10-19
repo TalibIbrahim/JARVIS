@@ -628,7 +628,7 @@ class Tracker(threading.Thread):
             # with zero missed first gestures.
             hand_recent = (now_loop - last_hand_seen_t) < 0.5
             if not self.engine.active and not getattr(self.cfg, "show_preview", False) and not hand_recent:
-                time.sleep(0.06)
+                time.sleep(0.12)
 
             if use_threaded:
                 if not self._grabber.is_alive() and not self.stop.is_set():
