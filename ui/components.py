@@ -738,8 +738,10 @@ class HSlider(FocusRingMixin, _SpringTicker, QWidget):
         value:   float,
         unit:    str   = "",
         parent:  Optional[QWidget] = None,
+        step:    Optional[float] = None,
     ):
         super().__init__(parent)
+        self._step = float(step) if step else None     # optional snap increment
         self._min  = minimum
         self._max  = maximum
         self._val  = max(minimum, min(maximum, value))
@@ -765,6 +767,9 @@ class HSlider(FocusRingMixin, _SpringTicker, QWidget):
         return self._val
 
     def setValue(self, v: float, *, silent: bool = False) -> None:
+        if self._step:
+            v = self._min + round((v - self._min) / self._step) * self._step
+            v = round(v, 6)
         v = max(self._min, min(self._max, v))
         if abs(v - self._val) < 1e-9:
             return
@@ -807,7 +812,7 @@ class HSlider(FocusRingMixin, _SpringTicker, QWidget):
         self._wake()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        step = (self._max - self._min) / 100.0
+        step = self._step or (self._max - self._min) / 100.0
         if event.key() in (Qt.Key.Key_Right, Qt.Key.Key_Up):
             self.setValue(self._val + step)
         elif event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Down):
@@ -1777,7 +1782,16 @@ class SensitivityPreviewWidget(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update)
-        self._timer.start(33)
+        self._timer.setInterval(33)               # runs only while visible (see show/hideEvent)
+
+    def showEvent(self, event) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
 
     def set_thresholds(self, open_thresh: float, fist_thresh: float) -> None:
         self._open_thresh = float(open_thresh)
@@ -1927,6 +1941,7 @@ def slider_card_row(
     maximum:     float,
     unit:        str,
     on_change:   Callable[[float], None],
+    step:        Optional[float] = None,
 ) -> HSlider:
     """
     Convenience: add an HSlider row to a GroupedCard.
@@ -1937,7 +1952,7 @@ def slider_card_row(
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(SPACING.sm)
 
-    slider  = HSlider(minimum, maximum, value, unit, row)
+    slider  = HSlider(minimum, maximum, value, unit, row, step=step)
     slider.setFixedWidth(140)
 
     dark = T.is_dark()

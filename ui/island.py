@@ -331,6 +331,8 @@ class AppleDynamicIsland(
         self._is_hovering: bool = False
         self._prev_is_hovering: bool = False
         self._prev_springs_active: bool = False
+        self.gesture_mode: bool = False          # camera / gesture mode on -> subtle pill indicator
+        self.animating: bool = True            # read by Overlay: fast (16 ms) tick only while True
         self._last_rendered_state: Optional[IslandState] = None
         self._last_rendered_dark: Optional[bool] = None
         self._last_rendered_min: Optional[int] = None
@@ -1375,6 +1377,7 @@ class AppleDynamicIsland(
             self._dirty = False
 
         self._prev_springs_active = springs_active
+        self.animating = bool(needs_repaint or springs_active)
         self._prev_is_hovering = getattr(self, "_is_hovering", False)
 
     def _tracking_visual_changed(self) -> bool:
@@ -2148,6 +2151,8 @@ class AppleDynamicIsland(
         else:
             # Standby IDLE & Compact Widgets
             self._draw_compact_widget(p, w, h, cy, dark, primary, secondary, accent, now, t)
+            if self.gesture_mode_visible():
+                self._draw_gesture_mode_mark(p, w, h)
 
         # Page dot column for expanded card layouts
         if state in (
@@ -2158,6 +2163,27 @@ class AppleDynamicIsland(
 
         # Publish the thread-safe hit-test snapshot (global coordinates) for worker threads
         self._publish_hit_snapshot(w, h, state)
+
+    # ── Gesture mode (camera on) indicator ────────────────────────────────
+
+    def set_gesture_mode(self, on: bool) -> None:
+        """Called by Overlay (UI thread) when camera/gesture mode changes; repaints on change."""
+        on = bool(on)
+        if on != self.gesture_mode:
+            self.gesture_mode = on
+            self._dirty = True
+
+    def gesture_mode_visible(self) -> bool:
+        return bool(self.gesture_mode)
+
+    def _draw_gesture_mode_mark(self, p: QPainter, w: float, h: float) -> None:
+        """Short cyan hairline at the bottom of the compact pill: subtle 'camera is on' cue."""
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(0, 229, 255, 150)))
+        mw = 14.0
+        p.drawRoundedRect(QRectF((w - mw) / 2.0, h - 4.0, mw, 1.6), 0.8, 0.8)
+        p.restore()
 
     def _draw_disambiguation_card(self, p: QPainter, w: float, h: float,
                                   now: float, t: float, dark: bool,

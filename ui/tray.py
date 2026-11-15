@@ -119,6 +119,13 @@ class JarvisTray(QSystemTrayIcon):
         act_toggle.triggered.connect(self._toggle_active)
         menu.addAction(act_toggle)
 
+        self._act_gesture = QAction("Gesture mode", menu)
+        self._act_gesture.setCheckable(True)
+        self._act_gesture.setChecked(self._gesture_mode_now())
+        self._act_gesture.triggered.connect(self._toggle_gesture_mode)
+        menu.addAction(self._act_gesture)
+        menu.aboutToShow.connect(lambda: self._act_gesture.setChecked(self._gesture_mode_now()))
+
         act_preview = QAction("Toggle Vision Preview", menu)
         act_preview.triggered.connect(self._toggle_preview)
         menu.addAction(act_preview)
@@ -153,6 +160,36 @@ class JarvisTray(QSystemTrayIcon):
     def _toggle_active(self) -> None:
         if self.mgr.ctx:
             self.mgr.ctx.set_active(None)
+
+    def _gesture_mode_now(self) -> bool:
+        fn = getattr(getattr(self.mgr, "ctx", None), "gesture_mode_on", None)
+        if callable(fn):
+            try:
+                return fn() is True
+            except Exception:
+                pass
+        isl = getattr(self.mgr, "island", None)
+        return bool(getattr(isl, "gesture_mode", False))
+
+    def _toggle_gesture_mode(self, checked: bool = False) -> None:
+        """Calls Overlay.on_gesture_mode_toggle(new_state) (wired by main.py), else ctx.set_gesture_mode."""
+        new_state = not self._gesture_mode_now()
+        hook = getattr(self.mgr, "on_gesture_mode_toggle", None)
+        ctx = getattr(self.mgr, "ctx", None)
+        try:
+            if callable(hook):
+                hook(new_state)
+            elif ctx is not None and hasattr(ctx, "set_gesture_mode"):
+                ctx.set_gesture_mode(new_state)
+            else:
+                return
+        except Exception as exc:
+            print(f"[tray] gesture mode toggle failed: {exc}")
+            return
+        isl = getattr(self.mgr, "island", None)
+        if hasattr(isl, "set_gesture_mode"):
+            isl.set_gesture_mode(new_state)
+        self._act_gesture.setChecked(new_state)
 
     def _toggle_preview(self) -> None:
         if self.mgr.cfg:

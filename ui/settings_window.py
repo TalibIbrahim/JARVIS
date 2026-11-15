@@ -1915,6 +1915,26 @@ class SettingsWindow(QDialog):
                      "How tightly you must close your fist to register a click",
                      click_seg)
 
+        # Camera / gesture mode
+        self.camera_autostart_switch = AppleSwitch(bool(getattr(self.cfg, "camera_autostart", False)))
+        self.camera_autostart_switch.toggled.connect(lambda v: self._save("camera_autostart", v))
+        card.add_row("Turn on camera at launch",
+                     "Otherwise the camera stays off until you switch Gesture mode on",
+                     self.camera_autostart_switch)
+
+        self.gesture_idle_combo = AppleComboBox()
+        cur_idle = float(getattr(self.cfg, "gesture_idle_timeout_s", 120.0) or 0.0)
+        idle_opts = [(30.0, "30 s"), (60.0, "1 min"), (120.0, "2 min"), (300.0, "5 min"), (0.0, "Never")]
+        sel_idle = min(range(len(idle_opts)), key=lambda i: abs(idle_opts[i][0] - cur_idle)) if cur_idle > 0 else 4
+        for secs, lbl in idle_opts:
+            self.gesture_idle_combo.addItem(lbl, secs)
+        self.gesture_idle_combo.setCurrentIndex(sel_idle)
+        self.gesture_idle_combo.currentIndexChanged.connect(
+            lambda i: self._save("gesture_idle_timeout_s", float(self.gesture_idle_combo.itemData(i))))
+        card.add_row("Turn camera off after no hand for",
+                     "Saves power and CPU; wave or toggle Gesture mode to turn it back on",
+                     self.gesture_idle_combo)
+
         card.add_row("Live Gesture Preview",
                      "Real-time simulated response showing Move, Neutral deadband, and Click zones",
                      self.sens_preview)
@@ -2117,10 +2137,36 @@ class SettingsWindow(QDialog):
                      "Continuously adapts energy threshold — disable on laptops to prevent cutoff",
                      sw_dyn)
 
-        slider_card_row(card, "Silence Cutoff",
-                        "Seconds of silence before phrase capture ends — increase for slow speakers",
-                        getattr(self.cfg, "mic_pause_threshold", 1.0), 0.5, 2.5, "s",
-                        lambda v: self._save("mic_pause_threshold", float(v)))
+        slider_card_row(card, "End of speech pause",
+                        "Shorter = faster replies; longer = fewer cut-offs",
+                        getattr(self.cfg, "mic_pause_threshold", 0.5), 0.3, 1.5, "s",
+                        lambda v: self._save("mic_pause_threshold", float(v)), step=0.05)
+
+        # Speech recognition engine / on-device model
+        self.stt_engine_combo = AppleComboBox()
+        cur_stt = str(getattr(self.cfg, "stt_engine", "local")).lower()
+        for i, (code, lbl) in enumerate([("local", "On-device (faster, private)"), ("groq", "Groq cloud")]):
+            self.stt_engine_combo.addItem(lbl, code)
+            if cur_stt == code:
+                self.stt_engine_combo.setCurrentIndex(i)
+        self.stt_engine_combo.currentIndexChanged.connect(
+            lambda i: self._save("stt_engine", self.stt_engine_combo.itemData(i)))
+        card.add_row("Speech recognition",
+                     "On-device runs locally; Groq cloud sends audio to Groq",
+                     self.stt_engine_combo)
+
+        self.stt_model_combo = AppleComboBox()
+        cur_model = str(getattr(self.cfg, "local_stt_model", "base.en"))
+        for i, (code, lbl) in enumerate([("tiny.en", "Fast"), ("base.en", "Balanced"), ("small.en", "Accurate")]):
+            self.stt_model_combo.addItem(lbl, code)
+            if cur_model == code:
+                self.stt_model_combo.setCurrentIndex(i)
+        self.stt_model_combo.currentIndexChanged.connect(
+            lambda i: self._save("local_stt_model", self.stt_model_combo.itemData(i)))
+        card.add_row("On-device model",
+                     "Fast is quickest; Accurate understands more but uses more CPU",
+                     self.stt_model_combo)
+
         slider_card_row(card, "Trigger Sensitivity",
                         "Energy threshold for voice activation — lower values pick up quieter speech",
                         getattr(self.cfg, "mic_energy_threshold", 300), 50.0, 1500.0, "",

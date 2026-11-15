@@ -1208,7 +1208,6 @@ class AppleSwitch(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._animate)
-        self._timer.start(16)
 
     def isChecked(self):
         return self._checked
@@ -1221,6 +1220,8 @@ class AppleSwitch(QWidget):
         if self._checked != checked:
             self._checked = checked
             self._spring.set_target(1.0 if checked else 0.0)
+            if not self._timer.isActive():
+                self._timer.start(16)
             self.toggled.emit(checked)
             self.update()
 
@@ -1231,6 +1232,10 @@ class AppleSwitch(QWidget):
         v = self._spring.update(0.016)
         if abs(v - self._thumb_pos) > 0.005:
             self._thumb_pos = v
+            self.update()
+        elif abs(v - self._spring.target) < 0.005:
+            self._thumb_pos = self._spring.target
+            self._timer.stop()
             self.update()
 
     def paintEvent(self, event):
@@ -2731,6 +2736,9 @@ class Overlay:
         self.stop = stop_event
         self.cfg = cfg
         self.ctx = ctx
+        # Optional hook wired by main.py: called as on_gesture_mode_toggle(new_state: bool) from the
+        # tray "Gesture mode" item (UI thread). Falls back to ctx.set_gesture_mode(on) when unset.
+        self.on_gesture_mode_toggle = None
         self.updater = None
         self.q = queue.Queue()
         self.settings_dlg = None
@@ -2771,10 +2779,11 @@ class Overlay:
                 except Exception as _demo_err:
                     print(f"[overlay] demo start error: {_demo_err}")
 
-            # 60 FPS animation timer (16ms)
+            # Adaptive frame timer: 16 ms (60 FPS) only while something animates, otherwise a slow
+            # housekeeping poll (queue drain, hover detection, minute clock) at IDLE_TICK_MS.
             self.timer = QTimer()
             self.timer.timeout.connect(self._tick)
-            self.timer.start(16)
+            self.timer.start(self.FAST_TICK_MS)
 
             # Pre-create SettingsWindow hidden once the GUI has been idle for a while (never in the
             # first 5 s of startup); opening Settings earlier simply builds it on demand.
@@ -2783,6 +2792,8 @@ class Overlay:
         else:
             self._init_tk_fallback()
 
+    FAST_TICK_MS = 16
+    IDLE_TICK_MS = 50
     _PREWARM_IDLE_S = 3.0
     _PREWARM_FORCE_S = 40.0
 
@@ -3221,6 +3232,9 @@ class Overlay:
                         isl.collapse_card()
                     elif kind == "island_action" and hasattr(isl, "perform_action"):
                         isl.perform_action(d.get("action", ""), **{k: v for k, v in d.items() if k != "action"})
+                elif kind == "gesture_mode":
+                    if hasattr(self.island, "set_gesture_mode"):
+                        self.island.set_gesture_mode(bool(d.get("on", False)))
                 elif kind == "timer_state":
                     if hasattr(self.island, "timer_active"):
                         if "active" in d: self.island.timer_active = bool(d["active"])
@@ -3229,6 +3243,17 @@ class Overlay:
         except queue.Empty:
             pass
 
+    def _sync_gesture_mode(self):
+        """Mirror ctx.gesture_mode_on() (if main.py provides it) into the island's indicator."""
+        fn = getattr(self.ctx, "gesture_mode_on", None) if self.ctx is not None else None
+        if callable(fn) and hasattr(self.island, "set_gesture_mode"):
+            try:
+                v = fn()
+                if isinstance(v, bool):
+                    self.island.set_gesture_mode(v)
+            except Exception:
+                pass
+
     def _tick(self):
         if self.stop.is_set():
             self.app.quit()
@@ -3236,7 +3261,11 @@ class Overlay:
         try:
             now = time.time()
             self._drain(now)
+            self._sync_gesture_mode()
             self.island.update_frame(now)
+            want = self.FAST_TICK_MS if getattr(self.island, "animating", True) else self.IDLE_TICK_MS
+            if self.timer.interval() != want:
+                self.timer.setInterval(want)
         except Exception as exc:
             print(f"[overlay] tick error: {exc}")
 
