@@ -8,7 +8,7 @@ import time
 from ui.tokens import COLOR, TYPE, ISLAND, qfont
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtCore import QPointF, QRectF, Qt
-from ui.island_parts.common import create_cached_squircle_path
+from ui.island_parts.common import create_cached_squircle_path, ink
 
 
 # ── clock format ('auto' follows the Windows short-time pattern) ──────────────
@@ -150,7 +150,7 @@ class CompactPillMixin:
         elif self.active or self.listening or self.media_playing:
             dot_col = COLOR.accent_green
         else:
-            dot_col = QColor("#8E8E93" if dark else "#AEAEB2")
+            dot_col = QColor("#8E8E93" if dark else "#6F747B")
         # Worker health (once known) takes over the existing trailing dot.
         _wh = self._worker_health_color(time.monotonic())
         if _wh is not None:
@@ -169,7 +169,7 @@ class CompactPillMixin:
                 p.scale(s, s)
                 w, h, cy = w / s, h / s, cy / s
                 dot_cx = w - 14.0
-                self._draw_lyrics_pill(p, ly, w, h, cy, now, ISLAND.color.white)
+                self._draw_lyrics_pill(p, ly, w, h, cy, now, ISLAND.color.ink)
             else:
                 # Leading side: 20x20 album art thumbnail (rounded squircle)
                 thumb_size = 20.0
@@ -184,7 +184,7 @@ class CompactPillMixin:
                 p.drawPixmap(QPointF(tx, ty), art)
                 p.restore()
 
-                p.strokePath(thumb_path, QPen(QColor(255, 255, 255, 40), 1.0))
+                p.strokePath(thumb_path, QPen(ink(40), 1.0))
 
             # Center text: the track title when no lyric line is showing
             if ly is None:
@@ -227,7 +227,7 @@ class CompactPillMixin:
             rx, ry = 16.0 * scale, cy
             ring_r = 7.5 * scale
             pen_w = 2.2 * scale
-            p.setPen(QPen(QColor(255, 255, 255, 35 if dark else 55), pen_w))
+            p.setPen(QPen(ink(35 if dark else 40), pen_w))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QPointF(rx, ry), ring_r, ring_r)
 

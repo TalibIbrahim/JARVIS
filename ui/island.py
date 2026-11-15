@@ -71,14 +71,15 @@ from PySide6.QtWidgets import QWidget, QApplication
 
 from ui.tokens import (
     T, TYPE, COLOR, ISLAND, qfont, REDUCE_MOTION_MS,
-    SPRING_DT_MIN, SPRING_DT_MAX, RADIUS, GEOMETRY
+    SPRING_DT_MIN, SPRING_DT_MAX, RADIUS, GEOMETRY,
+    normalize_island_surface, set_island_ink, island_ink_is_light,
 )
 from ui.materials import remove_backdrop, make_click_through, set_interactive
 from ui.components import Spring, create_squircle_path
 
 from ui.island_parts.common import (  # noqa: F401  (re-exported for existing importers)
     _PATH_CACHE, create_cached_squircle_path, get_shell_pixmap, IslandState, _SIZE,
-    paint_island_shadow, shell_pad_for,
+    paint_island_shadow, shell_pad_for, invalidate_shell_cache, ink,
     SPRING_K_RESP04, SPRING_C_DAMP07,
 )
 from ui.island_parts.compact import CompactPillMixin
@@ -88,6 +89,7 @@ from ui.island_parts.weather import WeatherPageMixin
 from ui.island_parts.hardware import HardwarePageMixin
 from ui.island_parts.jarvis import JarvisPageMixin
 from ui.island_parts.paging import PagingMixin
+from ui.island_parts.ask import AskPageMixin
 
 
 
@@ -98,7 +100,7 @@ from ui.island_parts.paging import PagingMixin
 
 class AppleDynamicIsland(
     CompactPillMixin, MediaPageMixin, CalendarPageMixin, WeatherPageMixin,
-    HardwarePageMixin, JarvisPageMixin, PagingMixin, QWidget,
+    HardwarePageMixin, AskPageMixin, JarvisPageMixin, PagingMixin, QWidget,
 ):
     """
     Floating top-center Apple HIG glass capsule.
@@ -142,6 +144,18 @@ class AppleDynamicIsland(
         if hasattr(style_val, "value"):
             style_val = style_val.value
         self.shape_style: str = str(style_val).lower().strip() if style_val else "pill"
+
+        # Surface style (cfg.island_surface): "gradient" (default) | "near_black" | "black" | "white"
+        self.surface_style: str = normalize_island_surface(getattr(cfg, "island_surface", "gradient") if cfg else "gradient")
+        # Hide mode: the island is absent except while listening / answering (see _hidden_tick)
+        self.hidden: bool = False
+        self._hidden_shown: bool = False        # window currently shown because of activity while hidden
+        self._hidden_idle_t: float = 0.0
+        self._hidden_force_until: float = 0.0
+        # SPEAKING with no prompt: draw the reply on the main line instead of an empty quoted line. Off by default so
+        # bare-island renders stay as they were; Overlay turns it on for the running app.
+        self.hide_empty_quote: bool = False
+        self._ask_init()
 
         # ── State fields ───────────────────────────────────────────────
         self.active          = False
@@ -403,8 +417,17 @@ class AppleDynamicIsland(
                 if enabled_map.get(p, True) and enabled_map.get(canon, True):
                     if canon not in active_pages:
                         active_pages.append(canon)
+            # Type or Talk is the last page (cfg.island_ask_page, default on; island_pages_enabled["ask"] can turn it off)
+            if (bool(getattr(cfg, "island_ask_page", True)) and enabled_map.get("ask", True)
+                    and "ask" not in active_pages and active_pages):
+                active_pages.append("ask")
             if active_pages:
                 self.card_pages = active_pages
+
+            self.set_surface_style(getattr(cfg, "island_surface", "gradient"))
+            want_hidden = bool(getattr(cfg, "island_hidden", False))
+            if want_hidden != self.hidden:
+                self.set_hidden(want_hidden)
 
             hw_layout = getattr(cfg, "island_hardware_layout", "grid")
             if self.expanded_card in ("hardware", "hardware_grid", "hardware_strip"):
@@ -455,7 +478,11 @@ class AppleDynamicIsland(
             WS_EX_TOOLWINDOW  = 0x00000080
 
             style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            new_style = style | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+            new_style = style | WS_EX_LAYERED | WS_EX_TOOLWINDOW
+            if getattr(self, "_ask_focus_active", False):
+                new_style &= ~WS_EX_NOACTIVATE       # Type-or-Talk field has keyboard focus (restored on leave)
+            else:
+                new_style |= WS_EX_NOACTIVATE
             if self.is_interactive and self._cursor_in_shape:
                 new_style &= ~WS_EX_TRANSPARENT      # over the island shape: receives clicks, never activates
             else:
@@ -810,6 +837,10 @@ class AppleDynamicIsland(
         self._hovered_chip_idx = None
         self._chip_dwell_elapsed = 0.0
         c = card_name.lower()
+        if self.expanded_card == "ask" and c not in ("ask", "type", "talk", "type_or_talk", "ask_page"):
+            self._ask_on_leave(True)
+        if c in ("type", "talk", "type_or_talk", "ask_page"):
+            c = "ask"
         if c == "calendar":
             c = "time"
         elif c in ("hardware", "hardware_grid"):
@@ -831,6 +862,8 @@ class AppleDynamicIsland(
 
     def collapse_card(self) -> None:
         """Collapse expanded card back to compact pill."""
+        if self.expanded_card == "ask":
+            self._ask_on_leave(True)             # drop keyboard focus, restore NOACTIVATE + the previous window
         self.expanded_card = None
         self.expanded_until = 0.0
         self._opened_via_hover = False
@@ -1046,6 +1079,13 @@ class AppleDynamicIsland(
     def _resolve_state(self, now: float) -> IslandState:
         if now < self.error_until:
             return IslandState.ERROR
+        if self._ask_owns_card(now):
+            # Type-or-Talk page open: listening / thinking / reply show inside the page, not as separate pills
+            if self.sending_active and (self.sending_until == 0.0 or now < self.sending_until):
+                return IslandState.CARD_SENDING
+            if self.disambiguate_active and now < self.disambiguate_until and self.disambiguate_candidates:
+                return IslandState.CARD_DISAMBIGUATE
+            return IslandState.CARD_ASK
         if self.quick_answer_active and now < self.quick_answer_until and self.quick_answer_text:
             return IslandState.CARD_RESULT
         if now < self.result_until and self.result_text:
@@ -1103,6 +1143,8 @@ class AppleDynamicIsland(
                 return IslandState.CARD_JARVIS
             elif self.expanded_card == "timer":
                 return IslandState.CARD_TIMER
+            elif self.expanded_card == "ask":
+                return IslandState.CARD_ASK
         if self.active:
             return IslandState.TRACKING
         return IslandState.IDLE
@@ -1143,7 +1185,8 @@ class AppleDynamicIsland(
         if self.is_fullscreen_suppressed and state in (
             IslandState.IDLE, IslandState.CARD_MEDIA, IslandState.CARD_WEATHER,
             IslandState.CARD_TIME, IslandState.CARD_DISAMBIGUATE, IslandState.CARD_TIMER,
-            IslandState.CARD_HARDWARE_GRID, IslandState.CARD_HARDWARE_STRIP, IslandState.CARD_JARVIS
+            IslandState.CARD_HARDWARE_GRID, IslandState.CARD_HARDWARE_STRIP, IslandState.CARD_JARVIS,
+            IslandState.CARD_ASK
         ):
             return (60.0 * scale, 0.0)
 
@@ -1168,7 +1211,7 @@ class AppleDynamicIsland(
             return (390.0 * scale, 188.0 * scale)
         elif state == IslandState.CARD_HARDWARE_STRIP:
             return (446.0 * scale, 69.0 * scale)
-        elif state == IslandState.CARD_JARVIS:
+        elif state in (IslandState.CARD_JARVIS, IslandState.CARD_ASK):
             return (390.0 * scale, 188.0 * scale)
         elif state == IslandState.CARD_TIMER:
             return (380.0 * scale, 150.0 * scale)
@@ -1272,10 +1315,13 @@ class AppleDynamicIsland(
                 self._media_bars[i] += 0.20 * (0.15 - self._media_bars[i])
 
         # Interaction & Auto-collapse checks
+        self._ask_tick(now)
         self._update_interaction(now, dt)
         self._notify_visible_page()
 
         state = self._resolve_state(now)
+        if self.hidden and self._hidden_tick(now, state):
+            return                              # hidden and idle: no frame work, window is not shown
         tw, th = self._target_size(state, now)
 
         # State transition detection
@@ -1334,6 +1380,7 @@ class AppleDynamicIsland(
                 IslandState.CARD_SENDING,
                 IslandState.SPEAKING,
             )
+            or state == IslandState.CARD_ASK
             or self.no_speech_active
             or (self.target_prompt and self.user_prompt != self.target_prompt)
             or self.media_playing
@@ -1630,6 +1677,10 @@ class AppleDynamicIsland(
                 self._btn_flash_until = now + 0.25
                 return
 
+        elif self.expanded_card == "ask":
+            if self._ask_mouse_press(pos):
+                return
+
         elif self.expanded_card is None:
             self._opened_via_hover = False
             self.expand_card(self._default_card())
@@ -1655,7 +1706,7 @@ class AppleDynamicIsland(
 
         self.expanded_until = time.time() + 4.0
         self._update_shape_passthrough(event.globalPosition())   # left the shape -> click-through at once
-        if self.expanded_card in ("media", "timer", "jarvis"):
+        if self.expanded_card in ("media", "timer", "jarvis", "ask"):
             self._hovered_btn = self._button_at(self.to_island_pos(event.position()))
         super().mouseMoveEvent(event)
 
@@ -1669,6 +1720,9 @@ class AppleDynamicIsland(
     def _button_at(self, pos: QPointF | QPoint) -> Optional[str]:
         w = max(self.island_size()[0], self.spring_w.target)
         scale = self._get_size_scale()
+
+        if self.expanded_card == "ask":
+            return self._ask_button_at(pos)
 
         if self.expanded_card in ("jarvis", "jarvis_card"):
             if self._jarvis_pause_rect().contains(pos):
@@ -1696,6 +1750,8 @@ class AppleDynamicIsland(
         self.expanded_until = time.time() + 4.0
         if btn in ("jarvis_toggle_tracking", "jarvis_pause"):
             self.toggle_tracking_paused()
+        elif btn == "ask_mic":
+            self.ask_mic_action()
         elif btn == "lyrics_toggle":
             self.toggle_lyrics()
         elif btn in ("play_pause", "media_toggle"):
@@ -1923,7 +1979,7 @@ class AppleDynamicIsland(
     def _state_radius(self, state: IslandState, w: float, h: float, scale: float) -> float:
         """Corner radius token for the state, scaled and clamped so short shapes stay full stadiums."""
         if state in (IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME,
-                     IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS):
+                     IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS, IslandState.CARD_ASK):
             tok = float(RADIUS.expanded_card)
         elif state == IslandState.CARD_HARDWARE_STRIP:
             tok = h / 2.0 / max(0.1, scale)        # sheet 3.6: the strip is a full stadium (r = H / 2)
@@ -1971,11 +2027,20 @@ class AppleDynamicIsland(
         tint_key, tint_stops, tint_glow = (None, None, None)
         if state == IslandState.CARD_MEDIA:
             tint_key, tint_stops, tint_glow = self._media_shell_tint()
+        # Surface style. The media album-art tint always overrides it; on the light surface the media card
+        # without art keeps the dark gradient (its controls are drawn for a dark card).
+        shell_style = self.surface_style
+        light = shell_style == "white"
+        if light and state == IslandState.CARD_MEDIA:
+            shell_style, light = "gradient", False
+        set_island_ink(light)
+        if light:
+            dark = False
         kind = "pill" if (h <= 72.0 * scale and r >= h / 2.0 - 0.5) else "card"
         top = 0.0 if is_pill else -16.0
         paint_island_shadow(p, QRectF(0.0, top, w, h - top), r, kind, self._paint_dpr, scale, self._pad)
         shell = get_shell_pixmap(int(round(w)), int(round(h)), self._paint_dpr, r, kind, not is_pill,
-                                 tint_key, tint_stops, tint_glow, scale)
+                                 tint_key, tint_stops, tint_glow, scale, shell_style)
         p.drawPixmap(QPointF(0.0, 0.0), shell)
         self._shape_path = create_cached_squircle_path(QRectF(0.0, top, w, h - top), r)
 
@@ -2008,7 +2073,7 @@ class AppleDynamicIsland(
         self._draw_content(p, w, h, now, t, state, dark, reduce)
         p.setOpacity(1.0)
         self._last_rendered_state = state
-        self._last_rendered_dark = dark
+        self._last_rendered_dark = self.dark_mode if light else dark
         self._dirty = False
 
     def _draw_shimmer(self, p: QPainter, path: QPainterPath, w: float, h: float, t: float, dark: bool) -> None:
@@ -2084,7 +2149,7 @@ class AppleDynamicIsland(
         secondary = T.color.secondary_label.resolve(dark)
 
         CYAN = COLOR.HUD_ONLY.neon_cyan
-        GOLD = COLOR.HUD_ONLY.stark_gold
+        GOLD = COLOR.HUD_ONLY.stark_gold if dark else QColor("#9C6F00")   # deeper gold on the light surface
         # Assistant-state text: primary = white (#FAFAFA), secondary / meta = label grey (never blue)
         WHITE = ISLAND.color.value
         GREY = ISLAND.color.label
@@ -2142,6 +2207,9 @@ class AppleDynamicIsland(
         elif state == IslandState.CARD_JARVIS:
             self._draw_jarvis_card(p, w, h, now, t, dark, primary, secondary, accent)
 
+        elif state == IslandState.CARD_ASK:
+            self._draw_ask_card(p, w, h, now, t, dark, primary, secondary, accent)
+
         elif state == IslandState.HUD_VOLUME:
             self._draw_hud_volume(p, w, h, cy, dark, primary, secondary, accent)
 
@@ -2157,7 +2225,7 @@ class AppleDynamicIsland(
         # Page dot column for expanded card layouts
         if state in (
             IslandState.CARD_MEDIA, IslandState.CARD_WEATHER, IslandState.CARD_TIME,
-            IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS
+            IslandState.CARD_HARDWARE_GRID, IslandState.CARD_JARVIS, IslandState.CARD_ASK
         ):
             self._draw_page_dots(p, w, h, dark)
 
@@ -2232,11 +2300,11 @@ class AppleDynamicIsland(
                 p.setPen(QPen(QColor(0, 229, 255, 95), 1.5 * scale))
                 p.drawRoundedRect(glow2, glow2.height() / 2.0, glow2.height() / 2.0)
 
-                chip_bg = QColor(255, 255, 255, 45 if dark else 75)
+                chip_bg = ink(45 if dark else 34)
                 chip_border = QPen(QColor(0, 229, 255, 210), 1.4 * scale)
             else:
-                chip_bg = QColor(255, 255, 255, 18 if dark else 35)
-                chip_border = QPen(QColor(255, 255, 255, 34 if dark else 65), 1.0 * scale)
+                chip_bg = ink(18 if dark else 16)
+                chip_border = QPen(ink(34 if dark else 56), 1.0 * scale)
 
             # Draw Chip Pill Background & Border
             p.setPen(chip_border)
@@ -2255,7 +2323,7 @@ class AppleDynamicIsland(
                 p.drawEllipse(badge_rect)
                 num_color = QColor(10, 14, 20)
             else:
-                p.setBrush(QBrush(QColor(255, 255, 255, 36 if dark else 55)))
+                p.setBrush(QBrush(ink(36 if dark else 30)))
                 p.drawEllipse(badge_rect)
                 num_color = primary
 
@@ -2366,13 +2434,13 @@ class AppleDynamicIsland(
         # Status badge beside remaining time
         if getattr(self, "timer_paused", False):
             badge_text = "PAUSED"
-            badge_col = QColor("#FFD60A")
+            badge_col = QColor("#FFD60A" if dark else "#8F6F00")
         elif rem <= 0.0:
             badge_text = "DONE"
-            badge_col = QColor("#30D158")
+            badge_col = QColor("#30D158" if dark else "#1F9D43")
         else:
             badge_text = "COUNTDOWN"
-            badge_col = QColor("#FF9F0A")
+            badge_col = QColor("#FF9F0A" if dark else "#B85F00")
 
         p.setFont(qfont(TYPE.caption_2))
         time_w = p.fontMetrics().horizontalAdvance(rem_str)
@@ -2391,7 +2459,7 @@ class AppleDynamicIsland(
         bw = w - 48.0 * scale
         bh = 6.0 * scale
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(255, 255, 255, 30 if dark else 55)))
+        p.setBrush(QBrush(ink(30 if dark else 38)))
         p.drawRoundedRect(QRectF(bx, by, bw, bh), bh / 2.0, bh / 2.0)
 
         # Filled portion
@@ -2423,7 +2491,7 @@ class AppleDynamicIsland(
         self._draw_timer_button(p, "timer_cancel", cancel_cx, cy_btn, "Cancel", secondary, scale, now)
         is_paused = getattr(self, "timer_paused", False)
         play_label = "Resume" if is_paused else "Pause"
-        self._draw_timer_button(p, "timer_pause_resume", pause_cx, cy_btn, play_label, QColor("#FF9F0A"), scale, now)
+        self._draw_timer_button(p, "timer_pause_resume", pause_cx, cy_btn, play_label, QColor("#FF9F0A" if dark else "#B85F00"), scale, now)
 
     def _draw_timer_button(self, p: QPainter, btn_id: str, cx: float, cy: float,
                            label: str, col: QColor, scale: float, now: float) -> None:
@@ -2436,7 +2504,7 @@ class AppleDynamicIsland(
 
         bg_alpha = 75 if is_flash else (45 if is_hover else 25)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(255, 255, 255, bg_alpha)))
+        p.setBrush(QBrush(ink(bg_alpha if not island_ink_is_light() else int(bg_alpha * 0.7))))
         p.drawRoundedRect(rect, bh / 2.0, bh / 2.0)
 
         if is_hover and self._btn_dwell_elapsed > 0.05:
@@ -2529,13 +2597,16 @@ class AppleDynamicIsland(
             br    = 6.5 + 2.0 * math.sin(t * 3.2 * speed_mult + phase * 1.5)
 
             g = QRadialGradient(bx, by, br)
-            g.setColorAt(0.0, QColor(col.red(), col.green(), col.blue(), 230))
-            g.setColorAt(0.55, QColor(col.red(), col.green(), col.blue(), 130))
+            a0, a1 = (255, 190) if island_ink_is_light() else (230, 130)     # stronger blobs on the light surface
+            g.setColorAt(0.0, QColor(col.red(), col.green(), col.blue(), a0))
+            g.setColorAt(0.55, QColor(col.red(), col.green(), col.blue(), a1))
             g.setColorAt(1.0, QColor(col.red(), col.green(), col.blue(), 0))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(g))
             p.drawEllipse(QPointF(bx, by), br, br)
 
+        if island_ink_is_light():
+            return                       # no white core on the light surface (it would wash the orb out)
         core = QRadialGradient(orb_cx, orb_cy, 6.0)
         core.setColorAt(0.0, QColor(255, 255, 255, 240))
         core.setColorAt(0.6, QColor(255, 255, 255, 90))
@@ -2546,6 +2617,18 @@ class AppleDynamicIsland(
     def _get_waveform_colors(self) -> list[QColor]:
         """Returns 7 QColor entries for the audio-reactive waveform bars."""
         c_name = str(getattr(self, "waveform_color", "blue")).lower().strip()
+        if island_ink_is_light():
+            cols = self._get_waveform_colors_dark(c_name)
+            if c_name in ("monochrome", "white", "gray", "grey"):
+                g = [QColor(60, 64, 70, 200), QColor(48, 52, 58, 225), QColor(36, 40, 46, 240), QColor(20, 23, 27, 255)]
+                return [g[0], g[1], g[2], g[3], g[2], g[1], g[0]]
+            cols = list(cols)
+            main = cols[2]
+            cols[3] = QColor(int(main.red() * 0.72), int(main.green() * 0.72), int(main.blue() * 0.72), 255)
+            return cols
+        return self._get_waveform_colors_dark(c_name)
+
+    def _get_waveform_colors_dark(self, c_name: str) -> list[QColor]:
         if c_name == "multicolor":
             return [
                 QColor(175, 82, 222, 200),
@@ -2705,9 +2788,11 @@ class AppleDynamicIsland(
                     recency = 1.0 - (age / 2.0)
                     shimmer_wave = 0.5 + 0.5 * math.sin(now * 7.5 - cur_x * 0.06)
                     boost = int(55.0 * recency * shimmer_wave)
-                    r = min(255, col.red() + boost)
-                    g = min(255, col.green() + boost)
-                    b = min(255, col.blue() + boost)
+                    if island_ink_is_light():
+                        boost = -boost
+                    r = min(255, max(0, col.red() + boost))
+                    g = min(255, max(0, col.green() + boost))
+                    b = min(255, max(0, col.blue() + boost))
                     col = QColor(r, g, b)
 
             col.setAlphaF(alpha)
@@ -2879,6 +2964,8 @@ class AppleDynamicIsland(
         top_font.setWeight(QFont.Weight.DemiBold)
         p.setFont(top_font)
         err_col = QColor("#FF9F0A") if self.is_ai_error else QColor("#FF453A")
+        if not dark:
+            err_col = QColor("#B85F00") if self.is_ai_error else QColor("#C62F26")
         p.setPen(err_col)
         p.drawText(int(tx), int(cy - 2), "Jarvis Alert")
 
@@ -2896,7 +2983,7 @@ class AppleDynamicIsland(
         p.drawEllipse(QPointF(dot_x, cy), 5.5, 5.5)
         pulse = 0.65 + 0.35 * math.sin(t * 7.0)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(255, 255, 255, 255)))
+        p.setBrush(QBrush(ink(255)))
         p.drawEllipse(QPointF(dot_x, cy), 2.2 * pulse, 2.2 * pulse)
 
         tx = dot_x + 14.0
@@ -2911,6 +2998,13 @@ class AppleDynamicIsland(
             prompt_disp = prompt_disp + "▍"
         elif len(prompt_disp) > 42:
             prompt_disp = prompt_disp[:39] + "…"
+        if state == IslandState.SPEAKING and not prompt_disp and self.say_text and self.hide_empty_quote:
+            # Nothing was said to Jarvis (intro line, proactive reply): no empty quoted line, the reply takes its place
+            avail = max(40.0, w - tx - 70.0)
+            line = QFontMetrics(top_font).elidedText(self.say_text, Qt.TextElideMode.ElideRight, int(avail))
+            p.drawText(int(tx), int(cy + 4), line)
+            self._draw_waveform_bars(p, w, cy)
+            return
         p.drawText(int(tx), int(cy - 4), f'"{prompt_disp}"')
 
         sub_font = qfont(TYPE.caption_1)
@@ -2923,7 +3017,7 @@ class AppleDynamicIsland(
             p.drawText(int(tx), int(cy + 11), disp)
             self._draw_waveform_bars(p, w, cy)
         else:
-            p.setPen(QColor("#30D158"))
+            p.setPen(QColor("#30D158" if dark else "#1F9D43"))
             p.drawText(int(tx), int(cy + 11), "Directive confirmed")
 
     def _draw_gesture(self, p: QPainter, cy: float, primary: QColor, GOLD: QColor) -> None:
@@ -2978,7 +3072,7 @@ class AppleDynamicIsland(
         hand_lm = self.landmarks[0]
         pts = [(skel_x + lm[0] * skel_box, skel_y + lm[1] * skel_box) for lm in hand_lm]
 
-        bone_col = QColor(255, 255, 255, 75 if dark else 120)
+        bone_col = ink(75 if dark else 120)
         p.setPen(QPen(bone_col, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
 
         rays = [(0, 4), (0, 8), (0, 12), (0, 16), (0, 20)]
@@ -2989,7 +3083,7 @@ class AppleDynamicIsland(
         if len(pts) > 8:
             is_hot = (state == IslandState.GESTURE)
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(accent if is_hot else QColor(255, 255, 255, 160)))
+            p.setBrush(QBrush(accent if is_hot else ink(160)))
             p.drawEllipse(QPointF(pts[8][0], pts[8][1]), 2.2, 2.2)
 
     def _draw_hud_volume(self, p: QPainter, w: float, h: float, cy: float, dark: bool,
@@ -3113,6 +3207,121 @@ class AppleDynamicIsland(
         p.drawText(QRectF(text_x, 0.0, avail_w, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
 
         p.restore()
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Surface style (cfg.island_surface)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def set_surface_style(self, style) -> bool:
+        """gradient | near_black | black | white. Clears every cache that bakes the surface or ink colours.
+        Returns True when the style changed."""
+        new = normalize_island_surface(style)
+        if new == self.surface_style:
+            return False
+        self.surface_style = new
+        invalidate_shell_cache()
+        self._icon_cache.clear()
+        self.__dict__.pop("_page_pix", None)
+        self._cal_pix = None
+        self._cal_pix_key = None
+        self._dirty = True
+        self.update()
+        return True
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Hide mode: island absent except while listening / answering
+    # ──────────────────────────────────────────────────────────────────────
+
+    # states that bring a hidden island back (voice interaction, answers, explicit requests)
+    _HIDDEN_REVEAL_STATES = (
+        IslandState.WAKE, IslandState.LISTENING, IslandState.THINKING, IslandState.PROMPT, IslandState.SPEAKING,
+        IslandState.RESULT, IslandState.CARD_RESULT, IslandState.ERROR, IslandState.CARD_SENDING,
+        IslandState.CARD_DISAMBIGUATE, IslandState.CARD_ASK, IslandState.CARD_MEDIA, IslandState.CARD_WEATHER,
+        IslandState.CARD_TIME, IslandState.CARD_HARDWARE_GRID, IslandState.CARD_HARDWARE_STRIP,
+        IslandState.CARD_JARVIS, IslandState.CARD_TIMER,
+    )
+    _HIDDEN_LINGER_S = 0.45       # how long the island stays after the last activity before it collapses + hides
+
+    def set_hidden(self, on: bool) -> None:
+        """Hide Jarvis (island fully absent) or bring it back. GUI thread."""
+        on = bool(on)
+        self.hidden = on
+        self._hidden_idle_t = 0.0
+        if on:
+            if not self._hidden_reveal_wanted(time.time(), self._resolve_state(time.time())):
+                self._hidden_hide_window()
+        else:
+            self._hidden_shown = False
+            if not self.isVisible():
+                self._hidden_show_window()
+            self._dirty = True
+
+    def _hidden_reveal_wanted(self, now: float, state: IslandState) -> bool:
+        return state in self._HIDDEN_REVEAL_STATES or now < self._hidden_force_until
+
+    def _hidden_show_window(self) -> None:
+        self._center_top()
+        self.show()
+        self._apply_exstyle()
+        self._dirty = True
+
+    def _hidden_hide_window(self) -> None:
+        self._hidden_shown = False
+        if self.isVisible():
+            self.hide()
+
+    def _hidden_reveal(self, now: float, hold: float = 2.0) -> None:
+        """Show the (hidden) island for at least `hold` s: used by wake / ask hotkey / intro."""
+        self._hidden_force_until = max(self._hidden_force_until, now + hold)
+        if self.hidden and not self._hidden_shown:
+            self._hidden_shown = True
+            self._hidden_idle_t = 0.0
+            self._hidden_show_window()
+
+    def _hidden_tick(self, now: float, state: IslandState) -> bool:
+        """Per frame while hidden. Shows the island for voice activity, hides it again once the reply is done and the
+        pill has collapsed. Returns True when the island is (still) hidden and the frame can be skipped."""
+        want = self._hidden_reveal_wanted(now, state)
+        if want:
+            self._hidden_idle_t = 0.0
+            if not self._hidden_shown:
+                self._hidden_shown = True
+                self._hidden_show_window()
+            return False
+        if not self._hidden_shown:
+            self.animating = False
+            return True
+        # activity is over: let the pill collapse, then disappear
+        if self._hidden_idle_t == 0.0:
+            self._hidden_idle_t = now
+        collapsed = self.spring_w.settled and self.spring_h.settled
+        if now - self._hidden_idle_t >= self._HIDDEN_LINGER_S and (collapsed or now - self._hidden_idle_t > 1.5):
+            self._hidden_hide_window()
+            self.animating = False
+            return True
+        return False
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Onboarding intro (overlay.post("onboarding"))
+    # ──────────────────────────────────────────────────────────────────────
+
+    INTRO_LINE = "Hello, I’m J.A.R.V.I.S."
+
+    def play_intro(self, text: str | None = None) -> str:
+        """Boot key frame (wake spring) followed by the intro line on the island. Returns the line."""
+        line = text or self.INTRO_LINE
+        now = time.time()
+        if self.expanded_card:
+            self.collapse_card()
+        self.trigger_wake(duration=0.5)
+        self.user_prompt = ""
+        self.target_prompt = ""
+        self.prompt_until = 0.0
+        self.say_text = line
+        self.say_until = now + 0.5 + max(3.5, len(line) * 0.08)
+        self._hidden_reveal(now, hold=0.5 + max(3.5, len(line) * 0.08) + 0.5)
+        return line
 
 
 # ──────────────────────────────────────────────────────────────────────────────

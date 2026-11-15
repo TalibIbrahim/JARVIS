@@ -15,7 +15,7 @@ from PySide6.QtGui import (QBrush, QColor, QFontMetricsF, QLinearGradient, QPain
                            QRadialGradient)
 
 from ui.components import continuous_path_cached, quantize_half
-from ui.tokens import ISLAND, qfont
+from ui.tokens import (ISLAND, ISLAND_SURFACE_STOPS, island_ink_is_light, normalize_island_surface, qfont)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Continuous-corner path cache (keys quantized to 0.5 px so spring frames still hit)
@@ -104,6 +104,20 @@ def ensure_contrast(fg: QColor, bg: QColor, minimum: float = ISLAND.tint.min_con
 
 _SHELL_CACHE: "OrderedDict[tuple, QPixmap]" = OrderedDict()
 _SHELL_CACHE_MAX = 10
+_HAIR_DARK = ISLAND.color.hairline          # captured at import: the shell hairline never follows the live ink swap
+_HAIR_LIGHT = QColor(0, 0, 0, 36)
+
+
+def invalidate_shell_cache() -> None:
+    """Drop every pre-rendered shell (call when the surface style changes)."""
+    _SHELL_CACHE.clear()
+
+
+def ink(alpha: int) -> QColor:
+    """Neutral foreground at `alpha` (0..255): white on the dark surfaces, near-black on the light surface."""
+    if island_ink_is_light():
+        return QColor(16, 19, 22, alpha)
+    return QColor(255, 255, 255, alpha)
 
 
 def _norm_cdf(x: float) -> float:
@@ -132,7 +146,8 @@ def paint_soft_shadow(p: QPainter, rect: QRectF, radius: float, spec, smoothing:
 
 
 def build_shell_pixmap(w: int, h: int, dpr: float, radius: float, kind: str = "card",
-                       notch: bool = False, tint_stops=None, tint_glow: Optional[QColor] = None) -> QPixmap:
+                       notch: bool = False, tint_stops=None, tint_glow: Optional[QColor] = None,
+                       style: str = "gradient") -> QPixmap:
     """Pre-render the island surface (no shadow): vertical gradient, tint, 1 px hairline, at island size w x h.
 
     notch=True extends the card 16 px above the widget so the top corners hide behind the bezel.
@@ -163,26 +178,33 @@ def build_shell_pixmap(w: int, h: int, dpr: float, radius: float, kind: str = "c
             p.restore()
     else:
         grad = QLinearGradient(0.0, card.top(), 0.0, card.bottom())
-        grad.setColorAt(0.0, ISLAND.color.surface_top)
-        grad.setColorAt(1.0, ISLAND.color.surface_bottom)
+        if style == "gradient":
+            grad.setColorAt(0.0, ISLAND.color.surface_top)
+            grad.setColorAt(1.0, ISLAND.color.surface_bottom)
+        else:
+            s_top, s_bot = ISLAND_SURFACE_STOPS[style]
+            grad.setColorAt(0.0, s_top)
+            grad.setColorAt(1.0, s_bot)
         p.fillPath(path, QBrush(grad))
     inset = card.adjusted(0.5, 0.5, -0.5, -0.5)
     hair = continuous_path_cached(inset.width(), inset.height(), max(0.0, radius - 0.5), sm).translated(inset.x(), inset.y())
-    p.strokePath(hair, QPen(ISLAND.color.hairline, 1.0))
+    p.strokePath(hair, QPen(_HAIR_LIGHT if (style == "white" and not tint_stops) else _HAIR_DARK, 1.0))
     p.end()
     return pix
 
 
 def get_shell_pixmap(w: int, h: int, dpr: float, radius: float, kind: str, notch: bool,
-                     tint_key=None, tint_stops=None, tint_glow=None, scale: float = 1.0) -> QPixmap:
-    """LRU-cached shell pixmap keyed by (w, h, dpr, r, kind, notch, tint). Origin = island top-left
+                     tint_key=None, tint_stops=None, tint_glow=None, scale: float = 1.0,
+                     style: str = "gradient") -> QPixmap:
+    """LRU-cached shell pixmap keyed by (w, h, dpr, r, kind, notch, tint, style). Origin = island top-left
     (for notch the pixmap holds only the visible part, from y=0)."""
-    key = (w, h, round(dpr, 3), quantize_half(radius), kind, notch, tint_key)
+    style = normalize_island_surface(style)
+    key = (w, h, round(dpr, 3), quantize_half(radius), kind, notch, tint_key, style)
     pix = _SHELL_CACHE.get(key)
     if pix is not None:
         _SHELL_CACHE.move_to_end(key)
         return pix
-    pix = build_shell_pixmap(w, h, dpr, radius, kind, notch, tint_stops, tint_glow)
+    pix = build_shell_pixmap(w, h, dpr, radius, kind, notch, tint_stops, tint_glow, style)
     _SHELL_CACHE[key] = pix
     while len(_SHELL_CACHE) > _SHELL_CACHE_MAX:
         _SHELL_CACHE.popitem(last=False)
@@ -287,6 +309,7 @@ class IslandState(Enum):
     CARD_TIMER          = auto()
     CARD_SENDING        = auto()
     CARD_RESULT         = auto()
+    CARD_ASK            = auto()     # Type or Talk page
     # Gesture HUD States
     HUD_VOLUME          = auto()
     HUD_WINDOW          = auto()
@@ -318,6 +341,7 @@ _SIZE: dict[IslandState, tuple[float, float]] = {
     IslandState.CARD_TIMER:          (380.0, 150.0),
     IslandState.CARD_SENDING:        (300.0,  44.0),
     IslandState.CARD_RESULT:         (380.0,  58.0),
+    IslandState.CARD_ASK:            (390.0, 188.0),
     IslandState.HUD_VOLUME:          (260.0,  38.0),
     IslandState.HUD_WINDOW:          (290.0,  38.0),
 }
@@ -340,7 +364,7 @@ def cached_page(owner, name: str, key: tuple, w: float, h: float, dpr: float, sc
     The cache holds one entry per page name and is rebuilt only when `key` (content + size + dpr) changes,
     so steady-state paints are a single drawPixmap."""
     store = owner.__dict__.setdefault("_page_pix", {})
-    full = (key, round(dpr, 3), round(scale, 3), round(w, 1), round(h, 1))
+    full = (key, round(dpr, 3), round(scale, 3), round(w, 1), round(h, 1), island_ink_is_light())
     ent = store.get(name)
     if ent is not None and ent[0] == full:
         return ent[1]

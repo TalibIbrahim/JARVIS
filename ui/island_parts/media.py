@@ -25,7 +25,7 @@ from PySide6.QtGui import (
 
 from ui.tokens import ISLAND, TYPE, COLOR, qfont
 from ui.island_parts.common import (
-    create_cached_squircle_path, ensure_contrast, lerp_color, lighten, with_alpha,
+    create_cached_squircle_path, ensure_contrast, ink, lerp_color, lighten, with_alpha,
 )
 from ui.components import continuous_path_cached
 
@@ -680,7 +680,7 @@ class MediaPageMixin:
         p.setClipPath(path)
         p.drawPixmap(QRectF(tx, ty, ts, ts), art, QRectF(0.0, 0.0, art.width(), art.height()))
         p.restore()
-        p.strokePath(path, QPen(QColor(255, 255, 255, 40), 1.0))
+        p.strokePath(path, QPen(ink(40), 1.0))
 
         a_text = max(0.0, min(1.0, (hp - 0.4) / 0.6))
         if a_text <= 0.01:

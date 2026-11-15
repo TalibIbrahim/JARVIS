@@ -19,6 +19,7 @@ _PAGE_ALIASES = {
     "weather": "weather",
     "hardware": "hardware", "hardware_grid": "hardware", "hardware_strip": "hardware",
     "jarvis": "jarvis", "jarvis_card": "jarvis",
+    "ask": "ask", "type": "ask", "talk": "ask", "type_or_talk": "ask", "ask_page": "ask",
 }
 
 
@@ -255,7 +256,8 @@ class PagingMixin:
         strengths = self._dot_strengths(active_idx, time.time(), num)
 
         lo, hi = ISLAND.color.dot_inactive.alphaF(), ISLAND.color.dot_active.alphaF()
-        col = QColor(255, 255, 255)
+        col = QColor(ISLAND.color.dot_active)          # white on the dark surfaces, dark ink on the light one
+        col.setAlpha(255)
         p.setPen(Qt.PenStyle.NoPen)
         for i, dy in enumerate(ys):
             k = strengths[i]

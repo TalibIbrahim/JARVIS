@@ -2767,9 +2767,12 @@ class Overlay:
                 except Exception as _glass_err:
                     print(f"[overlay] glass init error: {_glass_err}")
 
+            self.island.hide_empty_quote = True       # SPEAKING without a prompt: no empty "" line
             self.island.show()
             self.island.make_click_through()
             self.cursor_overlay.show()
+            if getattr(self.cfg, "island_hidden", False) and hasattr(self.island, "set_hidden"):
+                self.island.set_hidden(True)          # Hide mode at startup: absent until voice activity
 
             if _NEW_UI_AVAILABLE and "--island-demo" in sys.argv:
                 try:
@@ -3232,6 +3235,17 @@ class Overlay:
                         isl.collapse_card()
                     elif kind == "island_action" and hasattr(isl, "perform_action"):
                         isl.perform_action(d.get("action", ""), **{k: v for k, v in d.items() if k != "action"})
+                elif kind == "island_surface":
+                    if hasattr(self.island, "set_surface_style"):
+                        self.island.set_surface_style(d.get("style", "gradient"))
+                elif kind == "hidden":
+                    if hasattr(self.island, "set_hidden"):
+                        self.island.set_hidden(bool(d.get("on", d.get("hidden", True))))
+                elif kind == "ask_page":
+                    if hasattr(self.island, "open_ask_page"):
+                        self.island.open_ask_page(focus=bool(d.get("focus", False)), toggle=bool(d.get("toggle", False)))
+                elif kind == "onboarding":
+                    self._start_onboarding()
                 elif kind == "gesture_mode":
                     if hasattr(self.island, "set_gesture_mode"):
                         self.island.set_gesture_mode(bool(d.get("on", False)))
@@ -3242,6 +3256,36 @@ class Overlay:
                         if "end_time" in d: self.island.timer_end_time = float(d["end_time"])
         except queue.Empty:
             pass
+
+    def _start_onboarding(self):
+        """overlay.post("onboarding"): boot key frame + intro line on the island (spoken through ctx.say when
+        available), then the onboarding window (ui.onboarding_window.OnboardingWindow(ctx, cfg), imported lazily)."""
+        line = None
+        try:
+            if hasattr(self.island, "play_intro"):
+                line = self.island.play_intro()
+        except Exception as exc:
+            print(f"[overlay] onboarding intro error: {exc}")
+        say = getattr(self.ctx, "say", None) if self.ctx is not None else None
+        if callable(say) and line:
+            try:
+                say(line)
+            except Exception as exc:
+                print(f"[overlay] onboarding say error: {exc}")
+
+        def _open():
+            try:
+                from ui.onboarding_window import OnboardingWindow
+            except Exception as exc:
+                print(f"[overlay] onboarding window unavailable: {exc}")
+                return
+            try:
+                self._onboarding_win = OnboardingWindow(self.ctx, self.cfg)
+                self._onboarding_win.show()
+            except Exception as exc:
+                print(f"[overlay] onboarding window failed: {exc}")
+
+        QTimer.singleShot(1600, _open)
 
     def _sync_gesture_mode(self):
         """Mirror ctx.gesture_mode_on() (if main.py provides it) into the island's indicator."""
