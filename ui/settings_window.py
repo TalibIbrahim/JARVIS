@@ -1577,6 +1577,35 @@ class SettingsWindow(QDialog):
         assistant_card = GroupedCard()
         self.assistant_card = assistant_card
 
+        # 0. Launch at login (state lives in autostart module, not Config)
+        def _autostart_state() -> bool:
+            try:
+                import autostart
+                return bool(autostart.is_enabled())
+            except Exception as _e:
+                print(f"[settings] autostart state unavailable: {_e}")
+                return False
+
+        def _on_autostart_toggled(v: bool) -> None:
+            try:
+                import autostart
+                autostart.set_enabled(bool(v))
+            except Exception as _e:
+                print(f"[settings] autostart change failed: {_e}")
+                self.autostart_switch.blockSignals(True)
+                try:
+                    self.autostart_switch.setChecked(_autostart_state())
+                finally:
+                    self.autostart_switch.blockSignals(False)
+
+        self.autostart_switch = AppleSwitch(_autostart_state())
+        self.autostart_switch.toggled.connect(_on_autostart_toggled)
+        assistant_card.add_row(
+            "Start with Windows",
+            "Open J.A.R.V.I.S. quietly when you sign in",
+            self.autostart_switch
+        )
+
         # 1. Wake Word toggle
         self.wake_word_switch = AppleSwitch(getattr(self.cfg, "wake_word_enabled", True))
         self.wake_word_switch.toggled.connect(lambda v: self._save("wake_word_enabled", v))
