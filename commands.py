@@ -27,6 +27,9 @@ from ai import (
     OfflineError,
     TimeoutError,
     AIError,
+    answer_cache_get,
+    answer_cache_put,
+    rate_limit_reply,
 )
 
 # Alias for external modules
@@ -350,6 +353,230 @@ def play_media(query: str, platform: str = "auto") -> Tuple[bool, str]:
     else:
         webbrowser.open(f"https://www.youtube.com/results?search_query={encoded}")
         return True, f"Playing {clean_q.title()} on YouTube, sir."
+
+
+# --- site search ("search elden ring malenia guide on youtube") -------------------------
+# {q} is the percent-encoded query (quote, safe=""): valid in both query strings and path segments.
+SITE_SEARCH_URL = {
+    "youtube": "https://www.youtube.com/results?search_query={q}",
+    "google": "https://www.google.com/search?q={q}",
+    "bing": "https://www.bing.com/search?q={q}",
+    "duckduckgo": "https://duckduckgo.com/?q={q}",
+    "wikipedia": "https://en.wikipedia.org/w/index.php?search={q}",
+    "reddit": "https://www.reddit.com/search/?q={q}",
+    "amazon": "https://www.amazon.com/s?k={q}",
+    "github": "https://github.com/search?q={q}",
+    "stackoverflow": "https://stackoverflow.com/search?q={q}",
+    "twitch": "https://www.twitch.tv/search?term={q}",
+    "spotify": "https://open.spotify.com/search/{q}",
+    "maps": "https://www.google.com/maps/search/{q}",
+    "images": "https://www.google.com/search?tbm=isch&q={q}",
+    "news": "https://news.google.com/search?q={q}",
+    "steam": "https://store.steampowered.com/search/?term={q}",
+    "ebay": "https://www.ebay.com/sch/i.html?_nkw={q}",
+    "imdb": "https://www.imdb.com/find/?q={q}",
+    "twitter": "https://x.com/search?q={q}",
+    "linkedin": "https://www.linkedin.com/search/results/all/?keywords={q}",
+}
+SITE_SEARCH_NAMES = {
+    "youtube": "YouTube", "google": "Google", "bing": "Bing", "duckduckgo": "DuckDuckGo",
+    "wikipedia": "Wikipedia", "reddit": "Reddit", "amazon": "Amazon", "github": "GitHub",
+    "stackoverflow": "Stack Overflow", "twitch": "Twitch", "spotify": "Spotify", "maps": "Google Maps",
+    "images": "Google Images", "news": "Google News", "steam": "Steam", "ebay": "eBay", "imdb": "IMDb",
+    "twitter": "X", "linkedin": "LinkedIn",
+}
+# Spoken name -> canonical site. Multi-word names win over their prefixes (sorted by length in the regex).
+SITE_SEARCH_ALIASES = {
+    **{k: k for k in SITE_SEARCH_URL},
+    "yt": "youtube", "you tube": "youtube",
+    "duck duck go": "duckduckgo", "ddg": "duckduckgo",
+    "wiki": "wikipedia",
+    "stack overflow": "stackoverflow",
+    "git hub": "github",
+    "google maps": "maps", "map": "maps",
+    "google images": "images", "image search": "images",
+    "google news": "news",
+    "steam store": "steam",
+    "e bay": "ebay",
+    "x": "twitter", "x.com": "twitter",
+    "linked in": "linkedin",
+    "amazon.com": "amazon",
+}
+_SITE_ALT = "|".join(re.escape(a) for a in sorted(SITE_SEARCH_ALIASES, key=len, reverse=True))
+_SITE_SUFFIX = r"(?:\s+(?:website|site|app|store|dot com))?"
+_SITE_VERB = (r"(?:search(?:\s+up)?|find(?:\s+me)?|look\s+up|look\s+for|google|show\s+me|pull\s+up|bring\s+up|"
+              r"watch|open|browse)")
+_SITE_SEARCH_PATTERNS = (
+    # "search [for] X on|in youtube", "look up X on reddit", "watch X on youtube", "show me X on youtube"
+    re.compile(r"^" + _SITE_VERB + r"\s+(?:for\s+)?(?P<q>.+?)\s+(?:on|in|at|from|using|via)\s+(?:the\s+)?(?P<site>"
+               + _SITE_ALT + r")" + _SITE_SUFFIX + r"$"),
+    # "search youtube for X", "look up on reddit for X"
+    re.compile(r"^(?:search|look\s+up|look|find|check)\s+(?:on\s+|in\s+)?(?:the\s+)?(?P<site>" + _SITE_ALT + r")"
+               + _SITE_SUFFIX + r"\s+for\s+(?P<q>.+)$"),
+    # "youtube search X", "reddit search for X"
+    re.compile(r"^(?P<site>" + _SITE_ALT + r")\s+search\s+(?:for\s+)?(?P<q>.+)$"),
+    # "search youtube X" (YouTube only: "search amazon stock price" is a Google search)
+    re.compile(r"^search\s+(?P<site>youtube|you tube|yt)\s+(?P<q>.+)$"),
+    # "how to beat malenia on youtube"
+    re.compile(r"^(?P<q>how\s+to\s+.+?)\s+(?:on|in)\s+(?P<site>" + _SITE_ALT + r")" + _SITE_SUFFIX + r"$"),
+)
+_RE_SHOW_PICTURES = re.compile(r"^(?:show\s+me|find(?:\s+me)?|search\s+for|look\s+up|pull\s+up)\s+"
+                               r"(?:some\s+)?(?:pictures|pics|images|photos)\s+of\s+(?P<q>.+)$")
+_RE_YT_LEAD = re.compile(r"^(?:some\s+|a\s+)?(?:videos?|clips?)\s+(?:of|about|on)\s+")
+_SITE_QUERY_JUNK = frozenset({"", "it", "this", "that", "something", "stuff", "things", "a", "the", "for"})
+
+
+def resolve_search_site(name: str) -> Optional[str]:
+    """Canonical SITE_SEARCH_URL key for a spoken site name ('you tube', 'google maps', 'yt'), or None."""
+    n = " ".join(str(name or "").lower().split())
+    n = re.sub(r"^the\s+", "", n)
+    n = re.sub(r"\s+(?:website|site|app|store|dot com)$", "", n) if n not in SITE_SEARCH_ALIASES else n
+    return SITE_SEARCH_ALIASES.get(n)
+
+
+def parse_site_search(text: str) -> Optional[Tuple[str, str]]:
+    """'search elden ring malenia guide on youtube' -> ('youtube', 'elden ring malenia guide'); else None.
+    Plain 'search X' (no site) returns None so it stays a Google search."""
+    t = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", str(text or "")).lower().replace("’", "'").split())
+    t = t.strip(" ,.!?")
+    if not t or len(t) > MAX_UTTERANCE_CHARS:
+        return None
+    t = re.sub(r"^(?:please\s+|can you\s+(?:please\s+)?|could you\s+(?:please\s+)?|would you\s+(?:please\s+)?|"
+               r"hey\s+|ok\s+|okay\s+|just\s+)", "", t).strip()
+    t = re.sub(r"\s+(?:please|for me|jarvis)$", "", t).strip()
+    site, query = None, None
+    for rx in _SITE_SEARCH_PATTERNS:
+        m = rx.match(t)
+        if m:
+            site, query = resolve_search_site(m.group("site")), m.group("q")
+            break
+    if site is None:
+        m = _RE_SHOW_PICTURES.match(t)
+        if not m:
+            return None
+        site, query = "images", m.group("q")
+    query = " ".join(query.strip(" ,.!?").split())
+    if site == "youtube":
+        query = _RE_YT_LEAD.sub("", query).strip()
+    if query in _SITE_QUERY_JUNK or not site:
+        return None
+    return site, query
+
+
+def site_search_url(site: str, query: str) -> Optional[str]:
+    key = resolve_search_site(site)
+    if not key:
+        return None
+    q = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", str(query or "")).split())
+    if not q:
+        return None
+    enc = urllib.parse.quote_plus(q) if key == "google" else urllib.parse.quote(q, safe="")
+    return SITE_SEARCH_URL[key].format(q=enc)
+
+
+def open_site_search(site: str, query: str) -> Tuple[bool, str]:
+    """Opens the site's search results for query. Returns (ok, spoken reply)."""
+    key = resolve_search_site(site)
+    url = site_search_url(site, query)
+    if not key or not url:
+        return False, "I didn't catch what to search for, sir."
+    q = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", str(query)).split())
+    name = SITE_SEARCH_NAMES.get(key, key.title())
+    if key == "spotify" and is_spotify_available():
+        try:
+            subprocess.Popen(f'start "" "spotify:search:{urllib.parse.quote(q, safe="")}"', shell=True)
+            return True, f"Searching {name} for {q}."
+        except Exception:
+            pass
+    webbrowser.open(url)
+    return True, f"Searching {name} for {q}."
+
+
+# --- gesture mode (camera hand control on/off) ------------------------------------------
+GESTURE_ON_PHRASES = (
+    "gesture mode on", "gesture mode", "gestures on", "enable gesture mode", "enable gestures",
+    "enable gesture control", "turn on gestures", "turn gestures on", "turn on gesture mode",
+    "turn on gesture control", "start gesture control", "start gesture mode", "start gestures",
+    "activate gestures", "activate gesture mode", "activate gesture control", "use gestures",
+    "i want to use gestures", "let me use gestures", "turn on the camera", "turn the camera on",
+    "turn on camera", "camera on", "enable the camera", "enable camera",
+)
+GESTURE_OFF_PHRASES = (
+    "gesture mode off", "gestures off", "disable gesture mode", "disable gestures", "disable gesture control",
+    "turn off gestures", "turn gestures off", "turn off gesture mode", "turn off gesture control",
+    "stop gesture control", "stop gesture mode", "stop gestures", "deactivate gestures",
+    "deactivate gesture mode", "exit gesture mode", "turn off the camera", "turn the camera off",
+    "turn off camera", "camera off", "disable the camera", "disable camera", "release the camera",
+)
+GESTURE_TOGGLE_PHRASES = (
+    "toggle tracking", "toggle hand tracking", "toggle gesture tracking", "toggle gestures",
+    "toggle gesture mode", "toggle gesture control", "toggle camera", "toggle the camera",
+)
+
+
+def gesture_mode_state(ctx) -> Optional[bool]:
+    """ctx.gesture_mode_on() as a bool, or None when the host has no gesture-mode support."""
+    fn = getattr(ctx, "gesture_mode_on", None) if ctx is not None else None
+    if not callable(fn):
+        return None
+    try:
+        v = fn()
+    except Exception:
+        return None
+    return v if isinstance(v, bool) else None
+
+
+def set_gesture_mode(ctx, on: bool) -> Tuple[bool, str]:
+    """Turns gesture mode (camera + hand tracking) on/off via ctx.set_gesture_mode; falls back to
+    pausing/resuming tracking on hosts without it. Returns (ok, spoken reply)."""
+    fn = getattr(ctx, "set_gesture_mode", None) if ctx is not None else None
+    if callable(fn):
+        try:
+            fn(bool(on))
+        except Exception:
+            _jl.get_logger("commands").exception("set_gesture_mode failed")
+            return False, "I couldn't change gesture mode, sir."
+        return True, "Gesture mode on." if on else "Gesture mode off, camera released."
+    pause = getattr(ctx, "set_tracking_paused", None) if ctx is not None else None
+    if callable(pause):
+        try:
+            pause(not on)
+        except Exception:
+            return False, "I couldn't change gesture mode, sir."
+        return True, "Gesture mode on." if on else "Gesture mode off."
+    return False, "Gesture mode isn't available right now, sir."
+
+
+def _is_image_frame(frame) -> bool:
+    try:
+        import numpy as np
+        return isinstance(frame, np.ndarray) and frame.ndim == 3 and frame.size > 0
+    except Exception:
+        return False
+
+
+def _camera_frame(ctx):
+    """Latest tracker frame, else a one-off ctx.snapshot_frame() (gesture mode off: camera not running)."""
+    tracker = getattr(ctx, "tracker", None) if ctx else None
+    get_latest = getattr(tracker, "get_latest_frame", None) if tracker is not None else None
+    frame = None
+    if callable(get_latest):
+        try:
+            frame = get_latest()
+        except Exception:
+            frame = None
+    if frame is not None:
+        return frame
+    snap = getattr(ctx, "snapshot_frame", None) if ctx else None
+    if callable(snap):
+        try:
+            shot = snap(timeout=3.0)
+        except Exception:
+            _jl.get_logger("commands").exception("snapshot_frame failed")
+            return None
+        if _is_image_frame(shot):
+            return shot
+    return None
 
 
 def _post_action(ctx, action: str, success: bool = True, args: Optional[dict] = None, text: str = ""):
@@ -681,6 +908,21 @@ def _run_single_command(text, ctx):
         _post_action(ctx, "tracking_paused" if _trk else "tracking_resumed", True, text=text)
         return "Tracking paused, sir." if _trk else "Tracking resumed, sir."
 
+    # Tier-1 exact phrases: gesture mode (camera + hand control) on / off / toggle
+    _gest = None
+    if _exact(clean_t, *GESTURE_ON_PHRASES):
+        _gest = True
+    elif _exact(clean_t, *GESTURE_OFF_PHRASES):
+        _gest = False
+    elif _exact(clean_t, *GESTURE_TOGGLE_PHRASES):
+        _state = gesture_mode_state(ctx)
+        if _state is not None:   # hosts without gesture mode keep the island tracking toggle below
+            _gest = not _state
+    if _gest is not None:
+        _ok, _msg = set_gesture_mode(ctx, _gest)
+        _post_action(ctx, "gesture_mode", _ok, args={"enabled": _gest}, text=text)
+        return _msg
+
     # Direct verbal confirmations
     if _exact(clean_t, *CONFIRM_SHUTDOWN):
         _PENDING_CONFIRMATION = None
@@ -978,6 +1220,15 @@ def _run_single_command(text, ctx):
         if res.success:
             ctx_res.record_turn(user_utterance=text, resolved_action="open_recent_file", arguments={"file": res.path})
         return res.message
+
+    # --- site search: "search X on youtube", "youtube search X", "look up X on reddit" ---
+    # Must run before the generic open/search handlers, which would Google the whole phrase.
+    _site = parse_site_search(clean_t)
+    if _site:
+        _s_name, _s_query = _site
+        _ok, _msg = open_site_search(_s_name, _s_query)
+        _post_action(ctx, "site_search", _ok, args={"site": _s_name, "query": _s_query}, text=text)
+        return _msg
 
     # --- apps and web ---
     m = re.match(r"(?:open|launch|start|run|bring up|go to)\s+(?:up\s+)?(?:the\s+)?(.+)", clean_t)
@@ -1376,8 +1627,53 @@ def _run_single_command(text, ctx):
     except Exception as exc:
         print(f"[commands] context resolver check note: {exc}")
 
+    # --- local-first answers (Wikipedia for simple "who is / define" lookups) before any Groq call ---
+    local_reply = _local_answer_first(text, clean_t, ctx)
+    if local_reply:
+        return local_reply
+
     # --- fallback: Groq AI query if enabled (System 2 Deep Reasoning) ---
     return _handle_ai_query(text, ctx)
+
+
+# "who is X", "tell me about X", "define X", "what is a/an X": encyclopedia lookups Wikipedia answers
+# for free. Anything that is not a self-contained topic (pronouns, time words, "my") goes to the LLM.
+_RE_LOCAL_LOOKUP = re.compile(r"^(?:who (?:is|was)|tell me about|define|what (?:is|are) (?:an?|the meaning of))\s+(.+)$")
+
+
+def _local_answer_first(text: str, clean_t: str, ctx: Any) -> Optional[str]:
+    """Local answers tried before Groq: the answer cache, then Wikipedia for plain lookups.
+    Math, units, time/date, world time and 'wiki X' are already handled earlier in _run_single_command."""
+    if is_visual_query(text):
+        return None
+    try:
+        cached = answer_cache_get(clean_t)
+    except Exception:
+        cached = None
+    if cached:
+        _jl.utterance_event(_jl.DECISION, tier="answer_cache", intent="conversation")
+        try:
+            get_conversation_manager().add_turn(text, cached)
+        except Exception:
+            pass
+        return cached
+    m = _RE_LOCAL_LOOKUP.match(clean_t.strip(" ,.!?"))
+    if not m:
+        return None
+    from ai import is_cacheable_question
+    topic = m.group(1).strip()
+    if len(topic.split()) > 6 or not is_cacheable_question(clean_t):
+        return None
+    try:
+        import quick_answers
+        summary = quick_answers.get_wikipedia_client().get_summary(topic)
+    except Exception:
+        summary = None
+    if not summary:
+        return None
+    _jl.utterance_event(_jl.DECISION, tier="wiki_first", intent="quick_answer")
+    _post_action(ctx, "wiki", True, text=text)
+    return f"According to Wikipedia, {summary}"
 
 
 def is_visual_query(text: str) -> bool:
@@ -1447,8 +1743,7 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
             blocked = screen_awareness.vision_blocked_reply(ctx, "Visual analysis")
             if blocked:
                 return blocked
-            tracker = getattr(ctx, "tracker", None) if ctx else None
-            frame = tracker.get_latest_frame() if tracker else None
+            frame = _camera_frame(ctx)
             if frame is not None:
                 try:
                     vision_model = getattr(cfg, "ai_vision_model", DEFAULT_VISION_MODEL) if cfg else DEFAULT_VISION_MODEL
@@ -1466,13 +1761,13 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
                         except Exception:
                             pass
                     return "My Groq API key appears to be invalid, sir. Please check your settings."
-                except RateLimitError:
+                except RateLimitError as rl_exc:
                     if ctx and hasattr(ctx, "overlay") and ctx.overlay:
                         try:
                             ctx.overlay.post("ai_error", text="Groq Rate Limited")
                         except Exception:
                             pass
-                    return "Groq rate limit reached, sir. Please stand by a moment."
+                    return rate_limit_reply(rl_exc)
                 except (OfflineError, TimeoutError):
                     if ctx and hasattr(ctx, "overlay") and ctx.overlay:
                         try:
@@ -1493,6 +1788,13 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
         client = GroqClient(api_key=api_key, timeout=timeout)
         conv_mgr = get_conversation_manager()
         conv_mgr.max_turns = max_history
+
+        # Same self-contained question asked before: answer locally, no Groq request.
+        cached = answer_cache_get(user_text)
+        if cached:
+            _jl.utterance_event(_jl.DECISION, tier="answer_cache", intent="conversation")
+            conv_mgr.add_turn(user_text, cached)
+            return cached
 
         system_prompt = build_system_prompt(ctx)
         messages = conv_mgr.get_messages(system_prompt, user_text)
@@ -1515,6 +1817,8 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
             executed, act_msg = execute_whitelisted_action(action, args, ctx)
             if not executed:
                 print(f"[ai] Action '{action}' note: {act_msg}")
+        elif reply:
+            answer_cache_put(user_text, reply)   # pure Q&A only; refuses time/personal/follow-up questions
 
         conv_mgr.add_turn(user_text, reply)
         return reply
@@ -1526,13 +1830,13 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
             except Exception:
                 pass
         return "My Groq API key appears to be invalid, sir. Please check your settings."
-    except RateLimitError:
+    except RateLimitError as rl_exc:
         if ctx and hasattr(ctx, "overlay") and ctx.overlay:
             try:
                 ctx.overlay.post("ai_error", text="Groq Rate Limited")
             except Exception:
                 pass
-        return "Groq rate limit reached, sir. Please stand by a moment."
+        return rate_limit_reply(rl_exc)
     except (OfflineError, TimeoutError) as exc:
         err_msg = "Request Timed Out" if isinstance(exc, TimeoutError) else "Groq Offline"
         if ctx and hasattr(ctx, "overlay") and ctx.overlay:

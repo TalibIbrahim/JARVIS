@@ -94,6 +94,40 @@ def _restore_tokens(text: str, tokens: List[str]) -> str:
     return res
 
 
+_SITE_SEARCH_TAIL_RE: Optional["re.Pattern[str]"] = None
+
+
+def _split_after_site_search(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """('search X on youtube', 'open spotify') for 'search X on youtube and then open spotify', else (None, None).
+    The head must parse as a site search on its own; the conjunction must directly follow the site name."""
+    global _SITE_SEARCH_TAIL_RE
+    try:
+        from commands import SITE_SEARCH_ALIASES, parse_site_search
+    except Exception:
+        return None, None
+    if _SITE_SEARCH_TAIL_RE is None:
+        alt = "|".join(re.escape(a) for a in sorted(SITE_SEARCH_ALIASES, key=len, reverse=True))
+        _SITE_SEARCH_TAIL_RE = re.compile(
+            r"\s+(?:on|in|at|from|using|via)\s+(?:the\s+)?(?:" + alt + r")(?:\s+(?:website|site|app|store))?"
+            r"(?=\s*(?:,\s*and\s+then|,\s*then|,\s*and|and\s+then|then|after\s+that|also|and|;)\s+\S)",
+            re.IGNORECASE)
+    for m in _SITE_SEARCH_TAIL_RE.finditer(text):
+        head = text[:m.end()].strip(" ,.!?")
+        rest = re.sub(r"^\s*(?:,\s*and\s+then|,\s*then|,\s*and|and\s+then|then|after\s+that|also|and|;)\s+", "",
+                      text[m.end():], flags=re.IGNORECASE).strip(" ,.!?")
+        if rest and parse_site_search(head):
+            return head, rest
+    # "youtube search lofi and then open spotify": a strong conjunction ends the query of any site search form.
+    for m in _STRONG_CONJ_RE.finditer(text):
+        head, rest = text[:m.start()].strip(" ,.!?"), text[m.end():].strip(" ,.!?")
+        if rest and parse_site_search(head):
+            return head, rest
+    return None, None
+
+
+_STRONG_CONJ_RE = re.compile(r"\s*,?\s+(?:and\s+then|then|after\s+that)\s+|\s*;\s*", re.IGNORECASE)
+
+
 def split_chained_commands(utterance: str) -> List[str]:
     """
     Splits a compound utterance into a sequence of individual command strings.
@@ -105,15 +139,27 @@ def split_chained_commands(utterance: str) -> List[str]:
 
     lower = clean.lower()
 
-    # 1. Do not split queries, dictations, or notes that naturally contain "and"
+    # 1. A site search's query ends at "on <site>": "search X on youtube and then open spotify" is two
+    #    commands, while "watch tom and jerry on youtube" (site at the very end) is one.
+    head, rest = _split_after_site_search(clean) if len(clean) <= 1000 else (None, None)
+    if head and rest:
+        return [head] + split_chained_commands(rest)[:MAX_CHAIN_COMMANDS - 1]
+    try:
+        from commands import parse_site_search
+        if parse_site_search(clean):
+            return [clean]
+    except Exception:
+        pass
+
+    # 2. Do not split queries, dictations, or notes that naturally contain "and"
     for prefix in _UNSPLITTABLE_PREFIXES:
         if lower.startswith(prefix):
             return [clean]
 
-    # 2. Protect valid non-splitting conjunctions (times, ranges)
+    # 3. Protect valid non-splitting conjunctions (times, ranges)
     protected, tokens = _protect_tokens(clean)
 
-    # 3. Try splitting across conjunction patterns
+    # 4. Try splitting across conjunction patterns
     for pattern in _CONJUNCTION_PATTERNS:
         parts = re.split(pattern, protected, flags=re.IGNORECASE)
         # Check if parts look like plausible commands

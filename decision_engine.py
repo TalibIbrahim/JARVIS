@@ -45,7 +45,8 @@ _RE_OPEN_FOLDER = re.compile(r"(?:open|show|bring\s+up)\s+(?:the\s+)?(?:folder\s
 _RE_STRIP_MY_THE = re.compile(r"^(?:my|the)\s+")
 _RE_FILE_EXT = re.compile(r"\b(pdf|txt|md|docx|xlsx|csv|png|jpg|mp4|py)\b")
 _RE_REMEMBER_FOLDER = re.compile(r"remember\s+(?:this\s+folder\s+)?(?:as\s+)?(.+)")
-_RE_PLAY_MUSIC = re.compile(r"(?:play|put on|listen to|search for)\s+(.+?)(?:\s+(?:on|in)\s+(?:spotify|youtube))?$")
+_RE_PLAY_MUSIC = re.compile(
+    r"(?:play|put on|listen to|search(?:\s+for)?|look\s+up)\s+(.+?)(?:\s+(?:on|in)\s+(?:spotify|youtube|you tube|yt))?$")
 _RE_SET_VOLUME = re.compile(r"\b(?:set\s+)?volume\s+(?:to\s+)?(\d{1,3})\b")
 _RE_SET_BRIGHTNESS = re.compile(r"\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})\b")
 _RE_SWITCH_APP = re.compile(r"(?:switch\s+(?:to\s+)?)(.+)")
@@ -199,6 +200,17 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
     "island_toggle_tracking": [
         "toggle tracking", "toggle hand tracking",
         "toggle gesture tracking", "switch tracking"
+    ],
+    # Gesture mode: camera + hand control on/off (commands.py handles the exact phrases first)
+    "gesture_mode_on": [
+        "gesture mode on", "turn on gestures", "enable gestures", "enable gesture control",
+        "start gesture control", "turn on the camera", "camera on", "i want to use gestures",
+        "switch the camera on", "activate gesture mode", "use hand gestures"
+    ],
+    "gesture_mode_off": [
+        "gesture mode off", "turn off gestures", "disable gestures", "disable gesture control",
+        "stop gesture control", "turn off the camera", "camera off", "release the camera",
+        "switch the camera off", "deactivate gesture mode", "stop using gestures"
     ],
     "island_set_pin": [
         "pin island", "unpin island", "pin card", "keep island open",
@@ -367,7 +379,7 @@ SIDE_EFFECT_INTENTS = frozenset({
     "move_to_other_monitor", "close_window", "open_this", "copy_this", "close_this",
     "sleep_system", "toggle_wifi", "toggle_bluetooth", "toggle_do_not_disturb",
     "shutdown_system", "restart_system", "set_timer", "cancel_timer", "quick_note",
-    "start_routine",
+    "start_routine", "gesture_mode_on", "gesture_mode_off",
 })
 SIDE_EFFECT_MIN_SCORE = 0.55
 SIDE_EFFECT_MIN_MARGIN = 0.08
@@ -394,6 +406,9 @@ _READ_ONLY_CUES: Dict[str, "re.Pattern[str]"] = {k: re.compile(v) for k, v in {
     "island_prev_page": r"\b(?:page|card|island)\b",
     "island_show_page": r"\b(?:" + _PAGES + r")\b",
     "island_toggle_expand": r"\b(?:island|card|expand|collapse)\b",
+    # Not read-only: gesture mode needs an explicit camera/gesture word, never a fuzzy "turn on ..." match.
+    "gesture_mode_on": r"\b(?:gestures?|camera|webcam)\b",
+    "gesture_mode_off": r"\b(?:gestures?|camera|webcam)\b",
 }.items()}
 # Not read-only, but clean_slate hides every window and enters standby (BUG-F2): it needs one of its own
 # explicit phrases in the utterance, never a fuzzy near-match such as a bare "execute".
@@ -934,6 +949,9 @@ def _get_action_label(action: str, args: Dict[str, Any]) -> str:
         "island_toggle_expand": "Toggle Island Expand",
         "island_toggle_tracking": "Toggle Hand Tracking",
         "island_set_pin": "Pin Dynamic Island",
+        "gesture_mode_on": "Gesture Mode On",
+        "gesture_mode_off": "Gesture Mode Off",
+        "site_search": "Site Search",
     }
     if action == "island_show_page" and "page" in args:
         return f"Show {args['page'].title()} Page"
@@ -1097,6 +1115,21 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
     if screen_awareness.is_screen_query(clean):
         return screen_awareness.analyze_screen(user_text, ctx)
 
+    # Site search ("search X on youtube", "youtube search X"): deterministic, never a fuzzy play_music/search
+    from commands import parse_site_search
+    site_hit = parse_site_search(clean)
+    if site_hit:
+        s_args = {"site": site_hit[0], "query": site_hit[1]}
+        executed, s_msg = execute_whitelisted_action("site_search", s_args, ctx)
+        if executed:
+            try:
+                get_context_resolver().record_turn(user_utterance=user_text, resolved_action="site_search",
+                                                   arguments=s_args)
+            except Exception:
+                pass
+            return s_msg
+        return None
+
     # Check for close-scoring candidates or entity ambiguity (Disambiguation Engine)
     ambig_cands = check_ambiguity_candidates(clean)
     if ambig_cands and len(ambig_cands) >= 2:
@@ -1246,7 +1279,17 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
     elif action == "island_toggle_expand":
         reply = "Toggling Dynamic Island expansion, sir."
     elif action == "island_toggle_tracking":
-        reply = "Toggling hand tracking, sir."
+        from commands import gesture_mode_state
+        g_state = gesture_mode_state(ctx)
+        if g_state is not None:   # host supports gesture mode: "toggle tracking" toggles it
+            action, args = "gesture_mode", {"enabled": not g_state}
+            reply = "Gesture mode on." if not g_state else "Gesture mode off, camera released."
+        else:
+            reply = "Toggling hand tracking, sir."
+    elif action in ("gesture_mode_on", "gesture_mode_off"):
+        g_on = action == "gesture_mode_on"
+        action, args = "gesture_mode", {"enabled": g_on}
+        reply = "Gesture mode on." if g_on else "Gesture mode off, camera released."
     elif action == "island_set_pin":
         pinned = not ("unpin" in clean or "don't pin" in clean or "do not pin" in clean)
         args = {"pinned": pinned}

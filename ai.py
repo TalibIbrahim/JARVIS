@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Any, Iterator, Union, Callable
 
 
@@ -101,6 +102,7 @@ WHITELIST_ACTIONS = {
     "open_app",
     "open_site",
     "search",
+    "site_search",
     "screenshot",
     "lock_workstation",
     "show_desktop",
@@ -173,6 +175,8 @@ WHITELIST_ACTIONS = {
     "island_toggle_expand",
     "island_toggle_tracking",
     "island_set_pin",
+    # Gesture mode (camera on/off for hand control)
+    "gesture_mode",
 }
 
 # Action argument validation schemas
@@ -204,6 +208,7 @@ ACTION_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "open_app": {"app": str},
     "open_site": {"site": str},
     "search": {"query": str},
+    "site_search": {"site": str, "query": str},
     "play_music": {"query": str, "platform": str},
     "open_folder": {"folder": str},
     "open_file": {"file": str},
@@ -241,6 +246,7 @@ ACTION_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "island_toggle_expand": {},
     "island_toggle_tracking": {},
     "island_set_pin": {"pinned": bool},
+    "gesture_mode": {"enabled": bool},
 }
 
 
@@ -350,6 +356,20 @@ def validate_action_arguments(action: str, args: Dict[str, Any]) -> Tuple[bool, 
         else:
             pinned = bool(pinned)
         sanitized["pinned"] = pinned
+    elif action == "site_search":
+        from commands import resolve_search_site
+        site = resolve_search_site(str(args.get("site", "")))
+        query = " ".join(str(args.get("query", "")).split())
+        if not site:
+            return False, f"Site '{args.get('site', '')}' is not a supported search site", {}
+        if not query:
+            return False, "Argument 'query' cannot be empty", {}
+        sanitized["site"], sanitized["query"] = site, query
+    elif action == "gesture_mode":
+        en = args.get("enabled", True)
+        if isinstance(en, str):
+            en = en.lower() not in ("false", "0", "no", "off")
+        sanitized["enabled"] = bool(en)
 
     return True, "Valid", sanitized
 
@@ -529,6 +549,255 @@ class SimpleRateLimiter:
 
             self.timestamps.append(now)
 
+    def reset(self) -> None:
+        with self._lock:
+            self.timestamps.clear()
+            self.retry_after_until = 0.0
+
+
+# =====================================================================
+# Process-wide shared Groq state: rate limiters, response caches, usage
+# =====================================================================
+# Every call site builds its own GroqClient (voice STT, commands LLM/vision, quick answers), so the
+# limiter, caches and usage counter live here at module level and every instance shares them.
+# Groq's free tier limits per model family, so each request kind has its own window.
+
+_SHARED_LIMITERS: Dict[str, SimpleRateLimiter] = {
+    "stt": SimpleRateLimiter(max_requests_per_minute=20),
+    "llm": SimpleRateLimiter(max_requests_per_minute=25),
+    "vision": SimpleRateLimiter(max_requests_per_minute=25),
+    "other": SimpleRateLimiter(max_requests_per_minute=25),
+}
+
+
+def get_shared_rate_limiter(kind: str = "llm") -> SimpleRateLimiter:
+    return _SHARED_LIMITERS.get(kind) or _SHARED_LIMITERS["other"]
+
+
+# --- daily usage counter ---------------------------------------------------------------
+_USAGE_KINDS = ("stt", "llm", "vision", "other", "cache_hits")
+_USAGE_LOCK = threading.Lock()
+_USAGE: Dict[str, Any] = {}
+
+
+def _cache_dir() -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "JARVIS", "cache")
+
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _usage_path() -> str:
+    return os.path.join(_cache_dir(), "groq_usage.json")
+
+
+def _usage_roll_locked() -> None:
+    """Make _USAGE describe today (loading today's persisted counts on first use)."""
+    today = datetime.date.today().isoformat()
+    if _USAGE.get("date") == today:
+        return
+    loaded: Dict[str, Any] = {}
+    if not _USAGE:
+        try:
+            with open(_usage_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("date") == today:
+                loaded = data
+        except Exception:
+            pass
+    _USAGE.clear()
+    _USAGE["date"] = today
+    for k in _USAGE_KINDS:
+        try:
+            _USAGE[k] = max(0, int(loaded.get(k, 0)))
+        except (TypeError, ValueError):
+            _USAGE[k] = 0
+
+
+def record_groq_usage(kind: str) -> None:
+    """Count one Groq request (or answer-cache hit) for today; logged so the user can see usage."""
+    kind = kind if kind in _USAGE_KINDS else "other"
+    with _USAGE_LOCK:
+        _usage_roll_locked()
+        _USAGE[kind] = int(_USAGE.get(kind, 0)) + 1
+        snapshot = dict(_USAGE)
+    _atomic_write_json(_usage_path(), snapshot)
+    try:
+        import jarvis_log
+        jarvis_log.get_logger("ai").info(
+            "groq usage today: stt=%d llm=%d vision=%d other=%d (answer-cache hits=%d)",
+            snapshot["stt"], snapshot["llm"], snapshot["vision"], snapshot["other"], snapshot["cache_hits"])
+    except Exception:
+        pass
+
+
+def groq_usage_today() -> Dict[str, Any]:
+    """Today's Groq request counts by kind: {'date', 'stt', 'llm', 'vision', 'other', 'cache_hits', 'total'}."""
+    with _USAGE_LOCK:
+        _usage_roll_locked()
+        out = dict(_USAGE)
+    out["total"] = sum(int(out.get(k, 0)) for k in ("stt", "llm", "vision", "other"))
+    return out
+
+
+# --- shared exact-request chat cache (GroqClient.chat non-stream) -----------------------
+_CHAT_CACHE_MAX = 256
+_CHAT_CACHE: "OrderedDict[Tuple, Tuple[str, float]]" = OrderedDict()
+_CHAT_CACHE_LOCK = threading.Lock()
+
+
+# --- normalized-question answer cache (LLM Q&A that does not depend on context) ----------
+ANSWER_CACHE_MAX = 256
+ANSWER_TTL_FACTUAL = 6 * 3600.0
+ANSWER_TTL_DEFAULT = 15 * 60.0
+_ANSWER_CACHE: "OrderedDict[str, Tuple[str, float, float]]" = OrderedDict()  # key -> (answer, stored_at, ttl)
+_ANSWER_LOCK = threading.Lock()
+_ANSWER_LOADED = False
+
+_RE_Q_PUNCT = re.compile(r"[^\w\s']")
+_RE_Q_LEAD = re.compile(
+    r"^(?:(?:hey|ok|okay)\s+jarvis|jarvis|please|so|um+|uh+|hey|ok|okay|well|just|kindly|"
+    r"can you(?: please)?|could you(?: please)?|would you(?: please)?|"
+    r"do you know|i want to know|i'd like to know|tell me)\b\s*")
+_RE_Q_TRAIL = re.compile(r"\s*\b(?:please|jarvis|sir|thanks|thank you)$")
+# Anything that makes an answer depend on the moment, the user, the screen or earlier turns.
+_RE_Q_UNCACHEABLE = re.compile(
+    r"\b(?:now|today|tonight|tomorrow|yesterday|currently|current|latest|recent|recently|right now|"
+    r"this (?:week|month|year|morning|evening|afternoon)|next (?:week|month|year)|last (?:week|month|year|night)|"
+    r"time|date|day|clock|weather|forecast|temperature|rain|news|score|scores|price|stock|stocks|"
+    r"i|i'm|im|i've|me|my|mine|myself|we|us|our|you|your|yours|"
+    r"it|its|it's|this|that|these|those|he|she|him|her|his|hers|they|them|their|"
+    r"again|else|more|another|also|too|instead|other|same|previous|before|earlier|above|"
+    r"joke|jokes|story|riddle|poem|random|surprise|fun fact|something|anything|"
+    r"screen|camera|clipboard|file|folder|window|playing|song|volume|timer|alarm|remind)\b")
+_RE_Q_FACTUAL = re.compile(
+    r"^(?:who|what|when|where|which|why|how (?:many|much|far|long|old|tall|big|does|do|is|are|did)|"
+    r"define|explain|what's|whats|who's|whos|where's|is|are|does|do|did|can)\b")
+
+
+def normalize_question(text: str) -> str:
+    """Cache key for a spoken question: lowercase, no punctuation, wake word and filler stripped."""
+    t = _RE_Q_PUNCT.sub(" ", str(text or "").lower().replace("’", "'"))
+    t = " ".join(t.split())
+    for _ in range(6):
+        nxt = _RE_Q_TRAIL.sub("", _RE_Q_LEAD.sub("", t, count=1)).strip()
+        if nxt == t:
+            break
+        t = nxt
+    return t
+
+
+def is_cacheable_question(text: str) -> bool:
+    """True for a self-contained question whose answer does not depend on time, the user or history."""
+    q = normalize_question(text)
+    if not q or len(q) > 160 or len(q.split()) < 2:
+        return False
+    return not _RE_Q_UNCACHEABLE.search(q)
+
+
+def _answer_cache_path() -> str:
+    return os.path.join(_cache_dir(), "answers.json")
+
+
+def _answer_load_locked() -> None:
+    global _ANSWER_LOADED
+    if _ANSWER_LOADED:
+        return
+    _ANSWER_LOADED = True
+    try:
+        with open(_answer_cache_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        now = time.time()
+        for row in (data if isinstance(data, list) else [])[-ANSWER_CACHE_MAX:]:
+            key, ans, ts, ttl = str(row[0]), str(row[1]), float(row[2]), float(row[3])
+            if key and ans and now - ts < ttl:
+                _ANSWER_CACHE[key] = (ans, ts, ttl)
+    except Exception:
+        pass
+
+
+def answer_cache_get(question: str) -> Optional[str]:
+    """Cached answer for a cacheable question, or None (also None for anything context-dependent)."""
+    if not is_cacheable_question(question):
+        return None
+    key = normalize_question(question)
+    with _ANSWER_LOCK:
+        _answer_load_locked()
+        hit = _ANSWER_CACHE.get(key)
+        if hit is None:
+            return None
+        ans, ts, ttl = hit
+        if time.time() - ts >= ttl:
+            del _ANSWER_CACHE[key]
+            return None
+        _ANSWER_CACHE.move_to_end(key)
+    record_groq_usage("cache_hits")
+    return ans
+
+
+def answer_cache_put(question: str, answer: str) -> bool:
+    """Store an LLM answer for a cacheable question (factual questions keep for 6 h). Returns True if stored."""
+    answer = str(answer or "").strip()
+    if not answer or not is_cacheable_question(question):
+        return False
+    key = normalize_question(question)
+    ttl = ANSWER_TTL_FACTUAL if _RE_Q_FACTUAL.match(key) else ANSWER_TTL_DEFAULT
+    with _ANSWER_LOCK:
+        _answer_load_locked()
+        _ANSWER_CACHE[key] = (answer, time.time(), ttl)
+        _ANSWER_CACHE.move_to_end(key)
+        while len(_ANSWER_CACHE) > ANSWER_CACHE_MAX:
+            _ANSWER_CACHE.popitem(last=False)
+        rows = [[k, a, ts, t] for k, (a, ts, t) in _ANSWER_CACHE.items()]
+    _atomic_write_json(_answer_cache_path(), rows)
+    return True
+
+
+def clear_answer_cache() -> None:
+    with _ANSWER_LOCK:
+        _ANSWER_CACHE.clear()
+    _atomic_write_json(_answer_cache_path(), [])
+
+
+def reset_shared_groq_state() -> None:
+    """Clear limiters, caches and today's usage counts (tests; also safe at runtime). Disk is not reloaded."""
+    global _ANSWER_LOADED
+    for lim in _SHARED_LIMITERS.values():
+        lim.reset()
+    with _CHAT_CACHE_LOCK:
+        _CHAT_CACHE.clear()
+    with _ANSWER_LOCK:
+        _ANSWER_CACHE.clear()
+        _ANSWER_LOADED = True
+    with _USAGE_LOCK:
+        _USAGE.clear()
+        _USAGE["date"] = datetime.date.today().isoformat()
+        _USAGE.update({k: 0 for k in _USAGE_KINDS})
+
+
+def rate_limit_reply(exc: Any = None) -> str:
+    """Spoken reply for a rate-limited request that says how long to wait."""
+    wait = getattr(exc, "retry_after", None)
+    try:
+        secs = int(-(-float(wait) // 1)) if wait is not None else 0
+    except (TypeError, ValueError):
+        secs = 0
+    if secs <= 0:
+        return "Groq rate limit reached, sir. Try again in a moment."
+    if secs >= 90:
+        mins = -(-secs // 60)
+        return f"Groq rate limit reached, sir. Try again in {mins} minutes."
+    return f"Groq rate limit reached, sir. Try again in {secs} second{'s' if secs != 1 else ''}."
+
 
 # =====================================================================
 # GroqClient
@@ -559,9 +828,21 @@ class GroqClient:
         self.session = session or get_persistent_session()
         self.max_retries = max_retries
         self.cache_ttl = cache_ttl
-        self._response_cache: Dict[Tuple, Tuple[str, float]] = {}
-        self._cache_lock = threading.Lock()
-        self.rate_limiter = SimpleRateLimiter(max_requests_per_minute=25)
+        # Shared across every GroqClient in the process (see _SHARED_LIMITERS / _CHAT_CACHE).
+        self._response_cache = _CHAT_CACHE
+        self._cache_lock = _CHAT_CACHE_LOCK
+        self.rate_limiter = get_shared_rate_limiter("llm")
+        self.stt_rate_limiter = get_shared_rate_limiter("stt")
+        self.vision_rate_limiter = get_shared_rate_limiter("vision")
+        self.other_rate_limiter = get_shared_rate_limiter("other")
+
+    def _acquire(self, kind: str) -> SimpleRateLimiter:
+        """Takes a slot in the shared per-kind limiter (raises RateLimitError) and counts today's usage."""
+        limiter = {"llm": self.rate_limiter, "stt": self.stt_rate_limiter,
+                   "vision": self.vision_rate_limiter}.get(kind, self.other_rate_limiter)
+        limiter.acquire()
+        record_groq_usage(kind)
+        return limiter
 
     def _post(self, url: str, **kwargs) -> Any:
         _get_orig_requests()
@@ -636,7 +917,7 @@ class GroqClient:
             "User-Agent": "JARVIS-Assistant/1.1",
         }
 
-    def _handle_response_error(self, resp: requests.Response) -> None:
+    def _handle_response_error(self, resp: requests.Response, limiter: Optional[SimpleRateLimiter] = None) -> None:
         if resp.status_code == 401:
             raise AuthenticationError("Invalid Groq API key (401 Unauthorized)")
         elif resp.status_code == 429:
@@ -647,7 +928,7 @@ class GroqClient:
                     wait_sec = float(retry_after)
                 except ValueError:
                     pass
-            self.rate_limiter.record_retry_after(wait_sec)
+            (limiter or self.rate_limiter).record_retry_after(wait_sec)
             raise RateLimitError("Groq API rate limit reached (429)", retry_after=wait_sec)
         else:
             try:
@@ -664,7 +945,7 @@ class GroqClient:
         Endpoint: POST /audio/transcriptions
         Uses acoustic vocabulary biasing prompt to boost recognition of Jarvis wake words and PC commands.
         """
-        self.rate_limiter.acquire()
+        limiter = self._acquire("stt")
         headers = self._get_headers()
         url = f"{self.base_url}/audio/transcriptions"
         files = {
@@ -694,7 +975,7 @@ class GroqClient:
         resp = self._request_with_retry("POST", url, headers=headers, files=files, data=data, timeout=self.timeout)
 
         if resp.status_code != 200:
-            self._handle_response_error(resp)
+            self._handle_response_error(resp, limiter)
 
         try:
             res_json = resp.json()
@@ -709,7 +990,7 @@ class GroqClient:
         Streams chat completion tokens as Server-Sent Events (SSE).
         Yields individual text content chunks in real time as they arrive.
         """
-        self.rate_limiter.acquire()
+        self._acquire("llm")
         headers = self._get_headers()
         headers["Content-Type"] = "application/json"
         url = f"{self.base_url}/chat/completions"
@@ -790,11 +1071,12 @@ class GroqClient:
                     if cache_key in self._response_cache:
                         cached_val, ts = self._response_cache[cache_key]
                         if time.time() - ts < self.cache_ttl:
+                            self._response_cache.move_to_end(cache_key)
                             return cached_val
                         else:
                             del self._response_cache[cache_key]
 
-        self.rate_limiter.acquire()
+        self._acquire("llm")
         headers = self._get_headers()
         headers["Content-Type"] = "application/json"
         url = f"{self.base_url}/chat/completions"
@@ -831,10 +1113,10 @@ class GroqClient:
             content = res_json["choices"][0]["message"]["content"].strip()
             if cache_key:
                 with self._cache_lock:
-                    if len(self._response_cache) >= 512:
-                        oldest = min(self._response_cache.keys(), key=lambda k: self._response_cache[k][1])
-                        del self._response_cache[oldest]
                     self._response_cache[cache_key] = (content, time.time())
+                    self._response_cache.move_to_end(cache_key)
+                    while len(self._response_cache) > _CHAT_CACHE_MAX:
+                        self._response_cache.popitem(last=False)
             return content
         except Exception as exc:
             raise InvalidResponseError("Failed to parse chat completion response") from exc
@@ -850,7 +1132,7 @@ class GroqClient:
         - raw JPEG bytes
         - base64 data URL string
         """
-        self.rate_limiter.acquire()
+        limiter = self._acquire("vision")
         headers = self._get_headers()
         headers["Content-Type"] = "application/json"
         url = f"{self.base_url}/chat/completions"
@@ -926,7 +1208,7 @@ class GroqClient:
         resp = self._request_with_retry("POST", url, headers=headers, json=payload, timeout=self.timeout)
 
         if resp.status_code != 200:
-            self._handle_response_error(resp)
+            self._handle_response_error(resp, limiter)
 
         try:
             res_json = resp.json()
@@ -939,14 +1221,14 @@ class GroqClient:
         Queries available models from Groq.
         Endpoint: GET /models
         """
-        self.rate_limiter.acquire()
+        limiter = self._acquire("other")
         headers = self._get_headers()
         url = f"{self.base_url}/models"
 
         resp = self._request_with_retry("GET", url, headers=headers, timeout=self.timeout)
 
         if resp.status_code != 200:
-            self._handle_response_error(resp)
+            self._handle_response_error(resp, limiter)
 
         try:
             data = resp.json()
@@ -1163,7 +1445,11 @@ def build_system_prompt(ctx: Any = None) -> str:
         "   - 'previous_track' (args: {})\n"
         "   - 'open_app' (args: {'app': '<name>'}) [Allowed: chrome, edge, firefox, notepad, calculator, paint, file explorer, terminal, cmd, vs code, settings, task manager, spotify, word, excel, powerpoint]\n"
         "   - 'open_site' (args: {'site': '<name>'}) [Allowed: youtube, google, github, gmail, maps, linkedin]\n"
-        "   - 'search' (args: {'query': '<terms>'})\n"
+        "   - 'search' (args: {'query': '<terms>'}) Google web search.\n"
+        "   - 'site_search' (args: {'site': '<site>', 'query': '<terms>'}) Search one site "
+        "[Allowed sites: youtube, google, bing, duckduckgo, wikipedia, reddit, amazon, github, stackoverflow, "
+        "twitch, spotify, maps, images, news, steam, ebay, imdb, twitter, linkedin]\n"
+        "   - 'gesture_mode' (args: {'enabled': true | false}) Turn camera hand-gesture control on or off.\n"
         "   - 'screenshot' (args: {})\n"
         "   - 'lock_workstation' (args: {})\n"
         "   - 'show_desktop' (args: {})\n"
@@ -1548,6 +1834,14 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
                 webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(query))
                 return True, f"Searched for {query}"
             return False, "Empty search query"
+
+        elif action == "site_search":
+            from commands import open_site_search
+            return open_site_search(str(args.get("site", "")), str(args.get("query", "")))
+
+        elif action == "gesture_mode":
+            from commands import set_gesture_mode
+            return set_gesture_mode(ctx, bool(args.get("enabled", True)))
 
         elif action == "play_music":
             from commands import play_media
@@ -1947,6 +2241,11 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             return True, f"Dynamic Island {state_str}"
 
         elif action == "island_toggle_tracking":
+            # "toggle tracking" toggles gesture mode (camera on/off) when the host supports it.
+            from commands import set_gesture_mode, gesture_mode_state
+            state = gesture_mode_state(ctx)
+            if state is not None:
+                return set_gesture_mode(ctx, not state)
             from island_manager import get_island_page_manager
             mgr = get_island_page_manager()
             tracking = mgr.toggle_tracking()

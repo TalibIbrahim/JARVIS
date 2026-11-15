@@ -341,7 +341,10 @@ def get_quick_answer(query: str, ctx: Any = None) -> Optional[str]:
     if not _ai_allowed(ctx):
         return None
     try:
-        from ai import get_api_key, GroqClient, DEFAULT_LLM_MODEL
+        from ai import get_api_key, GroqClient, DEFAULT_LLM_MODEL, answer_cache_get, answer_cache_put
+        cached = answer_cache_get(query)
+        if cached:
+            return cached
         api_key = get_api_key()
         if api_key:
             client = GroqClient(api_key=api_key, timeout=5)
@@ -353,6 +356,7 @@ def get_quick_answer(query: str, ctx: Any = None) -> Optional[str]:
             messages = [{"role": "user", "content": prompt}]
             reply = client.chat(messages, model=DEFAULT_LLM_MODEL, temperature=0.3, json_mode=False)
             if reply:
+                answer_cache_put(query, reply)
                 return reply
     except Exception as exc:
         print(f"[quick_answers] Groq fallback note: {exc}")

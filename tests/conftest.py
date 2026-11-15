@@ -105,6 +105,11 @@ def _isolate_user_state(tmp_path_factory):
     except Exception:
         pl = None
 
+    # ai.py keeps process-wide Groq rate limiters / answer caches / usage counts: start each test clean.
+    _ai = sys.modules.get("ai")
+    if _ai is not None and hasattr(_ai, "reset_shared_groq_state"):
+        _ai.reset_shared_groq_state()
+
     try:
         yield
     finally:
