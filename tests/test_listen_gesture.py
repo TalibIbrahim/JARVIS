@@ -74,18 +74,18 @@ def test_disabled_by_config():
 
 
 def _tracker_dispatch_loop():
-    """Compile the REAL `for action in self.engine.update(...)` loop out of Tracker._run_body (the loop
+    """Compile the REAL `for action in self.engine.update(...)` loop out of Tracker._session (the loop
     needs a camera to run in place, so it is extracted by AST and executed against fakes)."""
     import ast
     import inspect
     import textwrap
     import tracker
-    tree = ast.parse(textwrap.dedent(inspect.getsource(tracker.Tracker._run_body)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(tracker.Tracker._session)))
     for node in ast.walk(tree):
         if (isinstance(node, ast.For) and isinstance(node.iter, ast.Call)
                 and ast.unparse(node.iter.func) == "self.engine.update"):
             return compile(ast.Module(body=[node], type_ignores=[]), "tracker_loop", "exec")
-    raise AssertionError("dispatch loop not found in Tracker._run_body")
+    raise AssertionError("dispatch loop not found in Tracker._session")
 
 
 def _run_loop(actions, voice):

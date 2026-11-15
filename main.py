@@ -80,7 +80,43 @@ class Context:
     def set_tracking_paused(self, paused):
         """paused=True puts the gesture engine in standby; False wakes it. Applied on the next engine update."""
         _jlog.get_logger("main").info("tracking %s via island", "paused" if paused else "resumed")
+        if not paused and not self.gesture_mode_on():
+            self.set_gesture_mode(True)     # resuming with the camera off must open it
+            return
         self.engine.request(not bool(paused))
+
+    # ---- gesture mode (camera on-demand) ----
+    def set_gesture_mode(self, on):
+        """on=True opens the camera and wakes the gesture engine; on=False releases the camera and
+        puts the engine in standby. Safe to call from any thread."""
+        on = bool(on)
+        _jlog.get_logger("main").info("gesture mode %s", "on" if on else "off")
+        tr = self.tracker
+        if tr is not None and hasattr(tr, "set_camera_wanted"):
+            tr.set_camera_wanted(on)
+        self.engine.request(on)
+        self.overlay.post("gesture_mode", on=on)
+        self.say("Gesture mode on." if on else "Camera off.")
+
+    def gesture_mode_on(self):
+        tr = self.tracker
+        if tr is not None and hasattr(tr, "camera_wanted"):
+            return bool(tr.camera_wanted)
+        return bool(getattr(self.cfg, "camera_autostart", False))
+
+    def snapshot_frame(self, timeout=3.0):
+        """One BGR frame for vision queries (opens the camera briefly if it is off). None on failure."""
+        tr = self.tracker
+        if tr is None or not hasattr(tr, "snapshot_frame"):
+            return None
+        return tr.snapshot_frame(timeout)
+
+    def gesture_mode_auto_off(self):
+        """Called by the Tracker when the idle timeout turned the camera off: quiet notice, no speech."""
+        _jlog.get_logger("main").info("gesture mode off (idle timeout)")
+        self.engine.request(False)
+        self.overlay.post("gesture_mode", on=False, auto=True)
+        self.overlay.post("say", text="Camera off (idle).", speak=False)
 
     def is_tracking_paused(self):
         pending = getattr(self.engine, "_req", None)
@@ -937,11 +973,23 @@ def main():
             interval=1.0,
         )
 
+        def _hotkey_gesture_toggle():
+            if not ctx.gesture_mode_on():
+                ctx.set_gesture_mode(True)
+                return
+            # Camera already on: the toggle flips wake/standby; going to standby also releases the camera.
+            pending = getattr(engine, "_req", None)
+            active = (pending if pending not in (None, "toggle") else bool(getattr(engine, "active", True)))
+            if active:
+                ctx.set_gesture_mode(False)
+            else:
+                engine.request(True)
+
         # Global hotkeys: Ctrl+Alt+J toggles wake/standby, Ctrl+Alt+Q quits.
         try:
             from pynput import keyboard
             hotkeys = keyboard.GlobalHotKeys({
-                "<ctrl>+<alt>+j": engine.request_toggle,
+                "<ctrl>+<alt>+j": _hotkey_gesture_toggle,
                 "<ctrl>+<alt>+q": stop.set,
             })
             hotkeys.daemon = True

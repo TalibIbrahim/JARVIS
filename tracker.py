@@ -1,4 +1,5 @@
 """Camera + MediaPipe hand tracking loop. Feeds landmarks to the gesture engine."""
+import gc
 import sys
 import threading
 import time
@@ -352,6 +353,10 @@ class FrameGrabber(threading.Thread):
             raise
         else:
             jarvis_log.thread_exited("FrameGrabber")
+        finally:
+            # The grabber thread owns the capture: release it here so an on-demand camera-off frees
+            # the device without any other thread touching a capture mid-read.
+            self.release()
 
     def _run_body(self):
         if not self.cap or not self.opened:
@@ -483,11 +488,79 @@ class Tracker(threading.Thread):
         self._flip_buf = None
         self._rgb_buf = None
         self._preview_overlay_buf = None
+        # Camera on-demand: the thread never exits while the camera is off; it idles on _want.
+        self._want = threading.Event()
+        if getattr(cfg, "camera_autostart", False) or not getattr(cfg, "threaded_capture", True):
+            self._want.set()
+        self._cam_lock = threading.Lock()   # serializes real-grabber open/close vs one-shot snapshots
+        self._auto_off = False
+
+    # ---- camera on-demand ----
+    def set_camera_wanted(self, on: bool):
+        """Thread-safe. on=True opens camera + MediaPipe; on=False releases both (thread stays alive)."""
+        if on:
+            self._auto_off = False
+            self._want.set()
+        else:
+            self._want.clear()
+
+    @property
+    def camera_wanted(self) -> bool:
+        return self._want.is_set()
+
+    def snapshot_frame(self, timeout: float = 3.0):
+        """One good BGR frame for a vision query. Uses the live feed when the camera is on; otherwise
+        briefly opens the device (no MediaPipe), skips warm-up/dark frames, releases and returns it.
+        Returns None on failure/timeout."""
+        deadline = time.perf_counter() + max(0.0, float(timeout))
+        while True:
+            if self._want.is_set():
+                g = self._grabber
+                if g is not None:
+                    frame, _ = g.get_latest()
+                    if frame is not None:
+                        return frame.copy()
+                if time.perf_counter() >= deadline or self.stop.wait(0.05):
+                    return None
+                continue
+            if not self._cam_lock.acquire(timeout=max(0.0, deadline - time.perf_counter())):
+                return None
+            try:
+                if self._want.is_set():
+                    continue    # camera turned on while we waited for the lock: use the live feed
+                return self._snapshot_one_shot(deadline)
+            finally:
+                self._cam_lock.release()
+
+    def _snapshot_one_shot(self, deadline):
+        warmup, max_frames, min_mean = 5, 45, 12.0
+        g = FrameGrabber(self.cfg, threading.Event())
+        if not g.open_camera():
+            _tlog.warning("snapshot_frame: camera could not be opened")
+            return None
+        try:
+            best = None
+            n = 1   # the frame open_camera() validated counts as the first warm-up frame
+            first, _ = g.get_latest()
+            if first is not None:
+                best = first.copy()
+            while n < max_frames and time.perf_counter() < deadline:
+                ok, frame = g.cap.read()
+                n += 1
+                if not ok or frame is None or getattr(frame, "size", 0) == 0:
+                    continue
+                best = frame.copy()
+                if n > warmup and float(frame.mean()) >= min_mean:
+                    break
+            return best
+        finally:
+            g.release()
 
     def get_latest_frame(self, unmirrored: bool = True):
         """Returns the latest captured camera frame (BGR) for vision inspection."""
-        if self._grabber:
-            frame, _ = self._grabber.get_latest()
+        grabber = self._grabber
+        if grabber:
+            frame, _ = grabber.get_latest()
             if frame is not None:
                 return frame.copy() if unmirrored else cv2.flip(frame, 1)
         with self._frame_lock:
@@ -497,12 +570,17 @@ class Tracker(threading.Thread):
 
     def camera_state(self):
         """("ok"|"opening"|"reconnecting"|"stalled"|"down", reason) for the supervisor health summary."""
-        if self._grabber is not None:
-            return self._grabber.camera_state()
+        grabber = self._grabber
+        if grabber is not None:
+            return grabber.camera_state()
         if self.ident is not None and not self.is_alive():
             return "down", "Tracker thread not running"
+        if not self._want.is_set():
+            return "off", "idle timeout" if self._auto_off else "camera off"
         if self.ident is None:
             return "opening", "tracker not started"
+        if getattr(self.cfg, "threaded_capture", True):
+            return "opening", "camera starting"
         return "ok", "non-threaded capture"
 
     def reload_config(self, cfg=None):
@@ -534,17 +612,54 @@ class Tracker(threading.Thread):
         finally:
             self._release_dead_grabber()
 
+    def _idle_wait(self):
+        """Camera off: no grabber, no MediaPipe. Block on the wanted-Event, beating heartbeats so the
+        supervisor does not see a stall (and never exits, so it is not restarted)."""
+        _tlog.info("camera off: idle (device and MediaPipe released)")
+        while not self.stop.is_set() and not self._want.is_set():
+            jarvis_log.heartbeat("Tracker", idle=True, active=bool(getattr(self.engine, "active", False)))
+            jarvis_log.heartbeat("FrameGrabber", idle=True)
+            self._want.wait(1.0)
+
+    def _teardown_grabber(self):
+        with self._cam_lock:
+            g = self._grabber
+            if g is None:
+                return
+            g.stop.set()
+            g.join(3.0)
+            if g.is_alive():
+                _tlog.error("FrameGrabber did not exit within 3 s (DSHOW read blocked?); capture NOT released")
+            else:
+                g.release()
+            self._grabber = None
+
     def _run_body(self):
+        use_threaded = getattr(self.cfg, "threaded_capture", True)
+        while not self.stop.is_set():
+            if use_threaded and not self._want.is_set():
+                self._idle_wait()
+                continue
+            self._session(use_threaded)
+            if not use_threaded:
+                return
+
+    def _session(self, use_threaded):
+        """One camera-on period: open camera + MediaPipe, track until stop or camera turned off."""
         global _ACTIVE_GRABBER_IDX
         cfg = self.cfg
-        use_threaded = getattr(cfg, "threaded_capture", True)
+        self._flip_buf = None
+        self._rgb_buf = None
+        self._preview_overlay_buf = None
 
         if use_threaded:
-            self._grabber = FrameGrabber(cfg, self.stop)
-            if not self._grabber.open_camera():
-                self.ctx.say("I can't open the camera, sir.")
-                self.overlay.post("error", text="CAMERA NOT FOUND")
-            self._grabber.start()
+            with self._cam_lock:
+                grabber = FrameGrabber(cfg, threading.Event())
+                if not grabber.open_camera():
+                    self.ctx.say("I can't open the camera, sir.")
+                    self.overlay.post("error", text="CAMERA NOT FOUND")
+                grabber.start()
+                self._grabber = grabber
         else:
             backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
             preferred = getattr(cfg, "camera_index", 0)
@@ -608,6 +723,7 @@ class Tracker(threading.Thread):
 
         hand_visible = False
         last_hand_seen_t = 0.0
+        last_activity_t = time.perf_counter()   # idle auto-off clock (hand seen / dragging)
         hb_next = 0.0
         last_frame_pc = time.perf_counter()
         n_hands = 0
@@ -623,6 +739,20 @@ class Tracker(threading.Thread):
                     inf_ms=round(self._inference_ms, 1),
                     frame_age_ms=int((now_loop - last_frame_pc) * 1000),
                     active=bool(getattr(self.engine, "active", False)), hands=n_hands)
+            if use_threaded:
+                if self.stop.is_set() or not self._want.is_set():
+                    break
+                _idle_to = float(getattr(self.cfg, "gesture_idle_timeout_s", 0.0) or 0.0)
+                if getattr(self.engine, "dragging", False):
+                    last_activity_t = now_loop
+                elif _idle_to > 0 and (now_loop - last_activity_t) >= _idle_to:
+                    _tlog.info("camera auto-off: no hand seen for %.0f s", _idle_to)
+                    self._auto_off = True
+                    self._want.clear()
+                    hook = getattr(self.ctx, "gesture_mode_auto_off", None)
+                    if callable(hook):
+                        hook()
+                    break
             # Adaptive rate: low-power scanning when no hand is in view;
             # jump to full 30 FPS rate instantly the moment a hand is detected,
             # with zero missed first gestures.
@@ -743,7 +873,7 @@ class Tracker(threading.Thread):
 
             now = time.time()
             if found:
-                last_hand_seen_t = time.perf_counter()
+                last_hand_seen_t = last_activity_t = time.perf_counter()
                 hand_visible = True
             else:
                 hand_visible = False
@@ -813,13 +943,21 @@ class Tracker(threading.Thread):
                     pass
                 preview_window_open = False
 
+        self.controller.handle(Action("lost"))   # failsafe: mouseUp + keyUp("ctrl") on off/exit
         hands.close()
-        if use_threaded and self._grabber:
-            self._grabber.release()
-        elif not use_threaded:
+        hands = None
+        if use_threaded:
+            self._teardown_grabber()
+        else:
             with _CAMERA_IO_LOCK:
                 cap.release()
                 _ACTIVE_GRABBER_IDX = None
+        self._flip_buf = None
+        self._rgb_buf = None
+        self._preview_overlay_buf = None
+        self._latest_raw_frame = None
+        if use_threaded:
+            gc.collect()    # hand the MediaPipe/frame memory back while the camera is off
 
         if preview_window_open:
             try:

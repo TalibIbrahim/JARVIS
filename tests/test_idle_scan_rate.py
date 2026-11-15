@@ -28,6 +28,10 @@ class _FakeGrabber:
 
     def __init__(self, *a, **k):
         self._n = 0
+        self.stop = threading.Event()
+
+    def join(self, timeout=None):
+        pass
 
     def open_camera(self):
         return True
@@ -87,6 +91,7 @@ def _drive(monkeypatch, engine_active, hand_in_first_frame, show_preview=False, 
 
     cfg = Config()
     cfg.threaded_capture = True
+    cfg.camera_autostart = True      # camera on-demand: default is off
     cfg.show_preview = show_preview
     engine = types.SimpleNamespace(active=engine_active, update=lambda found, now: [],
                                    status=lambda now: {"active": engine_active, "label": "", "progress": 0.0})

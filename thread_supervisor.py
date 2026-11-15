@@ -292,7 +292,8 @@ def _compute_health(tasks: List[SupervisedTask], engine=None, tracker=None, voic
         workers["Camera"] = cam[0]
         # "opening" is a normal startup state (DSHOW open takes ~3-4 s); a hung open is caught by the
         # FrameGrabber heartbeat never starting (stalled_names: 30 s grace), so it is not "down" here.
-        if cam[0] not in ("ok", "opening"):
+        # "off" = intentionally released (camera on-demand), not a fault.
+        if cam[0] not in ("ok", "opening", "off"):
             reasons.append(f"Camera {cam[0]}")
     mic = _call_state(voice, "mic_state")
     if mic is not None:
