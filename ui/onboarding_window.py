@@ -6,7 +6,9 @@ setup dialog (ui/onboarding.py); only the pages differ:
 
     hello -> name -> address -> voice sample -> usage + favorite apps -> privacy -> done
 
-Every question can be answered by voice (mic button -> ctx.voice.capture_answer) or typed.  Jarvis reads
+Every question can be answered by voice (mic button -> ctx.voice.capture_answer) or typed.  Skip skips
+just the current step; closing the window skips the rest.  With voice commands off the mics are hidden
+and the voice step offers "Turn on voice" (ctx.set_voice_enabled).  Jarvis reads
 each question aloud through ctx.say (when available).  Blocking voice calls run on worker threads and
 reach the GUI only through signals.
 
@@ -62,6 +64,8 @@ _SPOKEN = {
 }
 
 MAX_SUGGESTIONS = 12
+
+VOICE_OFF_FOOTNOTE = "Voice commands are off. Turn them on in Settings > Voice, or skip this step."
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -237,7 +241,7 @@ def _flow_layout():
 # ──────────────────────────────────────────────────────────────────────────────
 
 class OnboardingWindow(QDialog):
-    """Name, address, voice sample, usage, privacy.  Skippable; closing it counts as skipping."""
+    """Name, address, voice sample, usage, privacy.  Skip skips one step; closing it skips the rest."""
 
     _sig_level = Signal(float)
     _sig_answer = Signal(str, int, str)          # which, token, text
@@ -266,6 +270,10 @@ class OnboardingWindow(QDialog):
         self._apps_scanned = False
         self._sample_done = 0
         self._sample_ok = False
+        self._voice_wait_left = 0            # "Turn on voice" poll ticks remaining
+        self._voice_poll = QTimer(self)
+        self._voice_poll.setInterval(250)
+        self._voice_poll.timeout.connect(self._poll_voice_ready)
 
         self.setWindowTitle("Welcome to J.A.R.V.I.S.")
         self.setFixedSize(580, 520)
@@ -478,11 +486,17 @@ class OnboardingWindow(QDialog):
         self.voice_mic = MicButton(False, 46)
         self.voice_mic.clicked.connect(self._start_samples)
         row.addWidget(self.voice_mic)
+        self.btn_voice_on = PlainButton("Turn on voice")
+        self.btn_voice_on.setFixedWidth(128)
+        self.btn_voice_on.clicked.connect(self._turn_on_voice)
+        self.btn_voice_on.setVisible(False)
+        row.addWidget(self.btn_voice_on)
         row.addStretch()
         v.addLayout(row)
         if not self._voice_ok():
             self.voice_mic.setVisible(False)
-            card.set_footnote("Voice isn’t available right now, so you can skip this step.")
+            self.btn_voice_on.setVisible(callable(getattr(self.ctx, "set_voice_enabled", None)))
+            card.set_footnote(VOICE_OFF_FOOTNOTE)
         v.addStretch()
 
     def _build_usage(self) -> None:
@@ -590,9 +604,20 @@ class OnboardingWindow(QDialog):
             self._go(self._idx - 1)
 
     def skip(self) -> None:
-        """Skip the rest.  Whatever was already answered is kept."""
-        self._collect(PAGES[self._idx])
-        self.finish(skipped=True)
+        """Skip this step: keep whatever is already on it and go to the next page (like Continue, but
+        no answer is needed and in-flight voice work is dropped).  Closing the window skips the rest."""
+        pid = PAGES[self._idx]
+        if pid == "done":
+            self.finish(skipped=True)
+            return
+        if self._busy:
+            self._token += 1                          # drop the in-flight voice result
+            self._busy = None
+            for mic in (self.name_mic, self.apps_mic, self.voice_mic):
+                mic.set_active(False)
+            self.voice_meter.update_level(0.0)
+        self._collect(pid)
+        self._go(self._idx + 1)
 
     def _collect(self, pid: str) -> None:
         if pid == "name":
@@ -643,6 +668,7 @@ class OnboardingWindow(QDialog):
             return
         self._finished = True
         self._token += 1                              # drop any in-flight voice result
+        self._voice_poll.stop()
         self._save_profile()
         self._save_cfg("onboarding_done", True)
         self.completed = True
@@ -681,8 +707,50 @@ class OnboardingWindow(QDialog):
         return getattr(self.ctx, "voice", None) if self.ctx is not None else None
 
     def _voice_ok(self) -> bool:
+        cfg = getattr(self.ctx, "cfg", None)          # live config (set_voice_enabled updates it)
+        if cfg is None:
+            cfg = self.cfg
+        if getattr(cfg, "voice_enabled", True) is False:
+            return False
         v = self._voice()
         return v is not None and callable(getattr(v, "capture_answer", None))
+
+    def _turn_on_voice(self) -> None:
+        """Voice step, voice off: ctx.set_voice_enabled(True), then poll (<= 5 s) until ctx.voice is up."""
+        fn = getattr(self.ctx, "set_voice_enabled", None)
+        if not callable(fn) or self._voice_poll.isActive():
+            return
+        try:
+            fn(True)
+        except Exception as exc:
+            print(f"[onboarding] set_voice_enabled failed: {exc}")
+            return
+        self.btn_voice_on.setEnabled(False)
+        self._voice_wait_left = 20                    # 20 x 250 ms = 5 s
+        self._poll_voice_ready()
+        if not self._voice_ok():
+            self._voice_poll.start()
+
+    def _poll_voice_ready(self) -> None:
+        if self._voice_ok():
+            self._voice_poll.stop()
+            self._enable_voice_ui()
+            return
+        self._voice_wait_left -= 1
+        if self._voice_wait_left <= 0:
+            self._voice_poll.stop()
+            self.btn_voice_on.setEnabled(True)        # still off: let the user try again or skip
+
+    def _enable_voice_ui(self) -> None:
+        if self._finished:
+            return
+        self.btn_voice_on.setVisible(False)
+        for mic in (self.name_mic, self.apps_mic, self.voice_mic):
+            mic.setVisible(True)
+        self._name_hint = "Tap the mic to answer by voice. Press Enter to continue."
+        if self._busy != "name":
+            self.name_card.set_footnote(self._name_hint)
+        self.voice_card.set_footnote("Used only to tune recognition to you. Stays on this PC.")
 
     def _level_cb(self, token: int) -> Callable:
         def _cb(level=0.0, *_a):

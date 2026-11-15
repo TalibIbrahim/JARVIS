@@ -59,6 +59,58 @@ class Context:
         self._sys_lock = threading.Lock()
         self._sys_pause_reasons = set()
         self._gesture_before_pause = False
+        # Live voice on/off (set_voice_enabled). _voice_on is the applied state; _voice_user_off marks a
+        # user "off" so unlock/resume (system_resume) does not reopen the mic.
+        self._voice_lock = threading.Lock()
+        self._voice_on = bool(getattr(cfg, "voice_enabled", True)) if cfg is not None else True
+        self._voice_user_off = not self._voice_on
+        self._voice_starter = None          # main() installs it: registers + starts the Voice task
+        self._voice_registered = False
+
+    # ---- voice on/off (Settings switch, onboarding "Turn on voice") ----
+    def install_voice_starter(self, starter):
+        """main() hands over the function that registers and starts the Voice supervisor task.
+        Starts it now when voice is on; otherwise set_voice_enabled(True) starts it later."""
+        self._voice_starter = starter
+        if self._voice_on:
+            self._start_voice_task()
+
+    def _start_voice_task(self):
+        """Register + start the Voice task once. False when it already exists or no starter is set."""
+        with self._voice_lock:
+            if self._voice_registered or self._voice_starter is None:
+                return False
+            self._voice_registered = True
+        self._voice_starter()
+        return True
+
+    def voice_should_be_suspended(self):
+        """True while the user turned voice off or the PC is locked/asleep (applied to new Voice instances)."""
+        with self._sys_lock:
+            paused = bool(self._sys_pause_reasons)
+        return self._voice_user_off or paused
+
+    def set_voice_enabled(self, on, persist=True):
+        """Turn voice commands on/off live. On starts the Voice task if it never ran, else un-suspends it;
+        off suspends it (mic closed, no listening) without tearing threads down. Persists cfg.voice_enabled."""
+        on = bool(on)
+        log = _jlog.get_logger("main")
+        log.info("voice commands %s (live)", "on" if on else "off")
+        with self._voice_lock:
+            self._voice_on = on
+            self._voice_user_off = not on
+        if persist and self.cfg is not None:
+            try:
+                import config as _config
+                _config.update_key("voice_enabled", on, self.cfg)
+                _config.clear_runtime_override(self.cfg, "voice_enabled")
+            except Exception:
+                log.exception("could not persist voice_enabled")
+        if on and self._start_voice_task():
+            return
+        fn = getattr(self.voice, "set_suspended", None)
+        if fn is not None:
+            fn(self.voice_should_be_suspended())
 
     # ---- text input, one-shot listen, hide/show, pages (UI entry points; thread-safe, non-blocking) ----
     def submit_text(self, text):
@@ -90,7 +142,7 @@ class Context:
     def listen_now(self):
         """Immediate one-shot listen without the wake word. False if voice is unavailable or busy."""
         v = self.voice
-        if v is None or not hasattr(v, "request_listen"):
+        if v is None or not hasattr(v, "request_listen") or self._voice_user_off:
             _jlog.get_logger("main").info("listen_now: voice not available")
             return False
         return bool(v.request_listen("listen_now"))
@@ -252,7 +304,7 @@ class Context:
         log.info("system resume (%s); restoring gesture mode=%s", reason, restore)
         voice = self.voice
         fn = getattr(voice, "set_suspended", None)
-        if fn is not None:
+        if fn is not None and not self._voice_user_off:     # a user "off" survives unlock/resume
             fn(False)
         if reopen_devices:
             self.reopen_voice_devices()
@@ -365,6 +417,9 @@ class Context:
             self.speaker.reload_config(self.cfg)
         if hasattr(self.voice, "reload_config"):
             self.voice.reload_config(self.cfg)
+        want = getattr(self.cfg, "voice_enabled", None) if self.cfg is not None else None
+        if isinstance(want, bool) and want != self._voice_on:
+            self.set_voice_enabled(want, persist=False)    # Settings already saved the key
         self.personal.configure(self.cfg)
         lf = getattr(self, "lyrics_feed", None)
         if lf is not None:
@@ -984,15 +1039,18 @@ def main():
         )
         supervisor.start("Tracker")
 
-        if cfg.voice_enabled:
-            def _on_voice_error(name, exc):
-                explain_graceful_degradation("voice", overlay=overlay, speaker=speaker)
+        def _on_voice_error(name, exc):
+            explain_graceful_degradation("voice", overlay=overlay, speaker=speaker)
 
-            def _make_voice():
-                v = Voice(cfg, ctx, stop)
-                ctx.voice = v
-                return v
+        def _make_voice():
+            v = Voice(ctx.cfg or cfg, ctx, stop)
+            if ctx.voice_should_be_suspended():     # user turned it off / PC locked before a (re)start
+                v.set_suspended(True)
+            ctx.voice = v
+            return v
 
+        def _register_voice():
+            """Startup (voice on) and ctx.set_voice_enabled(True) both start voice through this."""
             supervisor.register(
                 name="Voice",
                 factory=_make_voice,
@@ -1003,6 +1061,8 @@ def main():
                 stall_after=10.0,
             )
             supervisor.start("Voice")
+
+        ctx.install_voice_starter(_register_voice)   # starts now if cfg.voice_enabled
 
         # Media Session Manager (Windows SMTC / Media Controls)
         from media_adapter import get_media_adapter

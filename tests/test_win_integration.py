@@ -149,3 +149,117 @@ def test_context_pause_resume_remembers_gesture_state():
     assert ("susp", False) not in calls
     ctx.system_resume("suspend", reopen_devices=True)
     assert ("susp", False) in calls and "reopen" in calls and ("cam", True) in calls
+
+
+# ---- main.Context live voice on/off (Settings switch, onboarding "Turn on voice") ----
+def _voice_ctx(voice_enabled, voice=None, monkeypatch=None):
+    import main
+    from config import Config
+    cfg = Config()
+    cfg.voice_enabled = voice_enabled
+    saved = []
+    if monkeypatch is not None:
+        import config
+        monkeypatch.setattr(config, "update_key",
+                            lambda k, v, c=None, path=None: (saved.append((k, v)), setattr(c, k, v)))
+    engine = types.SimpleNamespace(request=lambda v: None)
+    overlay = types.SimpleNamespace(post=lambda *a, **k: None)
+    ctx = main.Context(engine, overlay, None, threading.Event(), voice=voice, cfg=cfg)
+    ctx.personal = types.SimpleNamespace(configure=lambda c: None)
+    return ctx, cfg, saved
+
+
+class _FakeSupervisor:
+    """Stands in for ThreadSupervisor: register/start record calls; start runs the factory."""
+
+    def __init__(self):
+        self.registered, self.started = [], []
+        self.factories = {}
+
+    def register(self, name, factory, **kw):
+        self.registered.append(name)
+        self.factories[name] = factory
+
+    def start(self, name):
+        self.started.append(name)
+        self.factories[name]()
+
+
+def _install(ctx, sup, made):
+    def _make_voice():
+        v = types.SimpleNamespace(susp=[], set_suspended=None)
+        v.set_suspended = v.susp.append
+        if ctx.voice_should_be_suspended():
+            v.set_suspended(True)
+        ctx.voice = v
+        made.append(v)
+        return v
+
+    ctx.install_voice_starter(lambda: (sup.register("Voice", _make_voice), sup.start("Voice")))
+
+
+def test_voice_off_at_startup_registers_once_when_turned_on(monkeypatch):
+    ctx, cfg, saved = _voice_ctx(False, monkeypatch=monkeypatch)
+    sup, made = _FakeSupervisor(), []
+    _install(ctx, sup, made)
+    assert sup.registered == [] and ctx.voice is None      # disabled at startup: not started
+    ctx.set_voice_enabled(True)
+    assert sup.registered == ["Voice"] and sup.started == ["Voice"] and ctx.voice is made[0]
+    assert cfg.voice_enabled is True and saved == [("voice_enabled", True)]
+    ctx.set_voice_enabled(False)
+    assert made[0].susp == [True] and cfg.voice_enabled is False
+    ctx.set_voice_enabled(True)                            # existing task: un-suspend, no re-register
+    assert sup.registered == ["Voice"] and made[0].susp == [True, False]
+
+
+def test_voice_on_at_startup_registers_through_same_helper(monkeypatch):
+    ctx, cfg, _ = _voice_ctx(True, monkeypatch=monkeypatch)
+    sup, made = _FakeSupervisor(), []
+    _install(ctx, sup, made)
+    assert sup.registered == ["Voice"] and made[0].susp == []
+    ctx.set_voice_enabled(True)
+    assert sup.registered == ["Voice"]
+
+
+def test_reload_config_applies_voice_enabled_change(monkeypatch):
+    ctx, cfg, saved = _voice_ctx(True, monkeypatch=monkeypatch)
+    sup, made = _FakeSupervisor(), []
+    _install(ctx, sup, made)
+    cfg.voice_enabled = False                  # what SettingsWindow._save/update_key does
+    ctx.reload_config(cfg)
+    assert made[0].susp == [True] and saved == []    # Settings already persisted it
+    ctx.reload_config(cfg)                     # no change: nothing more
+    assert made[0].susp == [True]
+    cfg.voice_enabled = True
+    ctx.reload_config(cfg)
+    assert made[0].susp == [True, False]
+
+
+def test_user_voice_off_survives_unlock_and_resume(monkeypatch):
+    ctx, cfg, _ = _voice_ctx(True, monkeypatch=monkeypatch)
+    sup, made = _FakeSupervisor(), []
+    _install(ctx, sup, made)
+    v = made[0]
+    ctx.set_voice_enabled(False)
+    ctx.system_pause("lock")
+    ctx.system_resume("lock")
+    ctx.system_pause("suspend")
+    ctx.system_resume("suspend", reopen_devices=True)
+    assert False not in v.susp
+    assert ctx.listen_now() is False
+    # A supervisor restart of Voice while off comes up suspended too.
+    sup.start("Voice")
+    assert made[1].susp == [True]
+    ctx.set_voice_enabled(True)
+    assert made[1].susp == [True, False]
+
+
+def test_voice_on_while_locked_stays_suspended_until_unlock(monkeypatch):
+    ctx, cfg, _ = _voice_ctx(False, monkeypatch=monkeypatch)
+    sup, made = _FakeSupervisor(), []
+    _install(ctx, sup, made)
+    ctx.system_pause("lock")
+    ctx.set_voice_enabled(True)                # first start while locked: comes up suspended
+    assert made[0].susp == [True]
+    ctx.system_resume("lock")
+    assert made[0].susp == [True, False]

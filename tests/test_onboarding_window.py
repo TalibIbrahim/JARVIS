@@ -127,14 +127,41 @@ def test_flow_navigation_and_save(make, app):
     assert ctx.reloaded
 
 
-def test_skip_sets_done_and_keeps_answers(make, app):
+def test_skip_skips_one_step_and_keeps_answers(make, app):
     win, ctx, cfg, cfg_path = make(FakeVoice())
     win._next()
     win.name_edit.setText("Ana")
     win.skip()
-    assert win.completed and win.was_skipped
-    assert cfg.onboarding_done is True
+    assert win.page_id() == "address"             # only this step was skipped
+    assert not win._finished and not win.completed
+    assert cfg.onboarding_done is False
     assert any(u.get("name") == "Ana" for u in ctx.personal.updates)
+
+
+def test_skip_on_voice_step_goes_to_next_page_not_done(make, app):
+    win, ctx, cfg, cfg_path = make(None)          # voice unavailable: the user report
+    win._go(3, speak=False)
+    assert win.page_id() == "voice"
+    win.skip()
+    assert win.page_id() == "usage"
+    assert cfg.onboarding_done is False and not win._finished
+    assert not cfg_path.exists()
+    win.skip()
+    win.skip()
+    assert win.page_id() == "done"
+    assert not win._btn_skip.isVisibleTo(win)
+    assert cfg.onboarding_done is False
+    win._next()
+    assert cfg.onboarding_done is True and win.completed and not win.was_skipped
+
+
+def test_skip_while_calibrating_drops_work_and_advances(make, app):
+    win, ctx, cfg, _ = make(FakeVoice())
+    win._go(3, speak=False)
+    win._busy = "voice"                           # as if a sample were being read
+    tok = win._token
+    win.skip()
+    assert win.page_id() == "usage" and win._busy is None and win._token > tok
 
 
 def test_close_counts_as_skip(make, app):
@@ -209,7 +236,93 @@ def test_no_voice_hides_mics_and_still_works(make, app):
     win._go(1, speak=False)
     win.name_edit.setText("Sam")
     win.skip()
-    assert cfg.onboarding_done is True
+    assert win.page_id() == "address" and cfg.onboarding_done is False
+    win.reject()                                  # closing still skips the rest
+    assert cfg.onboarding_done is True and win.was_skipped
+
+
+VOICE_OFF = "Voice commands are off. Turn them on in Settings > Voice, or skip this step."
+
+
+def test_voice_off_by_cfg_hides_mics_and_shows_footnote(make, app):
+    from ui.onboarding_window import OnboardingWindow
+    ctx = FakeCtx(FakeVoice())
+    cfg = Config()
+    cfg.voice_enabled = False
+    win = OnboardingWindow(ctx, cfg)
+    try:
+        assert not win._voice_ok()
+        assert win.name_mic.isHidden() and win.apps_mic.isHidden()
+        assert win.voice_mic.isHidden()
+        assert _footnote(win.voice_card) == VOICE_OFF
+        assert win.btn_voice_on.isHidden()   # FakeCtx has no set_voice_enabled
+    finally:
+        win._finished = True
+        win.deleteLater()
+
+
+def test_no_voice_footnote_text(make, app):
+    win, ctx, cfg, _ = make(None)
+    assert _footnote(win.voice_card) == VOICE_OFF
+
+
+class VoiceCtx(FakeCtx):
+    """Has set_voice_enabled; ctx.cfg is the live config, as on main.Context."""
+
+    def __init__(self, cfg):
+        super().__init__(None)
+        self.cfg = cfg
+        self.calls = []
+
+    def set_voice_enabled(self, on):
+        self.calls.append(on)
+        self.cfg.voice_enabled = bool(on)
+        self.voice = FakeVoice()
+
+
+def test_turn_on_voice_button_calls_ctx_and_enables_mics(app):
+    from ui.onboarding_window import OnboardingWindow
+    cfg = Config()
+    cfg.voice_enabled = False
+    ctx = VoiceCtx(cfg)
+    win = OnboardingWindow(ctx, cfg)
+    try:
+        win._go(3, speak=False)
+        assert win.btn_voice_on.isVisibleTo(win) and not win.voice_mic.isVisibleTo(win)
+        assert _footnote(win.voice_card) == VOICE_OFF
+        win.btn_voice_on.clicked.emit()
+        assert ctx.calls == [True]
+        assert not win.voice_mic.isHidden() and not win.name_mic.isHidden() and not win.apps_mic.isHidden()
+        assert not win.btn_voice_on.isVisibleTo(win)
+        assert _footnote(win.voice_card) != VOICE_OFF
+        assert win._voice_ok()
+    finally:
+        win._finished = True
+        win.deleteLater()
+
+
+def test_turn_on_voice_polls_until_voice_ready(app):
+    from ui.onboarding_window import OnboardingWindow
+    cfg = Config()
+    cfg.voice_enabled = False
+    ctx = VoiceCtx(cfg)
+    ctx.set_voice_enabled = lambda on: (ctx.calls.append(on), setattr(cfg, "voice_enabled", on))
+    win = OnboardingWindow(ctx, cfg)
+    try:
+        win._go(3, speak=False)
+        win._turn_on_voice()
+        assert win._voice_poll.isActive() and not win.btn_voice_on.isEnabled()
+        ctx.voice = FakeVoice()                   # supervisor started Voice
+        win._poll_voice_ready()
+        assert not win._voice_poll.isActive() and win.voice_mic.isVisibleTo(win)
+    finally:
+        win._finished = True
+        win._voice_poll.stop()
+        win.deleteLater()
+
+
+def _footnote(card):
+    return card._footnote_label.text()
 
 
 def test_speak_respects_cfg_speak(make, app):
