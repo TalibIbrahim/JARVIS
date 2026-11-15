@@ -95,6 +95,7 @@ SENSITIVITY_THRESHOLDS = {
     "low": 0.70,
     "balanced": 0.50,
     "high": 0.35,
+    "aggressive": 0.35,   # legacy name for "high"
 }
 
 
@@ -1187,7 +1188,7 @@ class WakeWordDetector(threading.Thread):
         self.threshold = parse_sensitivity(getattr(cfg, "wake_sensitivity", sensitivity))
         self.followup_window = float(getattr(cfg, "wake_followup_window", getattr(cfg, "command_window", followup_window)))
         self.device_index = device_index
-        self.guard = WakeWordGuard(threshold=self.threshold)
+        self.guard = WakeWordGuard(threshold=self.threshold, require_consecutive=True)
         self.vad = VADDetector(cfg=cfg)
         self.model = None
         # Voice Over Music (experimental): echo canceller + a second model/VAD for the AEC path.
@@ -1208,6 +1209,13 @@ class WakeWordDetector(threading.Thread):
         self._st_loud = 0
         self._st_chunks = 0
         self._stream_fault = None   # "stream_stall" | "stream_error" | "flatline" set by read paths
+        # Wake-model CPU saver + passive-burst pre-gate (see _wake_predict / Voice._on_utterance_recorded)
+        self._recent_scores = collections.deque(maxlen=6)
+        self.last_burst_wake_peak = 0.0
+        self._quiet_run = 0
+        self._skip_ring = collections.deque(maxlen=2)
+        self.wake_predicts = 0
+        self.wake_skipped = 0
         self._mic_state = ("down", "not started")
         self._init_model()
 
@@ -1430,6 +1438,35 @@ class WakeWordDetector(threading.Thread):
             return {"aec": "off"}
         return {"aec": "on" if self._aec_active else "idle"}
 
+    # Skip the wake model only after this many consecutive clearly-silent chunks (~0.64 s), so the model has
+    # already seen the trailing context of any word; the last 2 skipped chunks are replayed on the first
+    # non-silent chunk so its streaming mel/feature buffers see contiguous audio at the onset.
+    WAKE_SKIP_AFTER_QUIET = 8
+
+    def _is_quiet(self, rms, aec_arr):
+        """Clearly silent: Silero < 0.1 AND rms well below the VAD gate. Never while the AEC path is active."""
+        if aec_arr is not None:
+            return False
+        prob = self.vad.last_prob
+        return prob is not None and prob < VADDetector.NOISE_PROB and rms < 0.5 * self.vad.gate()
+
+    def _wake_predict(self, arr, quiet):
+        """openWakeWord score for this chunk (0.0 when the chunk was skipped as clearly silent)."""
+        if quiet:
+            self._quiet_run += 1
+            if self._quiet_run > self.WAKE_SKIP_AFTER_QUIET:
+                self._skip_ring.append(arr)
+                self.wake_skipped += 1
+                return 0.0
+        else:
+            self._quiet_run = 0
+            if self._skip_ring:
+                for old in self._skip_ring:
+                    self.model.predict(old)
+                self._skip_ring.clear()
+        self.wake_predicts += 1
+        return self.model.predict(arr).get("hey_jarvis", 0.0)
+
     def _init_model(self):
         try:
             _import_openwakeword_lean()
@@ -1453,12 +1490,27 @@ class WakeWordDetector(threading.Thread):
     def get_followup_window(self) -> float:
         return self.followup_window
 
+    def endpoint_silence_s(self) -> float:
+        """Silence that ends an utterance: cfg.mic_pause_threshold read live (Settings slider), clamped."""
+        try:
+            v = float(getattr(self.cfg, "mic_pause_threshold", 0.5))
+        except (TypeError, ValueError):
+            v = 0.5
+        return min(2.0, max(0.3, v))
+
+    def max_phrase_s(self) -> float:
+        try:
+            v = float(getattr(self.cfg, "mic_phrase_time_limit", 10.0))
+        except (TypeError, ValueError):
+            v = 10.0
+        return min(15.0, max(3.0, v))
+
     def record_utterance_with_vad(
         self,
         stream=None,
         timeout_no_speech: float = 5.0,
-        silence_endpoint: float = 0.70,
-        max_duration: float = 8.0,
+        silence_endpoint: float = None,
+        max_duration: float = None,
         pre_roll: list = None,
         chunk_samples: int = 1280,
         sample_rate: int = 16000,
@@ -1473,6 +1525,14 @@ class WakeWordDetector(threading.Thread):
         pre_speech_chunks: speech chunks already counted by the caller (the chunk that triggered capture).
         """
         self.is_recording = True
+        # The model hears nothing while recording: its next chunks are not contiguous with these.
+        self._quiet_run = 0
+        self._skip_ring.clear()
+        self._recent_scores.clear()
+        if silence_endpoint is None:
+            silence_endpoint = self.endpoint_silence_s()
+        if max_duration is None:
+            max_duration = self.max_phrase_s()
         chunk_duration = chunk_samples / sample_rate
         recorded_frames = list(pre_roll) if pre_roll else []
 
@@ -1602,8 +1662,8 @@ class WakeWordDetector(threading.Thread):
         self,
         stream=None,
         timeout_no_speech: float = 5.0,
-        silence_endpoint: float = 0.70,
-        max_duration: float = 8.0,
+        silence_endpoint: float = None,
+        max_duration: float = None,
     ) -> str:
         """Records with VAD and transcribes into an utterance string."""
         raw_bytes = self.record_utterance_with_vad(
@@ -1747,6 +1807,8 @@ class WakeWordDetector(threading.Thread):
 
                     if self._ptt_event.is_set():
                         pre_roll.clear()
+                        self._quiet_run = 0
+                        self._skip_ring.clear()
                         self._do_push_to_talk(stream, chunk_samples, sample_rate)
                         if self._stream_fault:
                             stream_error = True
@@ -1829,11 +1891,11 @@ class WakeWordDetector(threading.Thread):
                     # 1. openWakeWord prediction for instant "Hey Jarvis" wake chime
                     wake_triggered = False
                     if getattr(self.cfg, "wake_word_enabled", True) and self.model is not None:
-                        pred = self.model.predict(arr)
-                        score = pred.get("hey_jarvis", 0.0)
+                        score = self._wake_predict(arr, self._is_quiet(rms, aec_arr))
                         if aec_arr is not None and self._aec_model is not None:
                             # Dual path: the AEC path only ever adds a chance to hear the wake word.
                             score = max(score, self._aec_model.predict(aec_arr).get("hey_jarvis", 0.0))
+                        self._recent_scores.append(float(score))
                         if score > self._st_max_score:
                             self._st_max_score = float(score)
                         if self.guard.evaluate(score, is_speaking=Voice.is_speaking, now=now):
@@ -1880,6 +1942,7 @@ class WakeWordDetector(threading.Thread):
                     # _recognition_worker and _process verify wake_aliases in passive standby,
                     # ensuring zero false activations from random background speech.
                     if chunk_speech and not wake_triggered:
+                        self.last_burst_wake_peak = max(self._recent_scores, default=0.0)
                         raw = self.record_utterance_with_vad(
                             stream=stream,
                             pre_roll=list(pre_roll),
@@ -1968,6 +2031,22 @@ class WakeWordDetector(threading.Thread):
                 self.on_utterance(raw_bytes)
             except Exception as e:
                 print(f"[voice] dispatch utterance error: {e}")
+
+
+_GROQ_STT_CLIENT = None   # (GroqClient class, key, timeout, instance)
+_GROQ_STT_LOCK = threading.Lock()
+
+
+def _get_groq_stt_client(key, timeout):
+    """One GroqClient for STT (keeps its HTTP session and its 25 req/min limiter) instead of one per call."""
+    global _GROQ_STT_CLIENT
+    with _GROQ_STT_LOCK:
+        c = _GROQ_STT_CLIENT
+        if c is not None and c[0] is GroqClient and c[1] == key and c[2] == timeout:
+            return c[3]
+        client = GroqClient(api_key=key, timeout=timeout)
+        _GROQ_STT_CLIENT = (GroqClient, key, timeout, client)
+        return client
 
 
 class Voice(threading.Thread):
@@ -2166,21 +2245,61 @@ class Voice(threading.Thread):
             except Exception:
                 pass
 
+    PASSIVE_PREGATE_FRACTION = 0.5
+
     def _on_utterance_recorded(self, raw_bytes: bytes, is_command: bool = True):
         if not raw_bytes:
             return
         Voice._last_raw_audio = raw_bytes
         uid = jarvis_log.current_utterance()
+        now = time.time()
+        wd = self.wake_detector
+        if not is_command and now >= self.listening_until and not (wd and now < wd.listening_until):
+            # Wake-less speech in standby. Without a local transcriber it would cost a Groq call (or Google)
+            # only to be dropped by the wake-word check, so require the wake model to have stirred first.
+            if self._local_stt_ready() is None and wd is not None:
+                peak = getattr(wd, "last_burst_wake_peak", None)
+                thr = getattr(wd, "threshold", None)
+                if isinstance(peak, (int, float)) and isinstance(thr, (int, float)) \
+                        and peak < self.PASSIVE_PREGATE_FRACTION * thr:
+                    jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="passive_pregate",
+                                               peak=f"{peak:.2f}", thr=f"{thr:.2f}")
+                    return
         try:
             import speech_recognition as sr
             audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
-            self.audio_q.put_nowait((audio, is_command, time.time(), uid))
-        except queue.Full:
-            qs = self.audio_q.qsize()
-            jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="audio_q_full", qsize=qs)
-            _vlog.warning("audio_q full (qsize=%d): dropping utterance %s", qs, uid)
+            if not self._enqueue_audio((audio, is_command, time.time(), uid), is_command):
+                qs = self.audio_q.qsize()
+                jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="audio_q_full", qsize=qs)
+                _vlog.warning("audio_q full (qsize=%d): dropping utterance %s", qs, uid)
         except Exception as exc:
             _vlog.warning("enqueue utterance %s failed: %r", uid, exc)
+
+    def _enqueue_audio(self, item, is_command) -> bool:
+        """Queue an utterance. When full, a command/follow-up evicts the OLDEST passive (wake-less) item so
+        background noise can never starve it; a passive item is simply dropped. Returns False if dropped."""
+        q = self.audio_q
+        try:
+            q.put_nowait(item)
+            return True
+        except queue.Full:
+            pass
+        if not is_command:
+            return False
+        with q.mutex:
+            for i, it in enumerate(q.queue):
+                if isinstance(it, tuple) and len(it) > 1 and not it[1]:
+                    del q.queue[i]
+                    q.unfinished_tasks = max(0, q.unfinished_tasks - 1)
+                    _vlog.info("audio_q full: evicted oldest passive utterance for a command")
+                    break
+            else:
+                return False
+        try:
+            q.put_nowait(item)
+            return True
+        except queue.Full:
+            return False
 
     def run(self):
         jarvis_log.thread_started("Voice")
@@ -2203,6 +2322,7 @@ class Voice(threading.Thread):
                 self.ctx.say("Voice control needs the SpeechRecognition package.")
             return
 
+        self._start_local_stt()
         recognizer = sr.Recognizer()
         recognizer.dynamic_energy_threshold = getattr(self.cfg, "mic_dynamic_energy", False)
         recognizer.pause_threshold = getattr(self.cfg, "mic_pause_threshold", 1.0)
@@ -2344,6 +2464,96 @@ class Voice(threading.Thread):
             finally:
                 jarvis_log.set_current_utterance(None)
 
+    def _local_stt_ready(self):
+        """The local transcriber when cfg.stt_engine == "local" and its model is loaded, else None."""
+        if str(getattr(self.cfg, "stt_engine", "local")).lower() != "local":
+            return None
+        import local_stt
+        lt = local_stt.get_local_transcriber(getattr(self.cfg, "local_stt_model", "base.en"))
+        return lt if lt.available() else None
+
+    def _start_local_stt(self):
+        """Load the local model in the background at voice start (first run downloads it)."""
+        if str(getattr(self.cfg, "stt_engine", "local")).lower() != "local":
+            return
+        import local_stt
+        local_stt.get_local_transcriber(getattr(self.cfg, "local_stt_model", "base.en")).start_loading()
+
+    def _stt_local(self, lt, raw_bytes, uid, queue_ms):
+        t0 = time.monotonic()
+        jarvis_log.utterance_event(jarvis_log.STT_SENT, uid, engine="local", bytes=len(raw_bytes),
+                                   dur_s=f"{len(raw_bytes) / 32000.0:.2f}")
+        text, conf = lt.transcribe(raw_bytes)
+        ms = int((time.monotonic() - t0) * 1000)
+        print(f"[voice] Local Heard: \"{redact(text)}\"")
+        jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="local", text=text, ok=bool(text),
+                                   conf=f"{conf:.2f}", ms=ms, queue_ms=queue_ms)
+        return text, conf
+
+    def _stt_groq(self, recognizer, sr, audio, raw_bytes, uid, key, google_fallback=True):
+        """Groq Whisper with the shared cooldown handling. Returns (text, net_fail). On failure the text is
+        the Google fallback result, or None when google_fallback is False."""
+        def fb():
+            return self._fallback_google(recognizer, audio, sr) if google_fallback else None
+
+        text = None
+        groq_net_fail = False
+        t_groq = time.monotonic()
+
+        def ms():
+            return int((time.monotonic() - t_groq) * 1000)
+
+        try:
+            # Convert in-memory audio chunk to 16 kHz mono WAV (zero temp files)
+            wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+            stt_model = getattr(self.cfg, "ai_stt_model", "whisper-large-v3-turbo")
+            timeout = getattr(self.cfg, "ai_timeout", 10)
+            client = _get_groq_stt_client(key, timeout)
+            print(f"[voice] Transcribing complete utterance via Groq Whisper ({stt_model})...")
+            jarvis_log.utterance_event(jarvis_log.STT_SENT, uid, engine="groq", bytes=len(wav_bytes),
+                                       dur_s=f"{len(raw_bytes) / 32000.0:.2f}")
+            text = client.transcribe(wav_bytes, model=stt_model, language="en")
+            print(f"[voice] Groq Heard: \"{redact(text)}\"")
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", text=text, ok=bool(text),
+                                       ms=ms())
+            self.groq_cooldown_until = 0.0   # clear any prior cooldown
+        except AuthenticationError as auth_err:
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
+                                       err=type(auth_err).__name__, ms=ms())
+            print(f"[voice] Groq key authentication failed: {auth_err}")
+            self.groq_cooldown_until = time.time() + 300.0  # 5 min cooldown on auth failure
+            self._post_ai_error("Invalid Groq Key")
+            text = fb()
+        except RateLimitError as rl_err:
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
+                                       err=type(rl_err).__name__, ms=ms())
+            print(f"[voice] Groq rate limit: {rl_err}")
+            wait_sec = rl_err.retry_after if rl_err.retry_after else 10.0
+            self.groq_cooldown_until = time.time() + wait_sec
+            self._post_ai_error("Groq Rate Limited")
+            text = fb()
+        except (OfflineError, TimeoutError) as net_err:
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
+                                       err=type(net_err).__name__, ms=ms())
+            print(f"[voice] Groq network offline/timeout: {net_err}")
+            self.groq_cooldown_until = time.time() + 15.0
+            groq_net_fail = True
+            self._post_ai_error("Groq Offline")
+            text = fb()
+        except Exception as exc:
+            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
+                                       err=type(exc).__name__, ms=ms())
+            print(f"[voice] Groq error ({exc}), falling back...")
+            text = fb()
+        return text, groq_net_fail
+
+    def _post_ai_error(self, text):
+        if hasattr(self.ctx, "overlay") and self.ctx.overlay:
+            try:
+                self.ctx.overlay.post("ai_error", text=text)
+            except Exception:
+                pass
+
     def _handle_audio_item(self, recognizer, sr, vp, audio, is_command, enqueued_at, uid):
         # (body of the former _recognition_worker loop; `continue` -> `return`)
         if True:
@@ -2391,6 +2601,7 @@ class Voice(threading.Thread):
             text = None
             groq_net_fail = False
             self._google_net_err = False
+            passive = not is_active_session
             key = get_api_key(self.cfg)
             ai_enabled = getattr(self.cfg, "ai_enabled", False)
             use_groq = bool(ai_enabled and key and now >= self.groq_cooldown_until)
@@ -2400,65 +2611,32 @@ class Voice(threading.Thread):
                               time.strftime("%H:%M:%S", time.localtime(self.groq_cooldown_until)),
                               self.groq_cooldown_until - now)
 
-            if use_groq:
-                t_groq = time.monotonic()
+            queue_ms = max(0, int((time.time() - enqueued_at) * 1000)) if enqueued_at else 0
+            done = False
+            lt = self._local_stt_ready()
+            if lt is not None:
                 try:
-                    # Convert in-memory audio chunk to 16 kHz mono WAV (zero temp files)
-                    wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-                    stt_model = getattr(self.cfg, "ai_stt_model", "whisper-large-v3-turbo")
-                    timeout = getattr(self.cfg, "ai_timeout", 10)
-                    client = GroqClient(api_key=key, timeout=timeout)
-                    print(f"[voice] Transcribing complete utterance via Groq Whisper ({stt_model})...")
-                    jarvis_log.utterance_event(jarvis_log.STT_SENT, uid, engine="groq", bytes=len(wav_bytes),
-                                               dur_s=f"{len(raw_bytes) / 32000.0:.2f}")
-                    text = client.transcribe(wav_bytes, model=stt_model, language="en")
-                    print(f"[voice] Groq Heard: \"{redact(text)}\"")
-                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", text=text, ok=bool(text),
-                                               ms=int((time.monotonic() - t_groq) * 1000))
-                    # Clear any prior cooldown
-                    self.groq_cooldown_until = 0.0
-                except AuthenticationError as auth_err:
-                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
-                                               err=type(auth_err).__name__, ms=int((time.monotonic() - t_groq) * 1000))
-                    print(f"[voice] Groq key authentication failed: {auth_err}")
-                    self.groq_cooldown_until = time.time() + 300.0  # 5 min cooldown on auth failure
-                    if hasattr(self.ctx, "overlay") and self.ctx.overlay:
-                        try:
-                            self.ctx.overlay.post("ai_error", text="Invalid Groq Key")
-                        except Exception:
-                            pass
-                    text = self._fallback_google(recognizer, audio, sr)
-                except RateLimitError as rl_err:
-                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
-                                               err=type(rl_err).__name__, ms=int((time.monotonic() - t_groq) * 1000))
-                    print(f"[voice] Groq rate limit: {rl_err}")
-                    wait_sec = rl_err.retry_after if rl_err.retry_after else 10.0
-                    self.groq_cooldown_until = time.time() + wait_sec
-                    if hasattr(self.ctx, "overlay") and self.ctx.overlay:
-                        try:
-                            self.ctx.overlay.post("ai_error", text="Groq Rate Limited")
-                        except Exception:
-                            pass
-                    text = self._fallback_google(recognizer, audio, sr)
-                except (OfflineError, TimeoutError) as net_err:
-                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
-                                               err=type(net_err).__name__, ms=int((time.monotonic() - t_groq) * 1000))
-                    print(f"[voice] Groq network offline/timeout: {net_err}")
-                    self.groq_cooldown_until = time.time() + 15.0
-                    groq_net_fail = True
-                    if hasattr(self.ctx, "overlay") and self.ctx.overlay:
-                        try:
-                            self.ctx.overlay.post("ai_error", text="Groq Offline")
-                        except Exception:
-                            pass
-                    text = self._fallback_google(recognizer, audio, sr)
+                    text, conf = self._stt_local(lt, raw_bytes, uid, queue_ms)
+                    done = True
+                    min_conf = float(getattr(self.cfg, "local_stt_min_confidence", 0.55))
+                    if conf < min_conf and not passive and use_groq:
+                        # Unsure local result in an active session: let Groq have a go; keep local text if it fails.
+                        _vlog.info("local STT conf=%.2f < %.2f: retrying with Groq", conf, min_conf)
+                        gtext, groq_net_fail = self._stt_groq(recognizer, sr, audio, raw_bytes, uid, key,
+                                                              google_fallback=False)
+                        if gtext:
+                            text = gtext
                 except Exception as exc:
-                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
-                                               err=type(exc).__name__, ms=int((time.monotonic() - t_groq) * 1000))
-                    print(f"[voice] Groq error ({exc}), falling back to Google...")
+                    _vlog.warning("local STT failed (%r); falling back", exc)
+                    jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="local", ok=False,
+                                               err=type(exc).__name__)
+                    text, done = None, False
+
+            if not done:
+                if use_groq:
+                    text, groq_net_fail = self._stt_groq(recognizer, sr, audio, raw_bytes, uid, key)
+                else:
                     text = self._fallback_google(recognizer, audio, sr)
-            else:
-                text = self._fallback_google(recognizer, audio, sr)
 
             # Every STT engine tried failed on the network: tell the user once per interval.
             if not text and self._google_net_err and (groq_net_fail or not use_groq):

@@ -21,6 +21,8 @@ psutil>=5.9.0
 nvidia-ml-py>=13.0.0
 openwakeword>=0.6.0
 onnxruntime>=1.17.0
+# Local speech-to-text (CTranslate2, CPU int8); the model downloads to %LOCALAPPDATA%\JARVIS\models\stt on first run
+faster-whisper>=1.0.3
 scipy>=1.10.0
 pycaw>=20240000
 comtypes>=1.2.0
