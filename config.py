@@ -97,7 +97,7 @@ class Config:
     tts_voice: str = "jarvis"           # voice_models registry id used when tts_engine is "piper" (optional download)
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
-    config_version: int = 5            # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification; 4: glass; 5: camera/voice responsiveness)
+    config_version: int = 6            # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification; 4: glass; 5: camera/voice responsiveness; 6: microphone stored by name)
     # wake_word_enabled only toggles the openWakeWord model. listen_for_jarvis=False disables ALL
     # passive listening (mic stays closed, nothing recorded) until the listen gesture.
     wake_word_enabled: bool = True      # openWakeWord / wake word detection toggle
@@ -113,7 +113,8 @@ class Config:
         "jarves", "jarv", "charvis", "darvis", "jar business"
     ])
     command_window: float = 7.0         # seconds Jarvis keeps listening after "Jarvis?"
-    mic_device_index: Optional[int] = None        # specific microphone device index, or None for auto-detect
+    mic_device_index: Optional[int] = None        # legacy raw PortAudio index (unstable); migrated to mic_device_name by config_version 6, then always None
+    mic_device_name: str = ""                     # chosen microphone by name (host API picked at open time); "" = auto-detect
     mic_energy_threshold: int = 300     # minimum audio energy threshold for speech trigger (lower = more sensitive)
     mic_dynamic_energy: bool = False    # adapt threshold dynamically (False prevents runaway threshold on laptop mics)
     mic_pause_threshold: float = 0.5    # seconds of silence that end a command (VAD endpoint)
@@ -425,6 +426,17 @@ def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
     return value
 
 
+def _resolve_mic_name(idx: int):
+    """Name of the input device at raw PortAudio index `idx` (None when it is not an input device or
+    PortAudio cannot be queried). Imported lazily: only the one-time v6 migration needs it."""
+    try:
+        import voice
+        return voice.mic_name_for_index(idx)
+    except Exception as exc:
+        _log_repair("mic_device_index %r: name lookup failed (%r)", idx, exc)
+        return None
+
+
 def _loaded_version(data: dict) -> int:
     try:
         return int(data.get("config_version", 0))
@@ -529,6 +541,25 @@ def load_config(path=None):
         jarvis_log.get_logger("config").info("migrated v5: frame %sx%s, pause %.2fs",
                                              cfg.frame_width, cfg.frame_height, cfg.mic_pause_threshold)
         cfg.config_version = 5
+        migrated = True
+
+    # One-time migration (config_version 6): a raw PortAudio mic index (unstable across devices, host APIs and
+    # PyAudio builds) becomes the device's name; unresolvable -> auto-detect. The index is always cleared.
+    if isinstance(data, dict) and _loaded_version(data) < 6:
+        import jarvis_log
+        log = jarvis_log.get_logger("config")
+        legacy_idx = cfg.mic_device_index
+        if legacy_idx is not None:
+            name = None
+            if not cfg.mic_device_name:
+                name = _resolve_mic_name(legacy_idx)
+            if name:
+                cfg.mic_device_name = name
+                log.info("migrated v6: mic_device_index %s -> mic_device_name %r", legacy_idx, name)
+            else:
+                log.info("migrated v6: mic_device_index %s not resolvable -> auto-detect", legacy_idx)
+            cfg.mic_device_index = None
+        cfg.config_version = 6
         migrated = True
 
     if str(cfg.wake_sensitivity).strip().lower() == "aggressive":

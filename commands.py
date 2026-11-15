@@ -158,7 +158,56 @@ def is_power_phrase(text, kind: str) -> bool:
     return _exact(text, *table.get(kind, ()))
 
 
-_WAKE_PREFIX_RE = re.compile(r"^(?:(?:hey|ok|okay)\s+)?jarvis(?!\w)[\s,.:;!?-]*(?=\S)", re.ASCII)
+_WAKE_PREFIX_RE = re.compile(r"^(?:(?:hey|ok|okay)[\s,.:;!?-]+)?jarvis(?!\w)[\s,.:;!?-]*(?=\S)", re.ASCII)
+# A greeting left in front of the command ("hey, volume up", or "hey" after the wake word was cut off).
+_LEAD_GREETING_RE = re.compile(r"^(?:hey|ok|okay)(?!\w)[\s,.:;!?-]*(?=\S)")
+# Whole-utterance speech-to-text confusions seen in real logs ("Jarvis, volume up" -> "what are you up").
+_STT_COMMAND_FIXES = {"what are you up": "volume up", "what are you down": "volume down"}
+
+_BRI_WORD = frozenset({"brightness", "brighter", "brighten", "bright", "brightest", "dim", "dimmer", "darker",
+                       "darken"})
+_BRI_VOCAB = _BRI_WORD | frozenset({
+    "set", "turn", "put", "make", "change", "adjust", "bring", "the", "my", "screen", "display", "monitor",
+    "laptop", "to", "at", "up", "down", "increase", "raise", "boost", "decrease", "lower", "reduce", "full", "max",
+    "maximum", "highest", "min", "minimum", "lowest", "half", "all", "way", "a", "bit", "little", "more", "less",
+    "by", "percent", "higher", "it", "what", "what's", "s", "is", "current", "level", "how", "hundred",
+    "please", "now", "sir", "jarvis", "can", "you", "could", "would", "just", "hey", "ok", "okay"})
+_BRI_UP = frozenset({"up", "increase", "raise", "boost", "higher", "more", "brighter", "brighten"})
+_BRI_DOWN = frozenset({"down", "decrease", "lower", "reduce", "dim", "dimmer", "darker", "darken", "less"})
+
+
+def parse_brightness_intent(text: str) -> Optional[Tuple[str, dict]]:
+    """Local brightness intent -> ('set_brightness', {'level'}), ('brightness_up'|'brightness_down',
+    {'steps'}), ('get_brightness', {}) or None. Fires only when every word is brightness vocabulary,
+    so "dim the lights" or a question about something else never matches."""
+    s = re.sub(r"(\d)\s*%", r"\1 percent", _norm_text(text).replace("’", "'"))
+    words = re.sub(r"[^\w\s']", " ", s).split()
+    if not words or len(words) > 12 or not (_BRI_WORD & set(words)):
+        return None
+    nums = [w for w in words if w.isdigit()]
+    if len(nums) > 1 or any(w not in _BRI_VOCAB and not w.isdigit() for w in words):
+        return None
+    ws = set(words)
+    down = bool(_BRI_DOWN & ws)
+    up = bool(_BRI_UP & ws) and not down
+    if nums or "hundred" in ws:
+        n = int(nums[0]) if nums else 100
+        if (up or down) and re.search(r"\bby \d", " ".join(words)):
+            return ("brightness_down" if down else "brightness_up"), {"steps": max(1, min(100, n))}
+        return "set_brightness", {"level": max(0, min(100, n))}
+    if ws & {"full", "max", "maximum", "highest", "brightest"} or {"all", "way", "up"} <= ws:
+        return "set_brightness", {"level": 100}
+    if ws & {"min", "minimum", "lowest"} or {"all", "way", "down"} <= ws:
+        return "set_brightness", {"level": 0}
+    if "half" in ws:
+        return "set_brightness", {"level": 50}
+    if down:
+        return "brightness_down", {"steps": 10}
+    if up:
+        return "brightness_up", {"steps": 10}
+    if ("brightness" in ws and ws & {"what", "what's", "current", "how", "level"}) or {"how", "bright"} <= ws:
+        return "get_brightness", {}
+    return None
 
 
 def strip_wake_prefix(t: str) -> str:
@@ -763,7 +812,7 @@ def handle_island_voice_command(text: str, ctx: Any = None) -> Optional[str]:
 # --- personal intents (learning from the user) ------------------------------------------
 _PREV_UTTERANCE = {"text": "", "at": 0.0}
 _CORRECTION_WINDOW_S = 120.0
-_RE_WAKE_LEAD = re.compile(r"^(?:(?:hey|ok|okay)\s+)?jarvis\b[\s,.:;!?-]*", re.I)
+_RE_WAKE_LEAD = re.compile(r"^(?:(?:hey|ok|okay)[\s,.:;!?-]+)?jarvis\b[\s,.:;!?-]*", re.I)
 _RE_CORRECTION = re.compile(
     r"^(?:(?:no|nope|nah|wrong|not that|that'?s wrong|that is wrong|that'?s not right|that is not right|"
     r"that'?s not what i said)\b[\s,.:;!?-]*)?"
@@ -985,6 +1034,8 @@ def _run_single_command(text, ctx):
     # Strip a leading wake word ("jarvis play" -> "play") now that island navigation
     # ("jarvis page") has had its chance; keeps downstream matching on the command itself.
     clean_t = strip_wake_prefix(clean_t)
+    clean_t = _LEAD_GREETING_RE.sub("", clean_t, count=1).strip(" ,.!?") or clean_t
+    clean_t = _STT_COMMAND_FIXES.get(" ".join(re.sub(r"[^\w\s']", " ", clean_t).split()), clean_t)
 
     # Phase 7 Safety Gate: intercept unsafe or arbitrary shell/PowerShell requests
     from quick_answers import is_unsafe_shell_command
@@ -1375,7 +1426,9 @@ def _run_single_command(text, ctx):
     if _any(clean_t, "thank you jarvis", "thanks jarvis", "good job jarvis", "well done jarvis", "nice work jarvis"):
         _post_action(ctx, "small_talk", True, text=text)
         return "Always a pleasure watching you work, sir."
-    if _any(clean_t, "who are you", "what are you"):
+    # Whole utterance only: inside a phrase it caught "what are you up" (misheard "volume up").
+    if re.fullmatch(r"(?:who|what) (?:are|r) you(?: (?:exactly|again|jarvis))?",
+                    " ".join(re.sub(r"[^\w\s']", " ", clean_t).split())):
         _post_action(ctx, "small_talk", True, text=text)
         return "I am J.A.R.V.I.S., Just A Rather Very Intelligent System. Configured to manage your computing environment and tactical telemetry, sir."
     if _any(clean_t, "are you there", "you there jarvis"):
@@ -1457,6 +1510,15 @@ def _run_single_command(text, ctx):
         return f"Searching for {m.group(1).strip()}."
 
     # --- media / volume / display (Phase 5) ---
+    # Brightness first: "turn up the brightness" must not hit the volume "turn up" rule.
+    bri = parse_brightness_intent(clean_t)
+    if bri:
+        import system_control
+        b_action, b_args = bri
+        ok, msg = getattr(system_control, b_action)(**b_args)
+        _post_action(ctx, b_action, ok, args=b_args, text=text)
+        return msg
+
     m_vol = re.search(r"\b(?:set\s+)?volume\s+(?:to\s+)?(\d{1,3})(?:\s*%)?\b", clean_t)
     if m_vol and not _any(clean_t, "volume up", "volume down", "turn up", "turn down"):
         lvl = int(m_vol.group(1))
@@ -1502,27 +1564,26 @@ def _run_single_command(text, ctx):
         _post_action(ctx, "mute", True, args={"mode": "mute"}, text=text)
         return "Muted."
 
-    # Brightness & Night Light
+    # Brightness phrasings outside parse_brightness_intent's vocabulary, and Night Light
     m_bri = re.search(r"\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})(?:\s*%)?\b", clean_t)
     if m_bri and not _any(clean_t, "brightness up", "brightness down", "brighter", "dimmer"):
         lvl = int(m_bri.group(1))
         import system_control
         ok, msg = system_control.set_brightness(lvl)
         _post_action(ctx, "set_brightness", ok, args={"level": lvl}, text=text)
-        ctx_res.record_turn(user_utterance=text, resolved_action="set_brightness", arguments={"level": lvl})
-        return f"Screen brightness set to {lvl} percent, sir."
+        return msg
 
     if _any(clean_t, "brightness up", "turn brightness up", "increase brightness", "raise brightness", "brighter screen", "make screen brighter"):
         import system_control
         ok, msg = system_control.brightness_up(10)
         _post_action(ctx, "brightness_up", ok, args={"steps": 10}, text=text)
-        return "Screen brightness increased, sir."
+        return msg
 
     if _any(clean_t, "brightness down", "turn brightness down", "decrease brightness", "lower brightness", "dim screen", "dim the screen", "make screen dimmer"):
         import system_control
         ok, msg = system_control.brightness_down(10)
         _post_action(ctx, "brightness_down", ok, args={"steps": 10}, text=text)
-        return "Screen brightness lowered, sir."
+        return msg
 
     if _any(clean_t, "toggle night light", "turn on night light", "turn off night light", "night light"):
         import system_control
@@ -2012,6 +2073,10 @@ def _handle_ai_query(user_text: str, ctx: Any) -> str:
             executed, act_msg = execute_whitelisted_action(action, args, ctx)
             if not executed:
                 print(f"[ai] Action '{action}' note: {act_msg}")
+            if action in ("set_brightness", "brightness_up", "brightness_down", "get_brightness") and act_msg:
+                # The model wrote its reply before the action ran ("full maximum, sir"); speak what the
+                # display actually did instead, success or failure.
+                reply = act_msg
         elif reply:
             answer_cache_put(user_text, reply)   # pure Q&A only; refuses time/personal/follow-up questions
 

@@ -383,78 +383,202 @@ def reset_shared_pyaudio():
             _SHARED_PYAUDIO = None
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Microphone identity. PortAudio lists every physical mic once per host API (MME, DirectSound, WASAPI, WDM-KS)
+# and its raw indices change with devices and builds, so a mic is identified by NAME. One entry per mic,
+# with its usable host-API "variants" ordered WASAPI (native rate, resampled), MME, DirectSound; never WDM-KS.
+# ---------------------------------------------------------------------------------------------------------
+MIC_VERIFY_TIMEOUT_S = 1.0    # a variant only counts as working when a full chunk arrives within this long
+VARIANT_MAX_FAILS = 2         # stalls/no-data opens after which a variant is skipped until a device change
+_MME_NAME_MAX = 31            # MME truncates device names to 31 characters
+_VIRTUAL_NAME_KEYS = ("virtual", "cable", "mapper", "stereo mix", "wave out", "loopback", "primary sound capture")
+
+_VARIANT_FAILS = {}           # (normalized name prefix, host rank) -> consecutive failures (guarded by _PORTAUDIO_LOCK)
+LAST_MIC_CHOICE = None        # {"index", "name", "host_api", "reason"} of the last find_best_microphone(require_16k=True)
+
+
+def _norm_mic_name(name):
+    return " ".join(str(name or "").split()).casefold()
+
+
+def _names_match(a, b):
+    """Same physical mic: equal normalized names, or one is an MME-truncated (~31 char) prefix of the other."""
+    na, nb = _norm_mic_name(a), _norm_mic_name(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    short, long_ = (na, nb) if len(na) <= len(nb) else (nb, na)
+    return len(short) >= _MME_NAME_MAX - 3 and long_.startswith(short)
+
+
+def _host_rank(host_api):
+    """WASAPI 0, MME 1, DirectSound 2, anything else 3; None = never used (WDM-KS)."""
+    h = str(host_api).lower()
+    if "wdm" in h:
+        return None
+    if "wasapi" in h:
+        return 0
+    if "mme" in h:
+        return 1
+    if "directsound" in h or "direct sound" in h:
+        return 2
+    return 3
+
+
+def _variant_key(name, host_api):
+    return (_norm_mic_name(name)[:_MME_NAME_MAX - 3], _host_rank(host_api))
+
+
+def note_variant_failure(name, host_api):
+    """A mic variant opened but delivered no data (or failed to open). Returns its consecutive failure count."""
+    with _PORTAUDIO_LOCK:
+        k = _variant_key(name, host_api)
+        _VARIANT_FAILS[k] = _VARIANT_FAILS.get(k, 0) + 1
+        return _VARIANT_FAILS[k]
+
+
+def _note_variant_ok(name, host_api):
+    with _PORTAUDIO_LOCK:
+        _VARIANT_FAILS.pop(_variant_key(name, host_api), None)
+
+
+def _variant_fails(name, host_api):
+    with _PORTAUDIO_LOCK:
+        return _VARIANT_FAILS.get(_variant_key(name, host_api), 0)
+
+
+def reset_variant_failures():
+    with _PORTAUDIO_LOCK:
+        _VARIANT_FAILS.clear()
+
+
+def group_input_devices(devs):
+    """
+    devs: [{"index", "name", "host_api", "channels", "rate", "loopback"(opt)}] (raw PortAudio inputs).
+    Returns one dict per physical mic, in first-seen order:
+        {"index", "name", "channels", "working", "rms", "is_virtual", "host_api", "variants": [...]}
+    where index/host_api are those of the preferred variant, name is the longest (untruncated) name seen,
+    and variants are ordered by host API preference (WASAPI, MME, DirectSound; WDM-KS and loopback dropped).
+    """
+    groups = []
+    for d in devs:
+        if d.get("loopback"):
+            continue
+        rank = _host_rank(d["host_api"])
+        if rank is None:
+            continue
+        var = {"index": d["index"], "host_api": d["host_api"], "rank": rank,
+               "channels": d.get("channels", 1), "rate": d.get("rate", 44100)}
+        for g in groups:
+            if _names_match(g["name"], d["name"]):
+                g["variants"].append(var)
+                if len(_norm_mic_name(d["name"])) > len(_norm_mic_name(g["name"])):
+                    g["name"] = d["name"]
+                break
+        else:
+            groups.append({"name": d["name"], "variants": [var]})
+    mics = []
+    for g in groups:
+        g["variants"].sort(key=lambda v: v["rank"])
+        best = g["variants"][0]
+        mics.append({
+            "index": best["index"],
+            "name": g["name"],
+            "channels": best["channels"],
+            "working": True,
+            "rms": 0.0,
+            "is_virtual": any(k in g["name"].lower() for k in _VIRTUAL_NAME_KEYS),
+            "host_api": best["host_api"],
+            "variants": g["variants"],
+        })
+    return mics
+
+
+def find_mic_by_name(mics, name):
+    """The grouped mic whose name matches `name` (see _names_match), or None. "" never matches."""
+    if not name:
+        return None
+    for m in mics:
+        if _names_match(m["name"], name):
+            return m
+    return None
+
+
+def _clean_device_name(name):
+    """PyAudio hands back UTF-8 device names decoded as cp1252 ("IntelÂ®"); undo that so names display and
+    compare correctly. Names that are not such mojibake are returned unchanged."""
+    name = str(name)
+    if "Â" in name or "Ã" in name:
+        try:
+            return name.encode("cp1252").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return name
+    return name
+
+
+def _enumerate_input_devices(p):
+    devs = []
+    for i in range(p.get_device_count()):
+        try:
+            info = p.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) <= 0:
+                continue
+            try:
+                host_api = p.get_host_api_info_by_index(info["hostApi"])["name"]
+            except Exception:
+                host_api = "?"
+            devs.append({"index": i, "name": _clean_device_name(info.get("name", f"Microphone {i}")),
+                         "host_api": host_api,
+                         "channels": int(info.get("maxInputChannels", 1)),
+                         "rate": int(info.get("defaultSampleRate", 44100)),
+                         "loopback": bool(info.get("isLoopbackDevice", False))})
+        except Exception as exc:
+            _vlog.warning("list_microphones: device %s skipped: %r", i, exc)
+    return devs
+
+
+def mic_name_for_index(idx):
+    """Full name of the input device at raw index `idx` (None if it is not an input device). Used by the
+    one-time config migration from mic_device_index to mic_device_name."""
+    with _PORTAUDIO_LOCK:
+        devs = _enumerate_input_devices(get_shared_pyaudio())
+    for d in devs:
+        if d["index"] == idx:
+            return max((x["name"] for x in devs if _names_match(x["name"], d["name"])), key=len)
+    return None
+
+
 def list_microphones(probe_rms=False):
     """
-    Enumerates all system audio input devices safely using the shared PyAudio instance.
+    One entry per physical input device (see group_input_devices), using the shared PyAudio instance.
     Returns list of dicts:
-        [{'index': int, 'name': str, 'channels': int, 'working': bool, 'rms': float, 'is_virtual': bool}]
+        [{'index': int, 'name': str, 'channels': int, 'working': bool, 'rms': float, 'is_virtual': bool,
+          'host_api': str, 'variants': [{'index','host_api','rank','channels','rate'}, ...]}]
+    probe_rms=True also opens the preferred variant to confirm it delivers frames (working) and read its level.
     """
     mics = []
-    _n_probe_fail = 0
-    with _PORTAUDIO_LOCK:
-        try:
-            import pyaudio
-            p = get_shared_pyaudio()
-            dev_count = p.get_device_count()
-            for i in range(dev_count):
-                try:
-                    info = p.get_device_info_by_index(i)
-                    max_ch = info.get("maxInputChannels", 0)
-                    if max_ch <= 0:
-                        continue
-
-                    name = info.get("name", f"Microphone {i}")
-                    rate = int(info.get("defaultSampleRate", 44100))
-                    ch = min(max_ch, 2)
-                    is_virtual = any(k in name.lower() for k in ("virtual", "cable", "mapper", "stereo mix", "wave out"))
-
-                    working = True
-                    rms = 0.0
-                    if probe_rms:
-                        try:
-                            stream = _shared_open(p, 
-                                format=pyaudio.paInt16,
-                                channels=ch,
-                                rate=rate,
-                                input=True,
-                                input_device_index=i,
-                                frames_per_buffer=1024
-                            )
-                            data = stream.read(1024, exception_on_overflow=False)
-                            stream.stop_stream()
-                            _shared_close(stream)
-                            arr = np.frombuffer(data, dtype=np.int16)
-                            rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
-                            working = True
-                        except Exception:
-                            working = False
-                            rms = 0.0
-                            _n_probe_fail += 1
-
-                    try:
-                        host_api = p.get_host_api_info_by_index(info["hostApi"])["name"]
-                    except Exception:
-                        host_api = "?"
-                    mics.append({
-                        "index": i,
-                        "name": name,
-                        "channels": max_ch,
-                        "working": working,
-                        "rms": rms,
-                        "is_virtual": is_virtual,
-                        "host_api": host_api,
-                    })
-                except Exception:
-                    pass
-        except Exception as exc:
-            print(f"[voice] error enumerating microphones: {exc}")
     try:
-        if probe_rms:
-            _vlog.info("list_microphones probe: inputs=%d probe_failed=%d working=%s", len(mics), _n_probe_fail,
-                       [(m["index"], round(m["rms"], 1)) for m in mics if m["working"]])
-    except Exception:
-        pass
+        with _PORTAUDIO_LOCK:
+            mics = group_input_devices(_enumerate_input_devices(get_shared_pyaudio()))
+    except Exception as exc:
+        _vlog.warning("list_microphones: enumeration failed: %r", exc)
+        print(f"[voice] error enumerating microphones: {exc}")
+    if probe_rms and mics:
+        p = get_shared_pyaudio()
+        for m in mics:
+            ok, _detail, rms = probe_16k_open(p, m["index"])
+            m["working"], m["rms"] = ok, rms
+        _vlog.info("list_microphones probe: mics=%d working=%s", len(mics),
+                   [(m["index"], round(m["rms"], 1)) for m in mics if m["working"]])
     return mics
+
+
+def resolve_mic_index(cfg):
+    """Raw index of the preferred host-API variant of the configured mic (cfg.mic_device_name), or None for
+    auto-detect / not currently present. No device is opened."""
+    m = find_mic_by_name(list_microphones(), getattr(cfg, "mic_device_name", "") if cfg else "")
+    return m["index"] if m else None
 
 
 def _rank_mic_by_name(m):
@@ -470,37 +594,113 @@ def _rank_mic_by_name(m):
     return score
 
 
-def _host_priority_16k(host_api):
-    """MME first, then DirectSound, then anything else. WASAPI and WDM-KS are excluded elsewhere."""
-    h = str(host_api).lower()
-    if "mme" in h:
-        return 0
-    if "directsound" in h:
-        return 1
-    return 2
+class _ResampledStream:
+    """16 kHz mono view of a native-rate (WASAPI shared-mode) input stream: channels are averaged and the audio
+    is band-limited (windowed-sinc FIR) and interpolated down with state carried across reads, so successive
+    80 ms chunks join seamlessly. Quacks like a PyAudio stream for the pipeline (read / get_read_available /
+    stop_stream / close / is_stopped)."""
+    TARGET = 16000
+    TAPS = 193
+
+    def __init__(self, raw, rate, channels, chunk_samples=1280):
+        self.raw, self.rate, self.channels = raw, int(rate), max(1, int(channels))
+        self._native_chunk = int(round(chunk_samples * self.rate / self.TARGET))
+        self._step = self.rate / float(self.TARGET)
+        fc = 0.45 * self.TARGET / self.rate                      # cycles/sample; keeps the band below 7.2 kHz
+        t = np.arange(self.TAPS) - (self.TAPS - 1) / 2.0
+        h = 2.0 * fc * np.sinc(2.0 * fc * t) * np.blackman(self.TAPS)
+        self._h = (h / h.sum()).astype(np.float64)
+        self._tail = np.zeros(self.TAPS - 1)
+        self._last = 0.0
+        self._pos = 1.0
+        self._fifo = np.zeros(0, dtype=np.float64)
+
+    def _process(self, x):
+        buf = np.concatenate([self._tail, x])
+        filt = np.convolve(buf, self._h, mode="valid")           # len(x) samples, state-continuous
+        self._tail = buf[-(self.TAPS - 1):]
+        ext = np.concatenate([[self._last], filt])
+        n = max(int(np.floor((len(ext) - 1 - self._pos) / self._step)) + 1, 0)
+        pos = self._pos + self._step * np.arange(n)
+        out = np.interp(pos, np.arange(len(ext)), ext)
+        self._pos = self._pos + self._step * n - (len(ext) - 1)
+        self._last = float(filt[-1])
+        return out
+
+    def read(self, n, exception_on_overflow=False):
+        while len(self._fifo) < n:
+            data = self.raw.read(self._native_chunk, exception_on_overflow=exception_on_overflow)
+            x = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+            if self.channels > 1:
+                x = x[: len(x) // self.channels * self.channels].reshape(-1, self.channels).mean(axis=1)
+            self._fifo = np.concatenate([self._fifo, self._process(x)])
+        out, self._fifo = self._fifo[:n], self._fifo[n:]
+        return np.clip(np.rint(out), -32768, 32767).astype(np.int16).tobytes()
+
+    def get_read_available(self):
+        return len(self._fifo) + int(self.raw.get_read_available() * self.TARGET / self.rate)
+
+    def is_stopped(self):
+        return self.raw.is_stopped()
+
+    def stop_stream(self):
+        return self.raw.stop_stream()
+
+    def close(self):
+        return self.raw.close()
 
 
-def _host_excluded_16k(host_api):
-    """WASAPI rejects 16 kHz shared-mode opens (-9997); WDM-KS fails with -9999."""
-    h = str(host_api).lower()
-    return "wasapi" in h or "wdm" in h
+def _open_input(p, idx, chunk_samples=1280, opener=None):
+    """
+    Opens raw device `idx` as a 16 kHz mono stream. WASAPI shared mode only opens at the device's native rate
+    and channel count (-9997 / -9998 otherwise), so it is opened that way and wrapped in _ResampledStream;
+    MME / DirectSound open at 16 kHz mono directly. idx None = the Windows default input.
+    """
+    import pyaudio
+    opener = opener or _shared_open
+    if idx is None:
+        return opener(p, format=pyaudio.paInt16, channels=1, rate=16000, input=True,
+                      input_device_index=None, frames_per_buffer=chunk_samples)
+    info = p.get_device_info_by_index(idx)
+    host = str(p.get_host_api_info_by_index(info["hostApi"])["name"]).lower()
+    if "wasapi" in host:
+        rate = int(info.get("defaultSampleRate", 48000))
+        ch = max(1, int(info.get("maxInputChannels", 1)))
+        native_chunk = int(round(chunk_samples * rate / 16000.0))
+        raw = opener(p, format=pyaudio.paInt16, channels=ch, rate=rate, input=True, input_device_index=idx,
+                     frames_per_buffer=native_chunk)
+        return _ResampledStream(raw, rate, ch, chunk_samples)
+    return opener(p, format=pyaudio.paInt16, channels=1, rate=16000, input=True, input_device_index=idx,
+                  frames_per_buffer=chunk_samples)
+
+
+def _stream_delivers(stream, chunk_samples, timeout_s=None):
+    """(ok, data): ok when a full chunk arrives within timeout_s. Frames are counted, not their level:
+    silence is fine, NO DATA is not. The blocking read only happens once the chunk is available."""
+    deadline = time.monotonic() + (MIC_VERIFY_TIMEOUT_S if timeout_s is None else timeout_s)
+    while True:
+        avail = stream.get_read_available()
+        if not isinstance(avail, (int, np.integer)) or avail >= chunk_samples:
+            break
+        if time.monotonic() >= deadline:
+            return False, b""
+        time.sleep(0.01)
+    data = stream.read(chunk_samples, exception_on_overflow=False)
+    return bool(data), data
 
 
 def probe_16k_open(p, idx, chunk_samples=1280):
     """
-    Opens device idx at 16 kHz mono and reads one chunk, exactly like the Settings test does.
-    Lock is held only for open and close, never during the read.
+    Opens raw device idx as 16 kHz mono (see _open_input) and requires a full chunk within
+    MIC_VERIFY_TIMEOUT_S. Lock is held only for open and close, never during the wait.
     Returns (ok, detail, rms).
     """
-    import pyaudio
     stream = None
     try:
-        with _PORTAUDIO_LOCK:
-            stream = _shared_open(p, format=pyaudio.paInt16, channels=1, rate=16000, input=True,
-                            input_device_index=idx, frames_per_buffer=chunk_samples)
-        data = stream.read(chunk_samples, exception_on_overflow=False)
-        if not data:
-            return False, "read returned no data", 0.0
+        stream = _open_input(p, idx, chunk_samples)
+        ok, data = _stream_delivers(stream, chunk_samples)
+        if not ok:
+            return False, f"no data within {MIC_VERIFY_TIMEOUT_S:.1f}s (0 frames)", 0.0
         arr = np.frombuffer(data, dtype=np.int16)
         return True, "OK", float(np.sqrt(np.mean(arr.astype(float) ** 2)))
     except Exception as exc:
@@ -515,135 +715,149 @@ def probe_16k_open(p, idx, chunk_samples=1280):
                 _vlog.warning("probe_16k_open: closing probe stream idx=%s failed: %r", idx, close_exc)
 
 
+def _verified_variant(p, m):
+    """First variant of grouped mic `m` that delivers frames: fewest recent failures first, then WASAPI, MME,
+    DirectSound. Variants already failed VARIANT_MAX_FAILS times are skipped. Returns the variant dict or None."""
+    order = sorted(m["variants"], key=lambda v: (_variant_fails(m["name"], v["host_api"]), v["rank"]))
+    for v in order:
+        fails = _variant_fails(m["name"], v["host_api"])
+        if fails >= VARIANT_MAX_FAILS:
+            _vlog.info("find_best_microphone[16k]: skip idx=%s hostApi=%s name=%r (failed %d times)",
+                       v["index"], v["host_api"], m["name"], fails)
+            continue
+        ok, detail, rms = probe_16k_open(p, v["index"])
+        (_vlog.info if ok else _vlog.warning)(
+            "find_best_microphone[16k]: candidate idx=%s hostApi=%s name=%r -> %s%s", v["index"], v["host_api"],
+            m["name"], "OK frames" if ok else "FAIL", f" rms={rms:.0f}" if ok else f" ({detail})")
+        if ok:
+            _note_variant_ok(m["name"], v["host_api"])
+            return v
+        note_variant_failure(m["name"], v["host_api"])
+    return None
+
+
 def _find_best_microphone_16k(cfg):
     """
-    Pipeline mic selection. Every candidate must pass a 16 kHz mono open + one-chunk read.
-    Order: configured device, the Windows default input (if not virtual), then ranking restricted
-    to tested devices on MME, then DirectSound (never WASAPI or WDM-KS). Every result is logged.
+    Pipeline mic selection. A variant must deliver frames within ~1 s of being opened (no data = not working).
+    Order: the configured mic by name (its host-API variants in preference order), the Windows default input
+    (if not virtual), then name-ranked mics. Never WDM-KS. Every result is logged; the winner is also left in
+    LAST_MIC_CHOICE. Returns (raw index of the working variant, mic name).
     """
+    global LAST_MIC_CHOICE
+    LAST_MIC_CHOICE = None
     mics = list_microphones()
     if not mics:
         _vlog.warning("find_best_microphone[16k]: no input devices")
         return None, "Default System Microphone"
     p = get_shared_pyaudio()
-    cfg_idx = getattr(cfg, "mic_device_index", None) if cfg else None
-    tested = {}
+    cfg_name = getattr(cfg, "mic_device_name", "") if cfg else ""
+    tried = set()
 
-    def _test(m):
-        if m["index"] not in tested:
-            ok, detail, rms = probe_16k_open(p, m["index"])
-            tested[m["index"]] = ok
-            (_vlog.info if ok else _vlog.warning)(
-                "find_best_microphone[16k]: candidate idx=%s hostApi=%s name=%r virtual=%s -> %s%s",
-                m["index"], m["host_api"], m["name"], m["is_virtual"], "OK" if ok else "FAIL",
-                f" rms={rms:.0f}" if ok else f" ({detail})")
-        return tested[m["index"]]
+    def _attempt(m, reason):
+        global LAST_MIC_CHOICE
+        tried.add(id(m))
+        v = _verified_variant(p, m)
+        if v is None:
+            return None
+        LAST_MIC_CHOICE = {"index": v["index"], "name": m["name"], "host_api": v["host_api"], "reason": reason}
+        _vlog.info("find_best_microphone[16k]: reason=%s idx=%s hostApi=%s name=%r", reason, v["index"],
+                   v["host_api"], m["name"])
+        return v["index"], m["name"]
 
-    # 1. Explicit user choice (honored if it opens at 16 kHz)
-    if cfg_idx is not None:
-        for m in mics:
-            if m["index"] == cfg_idx and not m["is_virtual"] and _test(m):
-                _vlog.info("find_best_microphone[16k]: reason=configured idx=%s name=%r", m["index"], m["name"])
-                return m["index"], m["name"]
-        _vlog.warning("find_best_microphone[16k]: configured idx=%s unusable at 16 kHz; ranking instead", cfg_idx)
-
-    # 2. The Windows default input device (what the Settings test uses)
-    else:
-        dflt = None
-        try:
-            dflt = p.get_default_input_device_info()
-        except Exception as exc:
-            _vlog.warning("find_best_microphone[16k]: no default input device: %r", exc)
-        if dflt is not None:
-            for m in mics:
-                if m["index"] == dflt.get("index"):
-                    if m["is_virtual"]:
-                        _vlog.info("find_best_microphone[16k]: default input idx=%s %r is virtual; skipped",
-                                   m["index"], m["name"])
-                    elif _test(m):
-                        _vlog.info("find_best_microphone[16k]: reason=windows_default idx=%s name=%r",
-                                   m["index"], m["name"])
-                        return m["index"], m["name"]
-                    break
-
-    # 3. Ranking among devices that pass the 16 kHz open test (MME, then DirectSound)
-    for allow_virtual in (False, True):
-        cands = [m for m in mics if m["is_virtual"] == allow_virtual and not _host_excluded_16k(m["host_api"])]
-        cands.sort(key=lambda m: (_host_priority_16k(m["host_api"]), -_rank_mic_by_name(m)))
-        for m in cands:
-            if _test(m):
-                _vlog.info("find_best_microphone[16k]: reason=ranked idx=%s hostApi=%s name=%r",
-                           m["index"], m["host_api"], m["name"])
-                return m["index"], m["name"]
-    excluded = [(m["index"], m["host_api"]) for m in mics if _host_excluded_16k(m["host_api"])]
-    _vlog.warning("find_best_microphone[16k]: no candidate opened at 16 kHz (excluded WASAPI/WDM-KS: %s)", excluded)
+    for attempt_round in (0, 1):
+        # 1. Explicit user choice, by name
+        if cfg_name:
+            m = find_mic_by_name(mics, cfg_name)
+            if m is None:
+                _vlog.warning("find_best_microphone[16k]: configured mic %r not present; auto-detecting", cfg_name)
+            elif m["is_virtual"]:
+                _vlog.warning("find_best_microphone[16k]: configured mic %r is virtual; auto-detecting", cfg_name)
+            else:
+                res = _attempt(m, "configured")
+                if res:
+                    return res
+                _vlog.warning("find_best_microphone[16k]: configured mic %r delivered no data on any host API; "
+                              "auto-detecting", cfg_name)
+        else:
+            # 2. The Windows default input device
+            try:
+                dflt = p.get_default_input_device_info()
+            except Exception as exc:
+                dflt = None
+                _vlog.warning("find_best_microphone[16k]: no default input device: %r", exc)
+            if dflt is not None:
+                for m in mics:
+                    if any(v["index"] == dflt.get("index") for v in m["variants"]):
+                        if m["is_virtual"]:
+                            _vlog.info("find_best_microphone[16k]: default input %r is virtual; skipped", m["name"])
+                        else:
+                            res = _attempt(m, "windows_default")
+                            if res:
+                                return res
+                        break
+        # 3. Ranking: physical mics first, then virtual ones
+        for allow_virtual in (False, True):
+            cands = [m for m in mics if m["is_virtual"] == allow_virtual and id(m) not in tried]
+            cands.sort(key=lambda m: -_rank_mic_by_name(m))
+            for m in cands:
+                res = _attempt(m, "ranked")
+                if res:
+                    return res
+        if attempt_round == 0 and _VARIANT_FAILS:
+            _vlog.warning("find_best_microphone[16k]: nothing delivered frames; clearing failure marks, retrying once")
+            reset_variant_failures()
+            tried.clear()
+        else:
+            break
+    _vlog.warning("find_best_microphone[16k]: no candidate delivered audio frames")
     return None, mics[0]["name"]
 
 
 def find_best_microphone(cfg=None, probe_working=False, require_16k=False):
     """
-    Finds the most suitable microphone device index and name.
-    require_16k=True (pipeline use, not for the GUI thread): only devices that open at 16 kHz mono
-    and deliver a chunk are considered; prefers cfg index, the Windows default input, then MME/DirectSound.
-    Otherwise:
-    1. If cfg.mic_device_index is explicitly specified, verifies and uses it.
-    2. Otherwise, auto-probes all devices, filtering out silent virtual audio cables
-       and selecting the physical microphone with active audio signal.
+    Finds the most suitable microphone and returns (raw device index of its preferred host-API variant, name).
+    require_16k=True (pipeline use, not for the GUI thread): only a variant that actually delivers frames is
+    returned (see _find_best_microphone_16k).
+    Otherwise (cheap, nothing is opened unless probe_working):
+    1. If cfg.mic_device_name is set and present, uses that mic.
+    2. Otherwise ranks the physical, non-virtual microphones by name keywords (and level when probed).
     """
     if require_16k:
         return _find_best_microphone_16k(cfg)
-    cfg_idx = getattr(cfg, "mic_device_index", None) if cfg else None
+    cfg_name = getattr(cfg, "mic_device_name", "") if cfg else ""
     mics = list_microphones(probe_rms=probe_working)
     if not mics:
         _vlog.warning("find_best_microphone: no input devices (probe_working=%s)", probe_working)
         return None, "Default System Microphone"
 
-    # 1. Explicitly requested device in config (if physical and working)
-    if cfg_idx is not None:
-        for m in mics:
-            if m["index"] == cfg_idx and m["working"] and not m["is_virtual"]:
-                _vlog.info("find_best_microphone: reason=configured idx=%s name=%r probe_working=%s",
-                           m["index"], m["name"], probe_working)
-                return m["index"], m["name"]
+    m = find_mic_by_name(mics, cfg_name)
+    if m is not None and m["working"] and not m["is_virtual"]:
+        _vlog.info("find_best_microphone: reason=configured idx=%s name=%r", m["index"], m["name"])
+        return m["index"], m["name"]
 
-    # 2. Filter working non-virtual devices
-    physical_working = [m for m in mics if m["working"] and not m["is_virtual"]]
-    
-    # Priority ranking for physical microphone keywords
     def rank_mic(m):
-        score = 0.0
-        name = m["name"].lower()
-        if "array" in name:
-            score += 40.0
-        if "microphone" in name or "mic" in name:
-            score += 30.0
-        if "intel" in name or "realtek" in name:
-            score += 20.0
+        score = _rank_mic_by_name(m)
         if m["rms"] > 5.0:
             score += 50.0 + min(m["rms"] / 100.0, 30.0)
         return score
 
+    physical_working = [m for m in mics if m["working"] and not m["is_virtual"]]
     if physical_working:
         physical_working.sort(key=rank_mic, reverse=True)
         best = physical_working[0]
-        try:
-            top = [(m["index"], m["name"][:30], round(rank_mic(m), 1)) for m in physical_working[:3]]
-            _vlog.info("find_best_microphone: reason=ranked idx=%s name=%r probe_working=%s cfg_idx=%s top3=%s",
-                       best["index"], best["name"], probe_working, cfg_idx, top)
-        except Exception:
-            pass
+        _vlog.info("find_best_microphone: reason=ranked idx=%s name=%r cfg_name=%r", best["index"], best["name"],
+                   cfg_name)
         return best["index"], best["name"]
 
-    # 3. Fallback to any working device
     any_working = [m for m in mics if m["working"]]
     if any_working:
         any_working.sort(key=lambda m: m["rms"], reverse=True)
-        _vlog.info("find_best_microphone: reason=fallback idx=%s name=%r probe_working=%s",
-                   any_working[0]["index"], any_working[0]["name"], probe_working)
+        _vlog.info("find_best_microphone: reason=fallback idx=%s name=%r", any_working[0]["index"],
+                   any_working[0]["name"])
         return any_working[0]["index"], any_working[0]["name"]
 
     _vlog.warning("find_best_microphone: reason=fallback none working (probe_working=%s)", probe_working)
-    return None, mics[0]["name"] if mics else "Default Microphone"
+    return None, mics[0]["name"]
 
 
 def probe_mic_level(device_index=None, chunk_samples=1024):
@@ -666,22 +880,11 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
         import pyaudio
         own = pyaudio.PyAudio()
         if device_index is None:
-            info = own.get_default_input_device_info()
-            dev_idx = info["index"]
+            dev_idx = own.get_default_input_device_info()["index"]
         else:
-            info = own.get_device_info_by_index(device_index)
             dev_idx = device_index
-        ch = min(info.get("maxInputChannels", 1), 2)
-        rate = int(info.get("defaultSampleRate", 44100))
-
-        stream = own.open(
-            format=pyaudio.paInt16,
-            channels=ch,
-            rate=rate,
-            input=True,
-            input_device_index=dev_idx,
-            frames_per_buffer=chunk_samples
-        )
+        stream = _open_input(own, dev_idx, chunk_samples, opener=lambda pa, **kw: pa.open(**kw))
+        rate, ch = 16000, 1
         _log_mic_open(own, dev_idx, rate, ch, chunk_samples, "OK", "probe_mic_level")
     except Exception as exc:
         _vlog.warning("mic open (probe_mic_level) FAILED: idx=%s fpb=%s err=%r", device_index, chunk_samples, exc)
@@ -692,7 +895,10 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
         _PORTAUDIO_LOCK.release()
 
     try:
-        data = stream.read(chunk_samples, exception_on_overflow=False)
+        ok, data = _stream_delivers(stream, chunk_samples)
+        if not ok:
+            _vlog.warning("probe_mic_level: no data from idx=%s within %.1fs", device_index, MIC_VERIFY_TIMEOUT_S)
+            return 0.0, 0.0
         arr = np.frombuffer(data, dtype=np.int16)
         rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
         norm = min(max((rms - 20.0) / 2500.0, 0.0), 1.0)
@@ -733,28 +939,27 @@ def _local_stt_for(cfg):
 
 
 def _record_pcm16(device_index, duration, level_cb=None, chunk=1024):
-    """Record `duration` seconds of 16 kHz mono PCM16 from a private PyAudio instance (device rate +
-    resample when the device refuses 16 kHz). level_cb(0..1) is called once per chunk."""
+    """Record `duration` seconds of 16 kHz mono PCM16 from a private PyAudio instance (WASAPI is opened at its
+    native rate and resampled by _open_input). level_cb(0..1) is called once per chunk. Raises RuntimeError
+    ("no_audio") when the device delivers no frames within MIC_VERIFY_TIMEOUT_S."""
     import pyaudio
     rate = 16000
     with _PORTAUDIO_LOCK:
         own = pyaudio.PyAudio()
         try:
             dev = device_index if device_index is not None else own.get_default_input_device_info()["index"]
-            kw = dict(format=pyaudio.paInt16, channels=1, input=True, input_device_index=dev,
-                      frames_per_buffer=chunk)
-            try:
-                stream = own.open(rate=rate, **kw)
-            except Exception:
-                rate = int(own.get_device_info_by_index(dev).get("defaultSampleRate", 44100))
-                stream = own.open(rate=rate, **kw)
+            stream = _open_input(own, dev, chunk, opener=lambda pa, **kw: pa.open(**kw))
             _log_mic_open(own, dev, rate, 1, chunk, "OK", "test_microphone_recognition")
         except Exception:
             own.terminate()
             raise
     frames = []
     try:
-        for _ in range(max(1, int(duration * rate / chunk))):
+        ok, first = _stream_delivers(stream, chunk)
+        if not ok:
+            raise RuntimeError("no_audio")
+        frames.append(first)
+        for _ in range(max(0, int(duration * rate / chunk) - 1)):
             data = stream.read(chunk, exception_on_overflow=False)
             frames.append(data)
             if level_cb is not None:
@@ -768,11 +973,7 @@ def _record_pcm16(device_index, duration, level_cb=None, chunk=1024):
             except Exception as exc:
                 _vlog.warning("test_microphone_recognition close failed: %r", exc)
             own.terminate()
-    raw = b"".join(frames)
-    if rate != 16000 and raw:
-        x = _resample_fft(np.frombuffer(raw, dtype=np.int16).astype(np.float32), rate, 16000)
-        raw = np.clip(x, -32768, 32767).astype(np.int16).tobytes()
-    return raw
+    return b"".join(frames)
 
 
 def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
@@ -835,7 +1036,8 @@ def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
             result["error"] = "Audio recorded, but speech could not be understood (try speaking closer)."
 
     except Exception as exc:
-        result["error"] = str(exc)
+        result["error"] = ("No audio from the microphone. Pick another one in Input Microphone."
+                           if str(exc) == "no_audio" else str(exc))
 
     return result
 
@@ -1410,6 +1612,10 @@ class WakeWordDetector(threading.Thread):
         self._st_loud = 0
         self._st_chunks = 0
         self._stream_fault = None   # "stream_stall" | "stream_error" | "flatline" set by read paths
+        self._cfg_name_seen = self._cfg_mic_name()   # cfg.mic_device_name last acted on (a change reopens the mic)
+        self._active_choice = None  # (mic name, host API) of the stream in use; set from LAST_MIC_CHOICE
+        self.on_mic_switch = None   # callable(name) -> None: told once when stall recovery moves to another mic/host API
+        self._last_rec_chunks = 0   # chunks read by the last record_utterance_with_vad (0 + fault = no audio at all)
         # Wake-model CPU saver + passive-burst pre-gate (see _wake_predict / Voice._on_utterance_recorded)
         self._recent_scores = collections.deque(maxlen=6)
         self.last_burst_wake_peak = 0.0
@@ -1425,6 +1631,33 @@ class WakeWordDetector(threading.Thread):
         self._reopen_at = 0.0           # monotonic time at/after which to close+reopen (0 = none); debounced
         self._reset_pa_pending = False  # re-enumerate PortAudio devices before the next open
         self._init_model()
+
+    def _cfg_mic_name(self):
+        return str(getattr(self.cfg, "mic_device_name", "") or "") if self.cfg else ""
+
+    def _adopt_choice(self, idx):
+        """Remember which (mic, host API) find_best_microphone verified for raw device idx."""
+        ch = LAST_MIC_CHOICE
+        if ch and ch.get("index") == idx:
+            self._active_choice = (ch["name"], ch["host_api"])
+
+    def _announce_switch(self, idx, reason):
+        """Stall recovery landed on a different mic/host API than before: log it and notify once."""
+        ch = LAST_MIC_CHOICE
+        if not (ch and ch.get("index") == idx):
+            return
+        new = (ch["name"], ch["host_api"])
+        old = self._active_choice
+        self._active_choice = new
+        if old is None or old == new:
+            return
+        _vlog.warning("microphone switched (%s): %r [%s] -> %r [%s]", reason, old[0], old[1], new[0], new[1])
+        cb = self.on_mic_switch
+        if cb is not None:
+            try:
+                cb(new[0])
+            except Exception as exc:
+                _vlog.warning("on_mic_switch callback failed: %r", exc)
 
     STALL_TIMEOUT_S = 2.0     # no data for this long => stream stall
     STALL_POLL_S = 0.01
@@ -1587,6 +1820,8 @@ class WakeWordDetector(threading.Thread):
             self.max_duration = max_duration
             self.raw = None
             self.done = threading.Event()
+            self.started = threading.Event()   # the detector thread picked the request up
+            self.no_audio = False              # the mic delivered no frames at all (stalled / not reading)
             self.cancelled = False
 
     def request_capture(self, timeout: float, on_level=None, max_duration: float = None):
@@ -1622,12 +1857,14 @@ class WakeWordDetector(threading.Thread):
                 return
             self._level_cb = req.on_level
             self._capture_active = True
+            req.started.set()
             req.raw = self.record_utterance_with_vad(
                 stream=stream, chunk_samples=chunk_samples, sample_rate=sample_rate,
                 timeout_no_speech=req.timeout,
                 max_duration=req.max_duration if req.max_duration else req.timeout,
                 trigger="capture",
             )
+            req.no_audio = req.raw is None and self._last_rec_chunks == 0 and self._stream_fault is not None
         finally:
             self._level_cb = None
             self._capture_active = False
@@ -1665,6 +1902,8 @@ class WakeWordDetector(threading.Thread):
                         _vlog.warning("mic stream stall: no data for %.1fs on device [%s] %s (avail=%s/%s)",
                                       self.STALL_TIMEOUT_S, self.device_index, Voice.current_mic_name,
                                       avail, chunk_samples)
+                        if self._active_choice is not None:
+                            note_variant_failure(*self._active_choice)
                         return None, "stream_stall"
                     avail = stream.get_read_available()
             return stream.read(chunk_samples, exception_on_overflow=False), None
@@ -1930,6 +2169,7 @@ class WakeWordDetector(threading.Thread):
             Voice._last_raw_audio = raw_bytes
             return raw_bytes
         finally:
+            self._last_rec_chunks = total_chunks
             self.is_recording = False
 
     def transcribe(self, raw_bytes: bytes) -> str:
@@ -1977,10 +2217,11 @@ class WakeWordDetector(threading.Thread):
         """
         Auto-recovery backoff loop (1s, 2s, 4s) when audio stream encounters error/unplug/stall.
         The caller has already closed the broken stream, so no stream of ours is open when the shared
-        PyAudio instance is reset. Only candidates that pass a 16 kHz mono open + read are considered
-        (MME, then DirectSound; never WASAPI or WDM-KS); every candidate result is logged.
+        PyAudio instance is reset. Selection goes through find_best_microphone(require_16k=True): the
+        configured mic first on its host-API variants (the variant that just stalled has been marked, so it is
+        not reopened ahead of the others and is skipped after two failures), then auto-detect; only a variant
+        that delivers frames within ~1 s is returned. A switch to another mic/host API is logged and announced.
         """
-        import pyaudio
         delays = [1.0, 2.0, 4.0]
         delay_idx = 0
         print("[voice] Audio stream disconnected. Entering backoff retry loop (1s, 2s, 4s)...")
@@ -2001,36 +2242,36 @@ class WakeWordDetector(threading.Thread):
             p = get_shared_pyaudio()
             best_idx, best_name = find_best_microphone(self.cfg, require_16k=True)
             if best_idx is None:
-                _vlog.warning("reconnect_stream: attempt %d: no microphone opened at 16 kHz; retrying", attempt)
+                _vlog.warning("reconnect_stream: attempt %d: no microphone delivered audio; retrying", attempt)
                 continue
 
+            test_stream = None
             try:
-                with _PORTAUDIO_LOCK:
-                    test_stream = _shared_open(p, 
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=sample_rate,
-                        input=True,
-                        input_device_index=best_idx,
-                        frames_per_buffer=chunk_samples,
-                    )
+                test_stream = _open_input(p, best_idx, chunk_samples)
                 _log_mic_open(p, best_idx, sample_rate, 1, chunk_samples, "OK", "reconnect_stream")
-                # Verify reading at least one frame works without exception
-                test_data = test_stream.read(chunk_samples, exception_on_overflow=False)
-                if test_data and len(test_data) > 0:
+                ok, _data = _stream_delivers(test_stream, chunk_samples)
+                if ok:
                     self.device_index = best_idx
                     Voice.current_mic_index = best_idx
                     Voice.current_mic_name = best_name
+                    self._announce_switch(best_idx, "stall recovery")
                     self._set_state("ok", "")
                     print(f"[voice] Microphone auto-recovered successfully to [{best_idx}] {best_name}.")
                     _vlog.info("reconnect_stream: recovered on attempt %d: idx=%s name=%r", attempt, best_idx, best_name)
                     return test_stream
-                _vlog.warning("reconnect_stream: attempt %d: idx=%s opened but read returned no data", attempt, best_idx)
-                with _PORTAUDIO_LOCK:
-                    test_stream.stop_stream()
-                    _shared_close(test_stream)
+                _vlog.warning("reconnect_stream: attempt %d: idx=%s opened but delivered no frames", attempt, best_idx)
+                ch = LAST_MIC_CHOICE
+                if ch and ch.get("index") == best_idx:
+                    note_variant_failure(ch["name"], ch["host_api"])
             except Exception as exc:
                 _log_mic_open(p, best_idx, sample_rate, 1, chunk_samples, repr(exc), "reconnect_stream")
+            if test_stream is not None:
+                try:
+                    with _PORTAUDIO_LOCK:
+                        test_stream.stop_stream()
+                        _shared_close(test_stream)
+                except Exception as close_exc:
+                    _vlog.warning("reconnect_stream: closing unusable stream failed: %r", close_exc)
         return None
 
     def run(self):
@@ -2081,28 +2322,24 @@ class WakeWordDetector(threading.Thread):
                 # Device change / resume: no stream of ours is open here, so re-enumeration is safe.
                 self._reset_pa_pending = False
                 reset_shared_pyaudio()
-                if (getattr(self.cfg, "mic_device_index", None) if self.cfg else None) is None:
-                    self.device_index = None      # re-pick the best 16 kHz mic from the fresh device list
+                reset_variant_failures()
+                self.device_index = None          # raw indices are not stable: re-pick by name from the fresh list
             # Re-fetch every pass: reconnect_stream() resets the shared PyAudio instance.
             p = get_shared_pyaudio()
-            cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
-            active_idx = cfg_idx if cfg_idx is not None else self.device_index
+            cfg_name = self._cfg_mic_name()
+            if cfg_name != self._cfg_name_seen:   # the user picked another microphone
+                self._cfg_name_seen = cfg_name
+                self.device_index = None
+            active_idx = self.device_index
             if active_idx is None:
                 active_idx, _ = find_best_microphone(self.cfg, require_16k=True)
+                self._adopt_choice(active_idx)
             self.device_index = active_idx
 
             stream = None
             self._stream_fault = None
             try:
-                with _PORTAUDIO_LOCK:
-                    stream = _shared_open(p, 
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=sample_rate,
-                        input=True,
-                        input_device_index=active_idx,
-                        frames_per_buffer=chunk_samples,
-                    )
+                stream = _open_input(p, active_idx, chunk_samples)
                 _log_mic_open(p, active_idx, sample_rate, 1, chunk_samples, "OK", "WakeWordDetector.run")
                 self._set_state("ok", "")
             except Exception as exc:
@@ -2116,9 +2353,8 @@ class WakeWordDetector(threading.Thread):
             stream_error = False
             try:
                 while not self.stop.is_set():
-                    new_cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
-                    if new_cfg_idx is not None and new_cfg_idx != self.device_index:
-                        break
+                    if self._cfg_mic_name() != self._cfg_name_seen:
+                        break   # finally: closes the stream; the outer loop reopens the newly chosen mic
 
                     if self._suspended.is_set():
                         break   # finally: closes the stream; the outer loop then parks
@@ -2318,24 +2554,14 @@ class WakeWordDetector(threading.Thread):
         Actively captures an utterance with VAD and returns raw audio bytes.
         PortAudio lock is held only during stream open and close, never during blocking reads.
         """
-        cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
-        active_idx = cfg_idx if cfg_idx is not None else self.device_index
+        active_idx = self.device_index
         if active_idx is None:
             active_idx, _ = find_best_microphone(self.cfg)
 
-        import pyaudio
         p = get_shared_pyaudio()
         stream = None
         try:
-            with _PORTAUDIO_LOCK:
-                stream = _shared_open(p, 
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=16000,
-                    input=True,
-                    input_device_index=active_idx,
-                    frames_per_buffer=1280,
-                )
+            stream = _open_input(p, active_idx, 1280)
             _log_mic_open(p, active_idx, 16000, 1, 1280, "OK", "WakeWordDetector.listen")
             return self.record_utterance_with_vad(stream=stream, timeout_no_speech=timeout_no_speech)
         except Exception as exc:
@@ -2386,6 +2612,7 @@ class Voice(threading.Thread):
     is_speaking = False
     current_mic_index = None      # class-level so WakeWordDetector diagnostics never hit a missing attribute
     current_mic_name = "Auto"
+    last_capture_reason = ""      # why the last capture_answer returned nothing: no_speech | unavailable | no_audio
 
     def __init__(self, cfg, ctx, stop_event):
         super().__init__(name="Voice", daemon=True)
@@ -2671,8 +2898,8 @@ class Voice(threading.Thread):
         Voice.current_mic_index = dev_idx
         Voice.current_mic_name = dev_name
         print(f"[voice] Connecting to microphone [{dev_idx}]: {dev_name}")
-        _vlog.info("Voice: microphone chosen idx=%s name=%r (configured idx=%s)", dev_idx, dev_name,
-                   getattr(self.cfg, "mic_device_index", None))
+        _vlog.info("Voice: microphone chosen idx=%s name=%r (configured name=%r)", dev_idx, dev_name,
+                   getattr(self.cfg, "mic_device_name", ""))
 
         # STT background worker
         worker = threading.Thread(target=jarvis_log.run_logged,
@@ -2695,6 +2922,8 @@ class Voice(threading.Thread):
             followup_window=self.followup_window,
             device_index=dev_idx,
         )
+        self.wake_detector._adopt_choice(dev_idx)
+        self.wake_detector.on_mic_switch = self._on_mic_switched
         if self._suspended:
             self.wake_detector.set_suspended(True)
         self.wake_detector.start()
@@ -2705,12 +2934,6 @@ class Voice(threading.Thread):
                 _vlog.error("WakeWordDetector thread died (mic_state=%s); Voice exiting so the supervisor "
                             "restarts it", self.wake_detector.mic_state())
                 raise RuntimeError("WakeWordDetector thread died")
-            configured_idx = getattr(self.cfg, "mic_device_index", None)
-            if configured_idx is not None and configured_idx != self.wake_detector.device_index:
-                print(f"[voice] Switching microphone to [{configured_idx}]...")
-                self.wake_detector.device_index = configured_idx
-                self.current_mic_index = configured_idx
-
             configured_sens = getattr(self.cfg, "wake_sensitivity", None)
             if configured_sens is not None and configured_sens != self.wake_detector.sensitivity_str:
                 self.set_sensitivity(configured_sens)
@@ -2720,6 +2943,16 @@ class Voice(threading.Thread):
                 self.set_followup_window(float(configured_followup))
 
             self.stop.wait(timeout=0.5)
+
+    def _on_mic_switched(self, name):
+        """Stall recovery moved the detector to another microphone / host API: one island notice."""
+        Voice.current_mic_name = self.current_mic_name = name
+        ov = getattr(self.ctx, "overlay", None)
+        if ov:
+            try:
+                ov.post("say", text=f"Microphone switched to {name}", speak=False)
+            except Exception:
+                _vlog.warning("mic switch notice post failed", exc_info=True)
 
     _STT_OFFLINE_NOTICE_INTERVAL = 60.0
 
@@ -3013,22 +3246,38 @@ class Voice(threading.Thread):
     # ------------------------------------------------------------------ onboarding / calibration API
     CAPTURE_GRACE_S = 5.0
 
+    CAPTURE_NO_AUDIO_S = 2.0
+
     def _capture_raw(self, timeout, on_level):
-        """One no-wake-word utterance from the live mic stream (PCM16 bytes), or None. Blocking, bounded.
-        The detector thread records it on its own stream, so the main listen loop cannot collide."""
+        """One no-wake-word utterance from the live mic stream: (PCM16 bytes or None, reason). reason is ""
+        on success, "no_audio" when the mic delivers no frames at all (the capture returns within ~2 s of
+        that being evident instead of waiting out the whole timeout), else "no_speech" / "unavailable".
+        Blocking, bounded. The detector thread records it on its own stream, so the main listen loop cannot
+        collide."""
         wd = self.wake_detector
         if wd is None or self._suspended or wd.suspended:
-            return None
+            return None, "unavailable"
         req = wd.request_capture(timeout, on_level=on_level)
         if req is None:
             _vlog.info("capture dropped: detector busy or unavailable")
-            return None
+            return None, "unavailable"
         limit = float(timeout) + WakeWordDetector.CAPTURE_SPEAKING_WAIT_S + self.CAPTURE_GRACE_S
-        if not req.done.wait(limit):
-            wd.cancel_capture(req)
-            _vlog.warning("capture timed out after %.1fs", limit)
-            return None
-        return req.raw
+        t0 = time.monotonic()
+        while not req.done.wait(0.1):
+            waited = time.monotonic() - t0
+            if (waited >= self.CAPTURE_NO_AUDIO_S and not req.started.is_set()
+                    and wd.mic_state()[0] in ("stalled", "reconnecting", "down")):
+                wd.cancel_capture(req)
+                _vlog.warning("capture: no audio (mic_state=%s); giving up after %.1fs", wd.mic_state(), waited)
+                return None, "no_audio"
+            if waited >= limit:
+                wd.cancel_capture(req)
+                _vlog.warning("capture timed out after %.1fs", limit)
+                return None, "unavailable"
+        if req.no_audio:
+            _vlog.warning("capture: no audio frames from the microphone")
+            return None, "no_audio"
+        return req.raw, ("" if req.raw else "no_speech")
 
     def _transcribe_blocking(self, raw_bytes):
         """(text, confidence|None, engine) for a PCM16 clip on the calling thread, same engine order as
@@ -3049,8 +3298,10 @@ class Voice(threading.Thread):
     def capture_answer(self, timeout: float = 8.0, on_level=None) -> str:
         """Record ONE utterance without a wake word and return its transcript ("" on silence/timeout/
         error). It is NOT dispatched as a command. Blocking; call from a non-GUI thread.
-        on_level(float 0..1) is called from the audio thread once per 80 ms chunk."""
-        raw = self._capture_raw(timeout, on_level)
+        on_level(float 0..1) is called from the audio thread once per 80 ms chunk.
+        self.last_capture_reason afterwards is "" (heard speech), "no_speech", "unavailable" or "no_audio"
+        (the microphone delivered no audio: the answer failed because nothing could be heard)."""
+        raw, self.last_capture_reason = self._capture_raw(timeout, on_level)
         if not raw:
             return ""
         text, conf, engine = self._transcribe_blocking(raw)
@@ -3067,8 +3318,10 @@ class Voice(threading.Thread):
         a calibration sample (if learn_voice_clips) and returns
         {"ok", "transcript", "level_db", "snr_db", ...}. Blocking; call from a non-GUI thread."""
         out = {"ok": False, "transcript": "", "level_db": -120.0, "snr_db": 0.0}
-        raw = self._capture_raw(timeout, on_level)
+        raw, reason = self._capture_raw(timeout, on_level)
         if not raw:
+            if reason == "no_audio":
+                out["reason"] = "no_audio"
             return out
         m = analyze_levels(raw)
         text, conf, engine = self._transcribe_blocking(raw)

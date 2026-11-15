@@ -171,7 +171,7 @@ class TestDisplayControl(unittest.TestCase):
     @patch("subprocess.run")
     def test_windows_display_backend_powershell_cim_read(self, mock_run):
         backend = WindowsDisplayBackend()
-        mock_run.return_value = MagicMock(returncode=0, stdout="85\n")
+        mock_run.return_value = MagicMock(returncode=0, stdout="OK 85\n")
 
         with patch("sys.platform", "win32"):
             b = backend.get_brightness()
@@ -180,7 +180,7 @@ class TestDisplayControl(unittest.TestCase):
     @patch("subprocess.run")
     def test_windows_display_backend_powershell_cim_write(self, mock_run):
         backend = WindowsDisplayBackend()
-        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        mock_run.return_value = MagicMock(returncode=0, stdout="OK 40 90 90 90\n")  # before target want readback
 
         with patch("sys.platform", "win32"):
             res = backend.set_brightness(90)

@@ -340,3 +340,21 @@ def test_clean_name():
     assert W._clean_name("My name is talib.") == "Talib"
     assert W._clean_name("call me Big Al") == "Big Al"
     assert W._clean_name("") == ""
+
+
+NO_AUDIO = "I can't hear your microphone. Pick it in Settings > Voice > Input Microphone, or skip this step."
+
+
+def test_no_audio_shows_pick_your_microphone_footnote(make, app):
+    v = FakeVoice()
+    v.last_capture_reason = "no_audio"
+    win, ctx, cfg, _ = make(v)
+    win._go(1, speak=False)
+    win._listen("name")
+    _settle(win, app)
+    assert _footnote(win.name_card) == NO_AUDIO and win._busy is None
+    v.calibrate_from_sample = lambda *a, **k: {"ok": False, "reason": "no_audio"}
+    win._go(3, speak=False)
+    win._start_samples()
+    _settle(win, app)
+    assert _footnote(win.voice_card) == NO_AUDIO

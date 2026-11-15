@@ -24,7 +24,7 @@ class TestConfigMigrationV5(unittest.TestCase):
                             "mic_pause_threshold": 1.0})
         self.assertEqual((cfg.frame_width, cfg.frame_height), (640, 480))
         self.assertEqual(cfg.mic_pause_threshold, 0.5)
-        self.assertEqual(saved["config_version"], 5)
+        self.assertEqual(saved["config_version"], 6)
 
     def test_custom_values_are_kept(self):
         cfg, _ = _load({"config_version": 4, "frame_width": 1920, "frame_height": 1080,

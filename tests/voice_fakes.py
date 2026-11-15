@@ -73,6 +73,7 @@ def install_audio(monkeypatch):
     env = AudioEnv()
     monkeypatch.setattr(voice, "get_shared_pyaudio", lambda: object())
     monkeypatch.setattr(voice, "_shared_open", env.open)
+    monkeypatch.setattr(voice, "_open_input", lambda p, idx, chunk_samples=1280, opener=None: env.open(p, input_device_index=idx))
     monkeypatch.setattr(voice, "_shared_close", lambda s: s.close())
     monkeypatch.setattr(voice, "find_best_microphone", lambda *a, **k: (0, "fake"))
     monkeypatch.setattr(voice, "_log_mic_open", lambda *a, **k: None)

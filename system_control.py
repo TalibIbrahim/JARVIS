@@ -314,10 +314,86 @@ class FallbackDisplayBackend:
         return self._night_light
 
 
+class BrightnessError(RuntimeError):
+    """The display's brightness could not be read or changed (the caller must report it, never claim success)."""
+
+
+class BrightnessUnsupportedError(BrightnessError):
+    """This display has no WMI brightness control (desktop / external monitor)."""
+
+
+BRIGHTNESS_FAILED_REPLY = "I couldn't change the brightness on this display, sir."
+BRIGHTNESS_READ_FAILED_REPLY = "I couldn't read the brightness on this display, sir."
+BRIGHTNESS_UNSUPPORTED_REPLY = ("This display doesn't let Windows control its brightness, sir. "
+                                "External monitors usually need their own buttons.")
+
+# One PowerShell round trip: read, set with Invoke-CimMethod (the CimInstance object has no
+# WmiSetBrightness .NET method, so calling it directly always failed), then poll the readback.
+# Prints "OK <before> <target> <want> <after>", or NOWMI (exit 3) / ERR (exit 1).
+_PS_BRIGHTNESS = r"""
+$ErrorActionPreference = 'Stop'
+try {
+  $b = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness | Select-Object -First 1
+  $m = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods | Select-Object -First 1
+} catch { 'NOWMI'; exit 3 }
+if (-not $b -or -not $m) { 'NOWMI'; exit 3 }
+try {
+  $before = [int]$b.CurrentBrightness
+  $t = [int]([Math]::Max(0, [Math]::Min(100, __TARGET__)))
+  $lv = @($b.Level | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+  $want = $t
+  if ($lv.Count -gt 0) {
+    $want = ($lv | Sort-Object { [Math]::Abs($_ - $t) } | Select-Object -First 1)
+    if (__RELATIVE__ -and $want -eq $before -and $t -ne $before) {
+      if ($t -gt $before) { $n = @($lv | Where-Object { $_ -gt $before }) | Select-Object -First 1 }
+      else { $n = @($lv | Where-Object { $_ -lt $before }) | Select-Object -Last 1 }
+      if ($null -ne $n) { $want = [int]$n }
+    }
+  }
+  if ($want -ne $before) {
+    $null = Invoke-CimMethod -InputObject $m -MethodName WmiSetBrightness -Arguments @{Timeout = [uint32]1; Brightness = [byte]$want}
+  }
+  $after = $before
+  for ($i = 0; $i -lt 10; $i++) {
+    $after = [int](Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness | Select-Object -First 1).CurrentBrightness
+    if ($after -eq $want) { break }
+    Start-Sleep -Milliseconds 50
+  }
+  "OK $before $t $want $after"
+} catch { 'ERR ' + $_.Exception.Message; exit 1 }
+"""
+
+_PS_BRIGHTNESS_GET = r"""
+$ErrorActionPreference = 'Stop'
+try { $b = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness | Select-Object -First 1 }
+catch { 'NOWMI'; exit 3 }
+if (-not $b) { 'NOWMI'; exit 3 }
+"OK $([int]$b.CurrentBrightness)"
+"""
+
+
+def _run_powershell(script: str, timeout: float) -> Tuple[int, str]:
+    res = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return res.returncode, (res.stdout or "").strip()
+
+
+def _status_line(out: str) -> str:
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
 class WindowsDisplayBackend:
     """
-    Direct Windows display adapter using WmiMonitorBrightnessMethods and PowerShell CIM
-    with night light registry state toggling.
+    Windows laptop-panel brightness via WmiMonitorBrightness(Methods) in ONE PowerShell call per
+    operation, verified by reading CurrentBrightness back. Raises BrightnessUnsupportedError when the
+    display has no WMI brightness, BrightnessError when the change did not take. Night light toggles
+    the registry state.
     """
 
     def __init__(self):
@@ -326,82 +402,56 @@ class WindowsDisplayBackend:
     def get_brightness(self) -> int:
         if sys.platform != "win32":
             return self._fallback.get_brightness()
-
-        # 1. Try python wmi if installed
         try:
-            import wmi  # type: ignore
-            w = wmi.WMI(namespace="wmi")
-            monitors = w.WmiMonitorBrightness()
-            if monitors and len(monitors) > 0:
-                b = int(monitors[0].CurrentBrightness)
-                self._fallback.set_brightness(b)
-                return b
-        except Exception:
-            pass
+            code, out = _run_powershell(_PS_BRIGHTNESS_GET, timeout=4)
+        except Exception as exc:
+            raise BrightnessError(f"brightness read failed: {exc!r}") from exc
+        line = _status_line(out)
+        if code == 3 or line == "NOWMI":
+            raise BrightnessUnsupportedError("no WMI brightness on this display")
+        parts = line.split()
+        if code != 0 or len(parts) != 2 or parts[0] != "OK" or not parts[1].lstrip("-").isdigit():
+            raise BrightnessError(f"brightness read failed (exit {code}): {line[:120]}")
+        b = int(parts[1])
+        self._fallback.set_brightness(b)
+        return b
 
-        # 2. Try PowerShell CIM query
+    def _apply(self, target_expr: str, relative: bool) -> int:
+        script = _PS_BRIGHTNESS.replace("__TARGET__", target_expr).replace(
+            "__RELATIVE__", "$true" if relative else "$false")
         try:
-            cmd = "Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness | Select-Object -ExpandProperty CurrentBrightness"
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if res.returncode == 0 and res.stdout.strip():
-                lines = res.stdout.strip().split()
-                if lines and lines[0].isdigit():
-                    b = int(lines[0])
-                    self._fallback.set_brightness(b)
-                    return b
-        except Exception:
-            pass
-
-        return self._fallback.get_brightness()
+            code, out = _run_powershell(script, timeout=6)
+        except Exception as exc:
+            raise BrightnessError(f"brightness set failed: {exc!r}") from exc
+        line = _status_line(out)
+        if code == 3 or line == "NOWMI":
+            raise BrightnessUnsupportedError("no WMI brightness on this display")
+        parts = line.split()
+        if code != 0 or len(parts) != 5 or parts[0] != "OK" or not all(p.lstrip("-").isdigit() for p in parts[1:]):
+            raise BrightnessError(f"brightness set failed (exit {code}): {line[:120]}")
+        _before, _target, want, after = (int(p) for p in parts[1:])
+        if after != want:
+            raise BrightnessError(f"brightness readback {after} != requested {want}")
+        self._fallback.set_brightness(after)
+        return after
 
     def set_brightness(self, level: int) -> int:
         clamped = max(0, min(100, int(level)))
-        self._fallback.set_brightness(clamped)
-
         if sys.platform != "win32":
-            return clamped
-
-        # 1. Try python wmi
-        try:
-            import wmi  # type: ignore
-            w = wmi.WMI(namespace="wmi")
-            methods = w.WmiMonitorBrightnessMethods()
-            if methods and len(methods) > 0:
-                methods[0].WmiSetBrightness(Timeout=1, Brightness=clamped)
-                return clamped
-        except Exception:
-            pass
-
-        # 2. Try PowerShell CIM call
-        try:
-            cmd = f"(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods).WmiSetBrightness(1, {clamped})"
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                capture_output=True,
-                text=True,
-                timeout=4,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if res.returncode == 0:
-                return clamped
-        except Exception:
-            pass
-
-        return clamped
+            return self._fallback.set_brightness(clamped)
+        return self._apply(str(clamped), relative=False)
 
     def brightness_up(self, steps: int = 10) -> int:
-        current = self.get_brightness()
-        return self.set_brightness(current + steps)
+        steps = max(1, int(steps))
+        if sys.platform != "win32":
+            return self._fallback.brightness_up(steps)
+        return self._apply(f"$before + {steps}", relative=True)
 
     def brightness_down(self, steps: int = 10) -> int:
-        current = self.get_brightness()
-        return self.set_brightness(current - steps)
+        steps = max(1, int(steps))
+        if sys.platform != "win32":
+            return self._fallback.brightness_down(steps)
+        return self._apply(f"$before - {steps}", relative=True)
 
     def toggle_night_light(self) -> bool:
         if sys.platform != "win32":
@@ -878,21 +928,34 @@ class SystemControlAdapter:
 
     # --- Display API ---
 
+    def _brightness_call(self, fn, ok_text: str, fail_text: str = BRIGHTNESS_FAILED_REPLY) -> Tuple[bool, str]:
+        """Runs a display call; a failure is reported honestly, never as success."""
+        try:
+            lvl = fn()
+        except BrightnessUnsupportedError:
+            return False, BRIGHTNESS_UNSUPPORTED_REPLY
+        except Exception as exc:
+            import jarvis_log
+            jarvis_log.get_logger("system_control").warning("brightness: %s", exc)
+            return False, fail_text
+        return True, ok_text.format(lvl=lvl)
+
     def brightness_up(self, steps: int = 10) -> Tuple[bool, str]:
-        lvl = self.display.brightness_up(steps=steps)
-        return True, f"Screen brightness increased to {lvl} percent, sir."
+        return self._brightness_call(lambda: self.display.brightness_up(steps=steps),
+                                     "Screen brightness increased to {lvl} percent, sir.")
 
     def brightness_down(self, steps: int = 10) -> Tuple[bool, str]:
-        lvl = self.display.brightness_down(steps=steps)
-        return True, f"Screen brightness lowered to {lvl} percent, sir."
+        return self._brightness_call(lambda: self.display.brightness_down(steps=steps),
+                                     "Screen brightness lowered to {lvl} percent, sir.")
 
     def set_brightness(self, level: int) -> Tuple[bool, str]:
-        lvl = self.display.set_brightness(level=level)
-        return True, f"Screen brightness calibrated to {lvl} percent, sir."
+        return self._brightness_call(lambda: self.display.set_brightness(level=level),
+                                     "Screen brightness set to {lvl} percent, sir.")
 
     def get_brightness(self) -> Tuple[bool, str]:
-        lvl = self.display.get_brightness()
-        return True, f"Current display brightness is at {lvl} percent, sir."
+        return self._brightness_call(self.display.get_brightness,
+                                     "Current display brightness is at {lvl} percent, sir.",
+                                     BRIGHTNESS_READ_FAILED_REPLY)
 
     def toggle_night_light(self) -> Tuple[bool, str]:
         on = self.display.toggle_night_light()

@@ -24,6 +24,7 @@ from ui.cursor_overlay import CursorFeedbackOverlay
 from ui.settings_window import SettingsWindow
 from ui.tray import JarvisTray
 from ui import glass as _glass          # Liquid Glass material (radial menu, tooltips, Settings)
+from command_catalog import shows_action_chip
 
 
 def _qt_excepthook(exc_type, exc_val, exc_tb):
@@ -343,8 +344,9 @@ class Overlay:
                         win_title = str(d.get("title") or d.get("window") or "Switch Window")
                         if hasattr(self.island, "trigger_hud_window"):
                             self.island.trigger_hud_window(title=win_title, duration=1.5)
-                    else:
-                        label = action.replace("_", " ").title() if action else "Directive Confirmed"
+                    elif shows_action_chip(action):
+                        # System actions only; small talk, time, weather, Q&A keep their plain reply.
+                        label = action.replace("_", " ").title()
                         if hasattr(self.island, "trigger_result"):
                             self.island.trigger_result(text=label, icon="success" if success else "error", duration=2.5)
                 elif kind == "no_speech":

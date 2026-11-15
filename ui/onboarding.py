@@ -55,6 +55,14 @@ def find_best_microphone(cfg=None):
     return _f(cfg)
 
 
+def resolve_mic_index(cfg):
+    try:
+        from voice import resolve_mic_index as _f
+    except ImportError:
+        return None
+    return _f(cfg)
+
+
 def probe_mic_level(dev=None):
     try:
         from voice import probe_mic_level as _f
@@ -241,9 +249,10 @@ class OnboardingDialog(QDialog):
         self._mic_combo = QComboBox()
         mics = list_microphones()
         best_idx, best_name = find_best_microphone(self.cfg)
-        self._mic_combo.addItem(f"Auto-detect ({best_name[:22]})", -1)
+        self._mic_combo.addItem(f"Auto-detect ({best_name[:22]})", "")
         for m in mics:
-            self._mic_combo.addItem(f"[{m['index']}] {m['name'][:28]}", m["index"])
+            if not m.get("is_virtual"):
+                self._mic_combo.addItem(m["name"][:36], m["name"])
         card.add_row("Microphone Input", "Physical audio recording device", self._mic_combo)
 
         self._onboard_mic_meter = MicLevelMeter()
@@ -262,7 +271,7 @@ class OnboardingDialog(QDialog):
     def _tick_mic_meter(self) -> None:
         if self._step == 1:
             try:
-                dev = self.cfg.mic_device_index
+                dev = resolve_mic_index(self.cfg)
                 norm, _ = probe_mic_level(dev)
                 self._onboard_mic_meter.update_level(norm)
             except Exception:
@@ -324,7 +333,7 @@ class OnboardingDialog(QDialog):
             self._meter_timer.start()
         elif self._step == 1:
             dev = self._mic_combo.currentData()
-            self.cfg.mic_device_index = None if dev == -1 else dev
+            self.cfg.mic_device_name = str(dev or "")
             self._meter_timer.stop()
             self._step = 2
             self._stack.setCurrentIndex(2)

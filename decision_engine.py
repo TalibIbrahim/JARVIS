@@ -49,6 +49,17 @@ _RE_PLAY_MUSIC = re.compile(
     r"(?:play|put on|listen to|search(?:\s+for)?|look\s+up)\s+(.+?)(?:\s+(?:on|in)\s+(?:spotify|youtube|you tube|yt))?$")
 _RE_SET_VOLUME = re.compile(r"\b(?:set\s+)?volume\s+(?:to\s+)?(\d{1,3})\b")
 _RE_SET_BRIGHTNESS = re.compile(r"\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})\b")
+_BRIGHTNESS_ACTIONS = frozenset({"set_brightness", "brightness_up", "brightness_down", "get_brightness"})
+
+
+def _brightness_level(clean: str) -> int:
+    """Level for a set_brightness decision: the shared local parser ("full brightness" -> 100), then a number."""
+    from commands import parse_brightness_intent
+    parsed = parse_brightness_intent(clean)
+    if parsed and parsed[0] == "set_brightness":
+        return int(parsed[1]["level"])
+    m = _RE_SET_BRIGHTNESS.search(clean)
+    return max(0, min(100, int(m.group(1)))) if m else 50
 _RE_SWITCH_APP = re.compile(r"(?:switch\s+(?:to\s+)?)(.+)")
 _RE_QUICK_NOTE = re.compile(r"(?:note\s+that|take\s+(?:a\s+)?note|write\s+down|add\s+note)\s+(.+)")
 
@@ -846,8 +857,7 @@ def _extract_args_for_action(action: str, clean: str) -> Dict[str, Any]:
     elif action in ("brightness_up", "brightness_down"):
         args["steps"] = 10
     elif action == "set_brightness":
-        m = _RE_SET_BRIGHTNESS.search(clean)
-        args["level"] = int(m.group(1)) if m else 50
+        args["level"] = _brightness_level(clean)
     elif action == "snap_window":
         dir_val = "left"
         if "right" in clean:
@@ -1396,8 +1406,7 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
         args = {"steps": 10}
         reply = "Screen brightness lowered, sir."
     elif action == "set_brightness":
-        m = _RE_SET_BRIGHTNESS.search(clean)
-        lvl = int(m.group(1)) if m else 50
+        lvl = _brightness_level(clean)
         args = {"level": lvl}
         reply = f"Display brightness calibrated to {lvl} percent, sir."
     elif action == "toggle_night_light":
@@ -1565,6 +1574,9 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
             )
         except Exception:
             pass
+        if action in _BRIGHTNESS_ACTIONS:
+            return msg   # carries the level the display actually read back
         return reply or msg
-
+    if action in _BRIGHTNESS_ACTIONS:
+        return msg       # honest failure ("I couldn't change the brightness ..."), never a Groq retry
     return None

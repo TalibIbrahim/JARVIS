@@ -66,6 +66,7 @@ _SPOKEN = {
 MAX_SUGGESTIONS = 12
 
 VOICE_OFF_FOOTNOTE = "Voice commands are off. Turn them on in Settings > Voice, or skip this step."
+NO_AUDIO_FOOTNOTE = "I can't hear your microphone. Pick it in Settings > Voice > Input Microphone, or skip this step."
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -555,7 +556,7 @@ class OnboardingWindow(QDialog):
         self.done_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         v.addWidget(self.done_title)
         card = GroupedCard()
-        card.add_row("Say “Jarvis”", "Then speak your request", QWidget())
+        card.add_row("Say “Hey Jarvis”", "Then speak your request", QWidget())
         card.add_row("Hover the island", "Scroll to Type or Talk and write to me", QWidget())
         card.add_row("Change anything", "Tray icon › Settings", QWidget())
         v.addWidget(card)
@@ -784,8 +785,10 @@ class OnboardingWindow(QDialog):
 
         def _work():
             text = ""
+            self._no_audio = False
             try:
                 text = voice.capture_answer(timeout=8.0, on_level=cb) or ""
+                self._no_audio = not text and getattr(voice, "last_capture_reason", "") == "no_audio"
             except Exception as exc:
                 print(f"[onboarding] capture_answer failed: {exc}")
             self._sig_answer.emit(which, token, str(text))
@@ -806,6 +809,13 @@ class OnboardingWindow(QDialog):
             return
         self._busy = None
         text = (text or "").strip()
+        if not text and getattr(self, "_no_audio", False):
+            (self.name_mic if which == "name" else self.apps_mic).set_active(False)
+            if which == "name":
+                self.name_card.set_footnote(NO_AUDIO_FOOTNOTE)
+            else:
+                self._set_usage_footnote(NO_AUDIO_FOOTNOTE)
+            return
         if which == "name":
             self.name_mic.set_active(False)
             cleaned = self._clean_name(text)
@@ -887,7 +897,7 @@ class OnboardingWindow(QDialog):
                     res = calibrate(VOICE_SAMPLES[i], timeout=12.0, on_level=cb)
                     if isinstance(res, dict):
                         ok = bool(res.get("ok", res.get("success", True)))
-                        err = str(res.get("error", "") or "")
+                        err = str(res.get("error", "") or res.get("reason", "") or "")
                     else:
                         ok = bool(res)
                 except Exception as exc:
@@ -934,7 +944,8 @@ class OnboardingWindow(QDialog):
             self.voice_mic.set_active(False)
             self.voice_meter.update_level(0.0)
             self._show_sample(self._sample_done, reading=False)
-            self.voice_card.set_footnote("I couldn’t hear that clearly. Tap the mic to try again, or continue.")
+            self.voice_card.set_footnote(NO_AUDIO_FOOTNOTE if err == "no_audio" else
+                                         "I couldn’t hear that clearly. Tap the mic to try again, or continue.")
 
     # ── usage page ──────────────────────────────────────────────────────
 

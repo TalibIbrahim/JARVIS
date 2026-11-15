@@ -76,6 +76,36 @@ def find_best_microphone(cfg=None):
     return _f(cfg)
 
 
+def resolve_mic_index(cfg):
+    try:
+        from voice import resolve_mic_index as _f
+    except ImportError:
+        return None
+    return _f(cfg)
+
+
+def _same_mic(a, b):
+    try:
+        from voice import _names_match
+    except ImportError:
+        return a == b
+    return _names_match(a, b)
+
+
+def mic_combo_entries(mics, active_name=None):
+    """(label, name) per physical microphone for the Input Microphone dropdown. `mics` is already one entry
+    per mic (voice.list_microphones); virtual / loopback devices are hidden. The item data is the mic NAME,
+    which is what is saved (raw device indices are not stable)."""
+    out = []
+    for m in mics:
+        if m.get("is_virtual"):
+            continue
+        name = m["name"]
+        tag = "  [Active]" if active_name and name == active_name else ""
+        out.append((f"{name[:36]}{tag}", name))
+    return out
+
+
 def probe_mic_level(dev=None):
     try:
         from voice import probe_mic_level as _f
@@ -2085,7 +2115,7 @@ class SettingsWindow(QDialog):
         # ── Listening controls (top of the wake-word section) ──
         self.listen_switch = AppleSwitch(bool(getattr(self.cfg, "listen_for_jarvis", True)))
         self.listen_switch.toggled.connect(self._on_listen_toggled)
-        card.add_row("Listen for “Jarvis”",
+        card.add_row("Listen for “Hey Jarvis”",
                      "When off, the microphone stays closed and nothing is recorded until you make the listen gesture.",
                      self.listen_switch)
 
@@ -2123,12 +2153,12 @@ class SettingsWindow(QDialog):
         best_idx, best_name = find_best_microphone(self.cfg)
         self.mic_combo = AppleComboBox()
         self.mic_combo.setMinimumWidth(240)
-        self.mic_combo.addItem(f"Auto-detect ({best_name[:22]})", -1)
+        self.mic_combo.addItem(f"Auto-detect ({best_name[:22]})", "")
         sel_mic = 0
-        for i, m in enumerate(mics):
-            tag = "  [Active]" if m["index"] == best_idx else ""
-            self.mic_combo.addItem(f"[{m['index']}]  {m['name'][:30]}{tag}", m["index"])
-            if self.cfg.mic_device_index == m["index"]:
+        cur_mic = str(getattr(self.cfg, "mic_device_name", "") or "")
+        for i, (label, name) in enumerate(mic_combo_entries(mics, best_name)):
+            self.mic_combo.addItem(label, name)
+            if cur_mic and name == next((m["name"] for m in mics if _same_mic(m["name"], cur_mic)), None):
                 sel_mic = i + 1
         self.mic_combo.setCurrentIndex(sel_mic)
         self.mic_combo.currentIndexChanged.connect(self._on_mic_selected)
@@ -3677,10 +3707,9 @@ class SettingsWindow(QDialog):
         self.lyrics_pill_switch.setEnabled(bool(on))
 
     def _on_mic_selected(self, combo_idx: int) -> None:
-        dev = self.mic_combo.itemData(combo_idx)
-        val = None if dev == -1 else dev
-        self._save("mic_device_index", val)
-        self.cfg.mic_device_index = val
+        val = str(self.mic_combo.itemData(combo_idx) or "")     # "" = auto-detect
+        self._save("mic_device_name", val)
+        self.cfg.mic_device_name = val
 
     def _on_mic_level_updated(self, norm: float) -> None:
         if hasattr(self, "_mic_meter"):
@@ -3705,7 +3734,7 @@ class SettingsWindow(QDialog):
             return
 
         self._mic_probing = True
-        dev_idx = getattr(self.cfg, "mic_device_index", None)
+        dev_idx = resolve_mic_index(self.cfg)
 
         def worker():
             try:
@@ -3725,7 +3754,7 @@ class SettingsWindow(QDialog):
         self.lbl_test_result.setStyleSheet(f"color: {T.color.accent.resolve(self._dark).name()};")
 
         def worker():
-            res = test_microphone_recognition(device_index=self.cfg.mic_device_index, duration=3.5)
+            res = test_microphone_recognition(device_index=resolve_mic_index(self.cfg), duration=3.5)
             self.bridge.test_mic_result.emit(res)
 
         threading.Thread(target=worker, daemon=True).start()

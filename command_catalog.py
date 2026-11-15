@@ -213,6 +213,36 @@ _CATALOG: List[CommandSpec] = [
 ]
 
 
+# Actions that change the computer (volume, display, media, apps/sites, windows, power, files, input).
+# Only these earn the island's green "done" chip; small talk, status, time/date, weather, wiki/Q&A,
+# LLM answers and profile statements keep their normal reply display with no check.
+SYSTEM_CHIP_ACTIONS = frozenset({
+    # audio / media
+    "volume_up", "volume_down", "set_volume", "mute", "play_pause", "next_track", "previous_track",
+    "play_music",
+    # display
+    "set_brightness", "brightness_up", "brightness_down", "toggle_night_light", "screenshot",
+    # apps & web
+    "open_app", "open_site", "search", "site_search", "house_party",
+    # windows
+    "snap_window", "maximize_window", "minimize_window", "minimize_all", "show_desktop", "switch_window",
+    "switch_to_app", "move_to_other_monitor", "close_window", "close_this", "open_this", "copy_this",
+    "stealth_mode", "clean_slate",
+    # power & connectivity
+    "lock_workstation", "sleep_system", "shutdown_system", "restart_system", "toggle_wifi", "toggle_bluetooth",
+    "toggle_do_not_disturb",
+    # files & folders
+    "open_folder", "open_file", "open_recent_file", "show_last_download", "remember_folder",
+    # input
+    "type_text", "scroll",
+})
+
+
+def shows_action_chip(action) -> bool:
+    """True when a completed action should show the island's result chip/check."""
+    return isinstance(action, str) and action in SYSTEM_CHIP_ACTIONS
+
+
 def get_catalog() -> List[CommandSpec]:
     """Return a copy of the catalog (entries are immutable)."""
     return list(_CATALOG)
