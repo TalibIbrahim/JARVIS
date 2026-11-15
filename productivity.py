@@ -6,7 +6,7 @@ Provides:
     - Appends timestamped entries to a persistent markdown file (default: ~/Documents/Jarvis_Notes.md).
     - Voice commands: "note that <text>", "take a note <text>", "write down <text>", "read last note".
 - Dictation:
-    - "type <text>" inserts text into active field via pyautogui.
+    - "type <text>" inserts text into active field via win_input (SendInput).
     - Dictation mode toggle: "start dictation" / "dictation mode on", "stop dictation" / "dictation mode off".
 - Clipboard:
     - Read clipboard text ("read clipboard", "what's on my clipboard").
@@ -21,17 +21,9 @@ import os
 import re
 import sys
 import threading
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-class _LazyPyAutoGUI:
-    """pyautogui pulls in cv2/numpy/Pillow (+11 MB, ~200 ms); import it on first real use."""
-
-    def __getattr__(self, name):
-        import pyautogui as _pag
-        return getattr(_pag, name)
-
-
-pyautogui = _LazyPyAutoGUI()
+import win_input
 
 
 # =====================================================================
@@ -151,25 +143,22 @@ def set_dictation_mode(enabled: bool) -> bool:
 def type_text(text: str, use_paste_fallback: bool = True) -> bool:
     """
     Types text into the active Windows focused field.
-    Uses pyautogui.write for ASCII and clipboard paste (Ctrl+V) for unicode/multiline.
+    Uses win_input.write for ASCII and clipboard paste (Ctrl+V) for unicode/multiline.
     """
     clean_text = text.strip()
     if not clean_text:
         return False
 
     try:
-        if pyautogui is None:
-            return False
-
         # Check if text contains non-ASCII characters or special punctuation
         is_pure_ascii = all(32 <= ord(c) < 127 for c in clean_text)
         if is_pure_ascii and not use_paste_fallback:
-            pyautogui.write(clean_text, interval=0.01)
+            win_input.write(clean_text, interval=0.01)
             return True
 
         # Clipboard paste approach: preserves emojis, formatting, and unicode accurately
         set_clipboard_text(clean_text)
-        pyautogui.hotkey("ctrl", "v", _pause=False)
+        win_input.hotkey("ctrl", "v")
         return True
     except Exception as exc:
         print(f"[productivity] type_text note: {exc}")
@@ -280,11 +269,6 @@ def summarize_text(text: str, max_sentences: int = 3) -> str:
 
     summary = " ".join(item[2] for item in top)
     return summary
-
-
-class TranslatorProtocol(Protocol):
-    def translate(self, text: str, target_language: str) -> str:
-        ...
 
 
 _TRANSLATOR_HOOK: Optional[Callable[[str, str], str]] = None

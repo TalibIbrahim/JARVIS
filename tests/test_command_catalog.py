@@ -42,7 +42,7 @@ class _Env:
 
 @pytest.fixture(scope="module")
 def env():
-    import pyautogui
+    import win_input
     import subprocess
     import webbrowser
     import jarvis_log as jl
@@ -55,8 +55,9 @@ def env():
     e.EV, e.CALLS, e.groq_used = [], [], []
 
     mp.setattr(jl, "utterance_event", lambda stage, uid=None, **f: e.EV.append((stage, f)))
-    for n in ("press", "hotkey", "scroll", "write", "typewrite", "click", "keyDown", "keyUp", "mouseDown", "mouseUp"):
-        mp.setattr(pyautogui, n, lambda *a, **k: e.CALLS.append("pyautogui"))
+    for n in ("press", "hotkey", "scroll", "write", "click", "key_down", "key_up", "mouse_down", "mouse_up",
+              "screenshot"):
+        mp.setattr(win_input, n, lambda *a, **k: e.CALLS.append("win_input"))
     mp.setattr(subprocess, "Popen", lambda *a, **k: e.CALLS.append(("Popen", a)) or NS(pid=0))
     mp.setattr(subprocess, "run", lambda *a, **k: NS(stdout="", returncode=0))
     mp.setattr(webbrowser, "open", lambda *a, **k: e.CALLS.append(("web", a)) or True)

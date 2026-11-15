@@ -243,7 +243,7 @@ def test_transcript_to_dispatch_p99_under_50ms_warm(monkeypatch):
                     t0 = time.perf_counter()
                     v._process(c, is_command=True)
                     out.append((time.perf_counter() - t0) * 1000.0)
-            assert any(n.startswith(("system_control.", "pyautogui.", "webbrowser.", "subprocess."))
+            assert any(n.startswith(("system_control.", "win_input.", "webbrowser.", "subprocess."))
                        for n in g.names()), "no mocked side effect recorded: commands were not dispatched"
             return out
 

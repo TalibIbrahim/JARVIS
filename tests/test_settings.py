@@ -8,7 +8,12 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from config import Config
-from overlay import Spring, PYSIDE6_AVAILABLE
+from ui.components import Spring
+try:
+    import PySide6  # noqa: F401
+    PYSIDE6_AVAILABLE = True
+except ImportError:
+    PYSIDE6_AVAILABLE = False
 import voice
 
 
@@ -75,7 +80,7 @@ class TestSettingsWindowInteractions(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication(sys.argv)
 
     def setUp(self):
-        from overlay import Overlay, SettingsWindow
+        from overlay import Overlay
         self.cfg = Config()
         self.stop = threading.Event()
         self.ctx = MagicMock()

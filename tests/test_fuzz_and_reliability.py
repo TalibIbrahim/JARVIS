@@ -26,7 +26,8 @@ from unittest.mock import MagicMock, patch
 from config import Config, load_config, save_config
 from decision_engine import SemanticDecisionEngine, DecisionMatch, evaluate_decision, get_decision_engine
 import system_control
-from system_control import MockWindowBackend, SystemControlAdapter, ELEVATED_WINDOW_EXPLANATION
+from system_control import SystemControlAdapter, ELEVATED_WINDOW_EXPLANATION
+from system_control_mocks import MockWindowBackend
 from thread_supervisor import ThreadSupervisor, explain_graceful_degradation
 
 

@@ -96,7 +96,7 @@ def test_tracker_session_toggles_controller_active():
     t.controller = um.MagicMock()
     with um.patch.object(tracker.Tracker, "_session_body", side_effect=RuntimeError("boom")):
         with pytest.raises(RuntimeError):
-            t._session(True)
+            t._session()
     assert [c.args for c in t.controller.set_active.call_args_list] == [(True,), (False,)]
 
 

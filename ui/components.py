@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 
 from ui.tokens import (
     T, COLOR, TYPE, SPRING, RADIUS, SPACING, SHADOW, SIZES,
-    SpringToken, SPRING_DT_MIN, SPRING_DT_MAX, REDUCE_MOTION_MS,
+    SPRING_DT_MIN, SPRING_DT_MAX, REDUCE_MOTION_MS,
     squircle_bezier_factor, qfont
 )
 from ui import glass as _glass          # glass imports components lazily (inside functions) -> no cycle
@@ -81,11 +81,6 @@ class Spring:
         self.velocity = 0.0
         self.k        = float(stiffness)
         self.c        = float(damping)
-
-    def from_preset(self, preset: SpringToken) -> "Spring":
-        self.k = preset.stiffness
-        self.c = preset.damping
-        return self
 
     def set_target(self, target: float) -> None:
         self.target = float(target)
@@ -594,12 +589,6 @@ class SegmentedControl(FocusRingMixin, _SpringTicker, QWidget):
             self._thumb_x = float(self._idx)
             self._timer.stop()
             self.update()
-
-    def _seg_rect(self, idx: int) -> QRectF:
-        n   = len(self.options)
-        w   = float(self.width())
-        seg = w / n
-        return QRectF(idx * seg, 0, seg, float(self.height()))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         n   = len(self.options)
@@ -1659,9 +1648,6 @@ class StatusPill(QWidget):
             return
         self._variant = variant
         self.update()
-
-    def set_variant(self, variant: str) -> None:
-        self.setVariant(variant)
 
     def paintEvent(self, event: QPaintEvent) -> None:
         p = QPainter(self)

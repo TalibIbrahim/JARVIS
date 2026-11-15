@@ -65,16 +65,6 @@ def run_transport(job) -> None:
     _TRANSPORT_Q.put(job)
 
 
-def wait_transport_idle(timeout: float = 2.0) -> bool:
-    """Block until queued transport jobs finished (tests / shutdown). Returns True when idle."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _TRANSPORT_Q.unfinished_tasks == 0:
-            return True
-        time.sleep(0.005)
-    return _TRANSPORT_Q.unfinished_tasks == 0
-
-
 def _press_media_key(vk: int) -> None:
     if sys.platform != "win32":
         return
@@ -323,21 +313,8 @@ def _shimmer_assets():
 
 def _persist_setting(key: str, value) -> None:
     """Worker-thread body: write one key to the config file (same atomic write the settings window uses)."""
-    try:
-        import json
-        import os
-        from config import get_config_path, _atomic_write_json
-        path = get_config_path()
-        data = {}
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        if not isinstance(data, dict):
-            data = {}
-        data[key] = value
-        _atomic_write_json(path, data)
-    except Exception as exc:
-        print(f"[island] persist {key} error: {exc}")
+    from config import update_key
+    update_key(key, value)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

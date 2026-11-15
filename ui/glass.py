@@ -219,11 +219,6 @@ class GlassSpec:
         return QColor(r, g, b, int(round(self.label_alpha * 255)))
 
     @property
-    def border_color(self) -> QColor:
-        return QColor(255, 255, 255, int(GLASS.border_dark * 255)) if self.dark else \
-            QColor(0, 0, 0, int(GLASS.border_light * 255))
-
-    @property
     def key(self) -> tuple:
         return (self.dark, self.mode, round(self.transparency, 3), self.material,
                 round(self.window_alpha, 3), round(self.plate_alpha, 3), round(self.label_alpha, 3))

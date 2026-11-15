@@ -73,14 +73,14 @@ class TestAssistantStateMachineGlue(unittest.TestCase):
         run_command("lock workstation", self.ctx)
         self.ctx.overlay.post.assert_any_call("action_executed", action="lock_workstation", success=True)
 
-    @patch("pyautogui.screenshot")
+    @patch("win_input.screenshot")
     @patch("os.makedirs")
     def test_screenshot_command_completion_posts_action_executed(self, mock_dirs, mock_shot):
         """Screenshot execution posts action_executed with screenshot action."""
         run_command("take screenshot", self.ctx)
         self.ctx.overlay.post.assert_any_call("action_executed", action="screenshot", success=True)
 
-    @patch("pyautogui.press")
+    @patch("win_input.press")
     def test_whitelisted_action_execution_posts_action_executed_success(self, mock_press):
         """execute_whitelisted_action posts action_executed with success=True."""
         ok, msg = execute_whitelisted_action("volume_up", {"steps": 5}, self.ctx)

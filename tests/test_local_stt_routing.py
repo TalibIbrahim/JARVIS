@@ -43,24 +43,19 @@ def _voice(monkeypatch, local, ai=True, engine="local", cooldown=False):
     if cooldown:
         v.groq_cooldown_until = time.time() + 100
     v._groq = MagicMock(return_value=("groq text", False))
-    v._google = MagicMock(return_value="google text")
     v._process = MagicMock()
     monkeypatch.setattr(v, "_stt_groq", v._groq)
-    monkeypatch.setattr(v, "_fallback_google", v._google)
     return v
 
 
 def _run(v, is_command):
-    import speech_recognition as sr
-    audio = sr.AudioData(_pcm(), 16000, 2)
-    v._handle_audio_item(MagicMock(), sr, MagicMock(is_enrolled=False), audio, is_command, time.time(), "u1")
+    v._handle_audio_item(MagicMock(is_enrolled=False), _pcm(), is_command, time.time(), "u1")
 
 
 def test_confident_local_never_calls_groq(monkeypatch):
     v = _voice(monkeypatch, FakeLocal(conf=0.9))
     _run(v, True)
     v._groq.assert_not_called()
-    v._google.assert_not_called()
     v._process.assert_called_once_with("open chrome", is_command=True)
 
 
@@ -68,7 +63,6 @@ def test_low_confidence_active_retries_groq(monkeypatch):
     v = _voice(monkeypatch, FakeLocal(conf=0.2))
     _run(v, True)
     v._groq.assert_called_once()
-    assert v._groq.call_args.kwargs["google_fallback"] is False
     v._process.assert_called_once_with("groq text", is_command=True)
 
 
@@ -77,7 +71,6 @@ def test_low_confidence_groq_failure_keeps_local_text(monkeypatch):
     v._groq.return_value = (None, False)
     _run(v, True)
     v._process.assert_called_once_with("open chrome", is_command=True)
-    v._google.assert_not_called()
 
 
 @pytest.mark.parametrize("ai,cooldown", [(False, False), (True, True)])
@@ -92,7 +85,6 @@ def test_passive_burst_never_reaches_groq(monkeypatch):
     v = _voice(monkeypatch, FakeLocal(text="jarvis open chrome", conf=0.1))
     _run(v, False)   # wake-less, no follow-up window
     v._groq.assert_not_called()
-    v._google.assert_not_called()
     v._process.assert_called_once_with("jarvis open chrome", is_command=False)
 
 
@@ -102,13 +94,35 @@ def test_engine_groq_keeps_old_path(monkeypatch):
     _run(v, True)
     assert local.calls == 0
     v._groq.assert_called_once()
-    assert v._groq.call_args.kwargs.get("google_fallback", True) is True
 
 
 def test_local_not_ready_falls_back_to_groq(monkeypatch):
     v = _voice(monkeypatch, FakeLocal(ready=False))
     _run(v, True)
     v._groq.assert_called_once()
+
+
+def test_no_engine_says_didnt_catch_that_in_active_session(monkeypatch):
+    v = _voice(monkeypatch, FakeLocal(ready=False), ai=False)
+    _run(v, True)
+    v._groq.assert_not_called()
+    v._process.assert_not_called()
+    v.ctx.say.assert_called_once_with("I didn't catch that, sir.")
+
+
+def test_no_engine_passive_stays_silent(monkeypatch):
+    v = _voice(monkeypatch, FakeLocal(ready=False), ai=False)
+    _run(v, False)
+    v._process.assert_not_called()
+    v.ctx.say.assert_not_called()
+
+
+def test_groq_network_failure_posts_offline_notice(monkeypatch):
+    v = _voice(monkeypatch, FakeLocal(ready=False))
+    v._groq.return_value = (None, True)
+    _run(v, True)
+    v.ctx.overlay.post.assert_any_call("error", text="No internet - speech unavailable")
+    v.ctx.say.assert_not_called()
 
 
 def test_local_exception_falls_back(monkeypatch):
@@ -285,3 +299,28 @@ def test_groq_client_is_reused(monkeypatch):
     b = voice._get_groq_stt_client("k", 10)
     c = voice._get_groq_stt_client("k2", 10)
     assert a is b and a is not c and len(made) == 2
+
+
+# ---- Settings "Test microphone": local STT, same result shape
+def test_microphone_test_uses_local_stt(monkeypatch):
+    local = FakeLocal(text="open chrome")
+    local.state = local_stt.READY
+    local.start_loading = lambda: None
+    monkeypatch.setattr(local_stt, "get_local_transcriber", lambda name="base.en": local)
+    monkeypatch.setattr(voice, "list_microphones", lambda: [{"index": 3, "name": "Mic X"}])
+    monkeypatch.setattr(voice, "_record_pcm16", lambda dev, dur, cb=None: _pcm(0.5))
+    res = voice.test_microphone_recognition(device_index=3, duration=0.5)
+    assert res["success"] is True and res["text"] == "open chrome" and res["device_name"] == "Mic X"
+    assert res["avg_level"] > 0 and res["max_level"] > 0 and res["error"] == ""
+    local.ready = False
+    res = voice.test_microphone_recognition(device_index=3, duration=0.5)
+    assert res["success"] is False and "not ready" in res["error"]
+
+
+def test_pcm16_wav_roundtrip():
+    import io
+    import wave
+    raw = _pcm(0.1)
+    with wave.open(io.BytesIO(voice._pcm16_wav(raw)), "rb") as w:
+        assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 16000)
+        assert w.readframes(w.getnframes()) == raw

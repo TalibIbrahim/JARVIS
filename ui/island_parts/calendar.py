@@ -7,7 +7,6 @@ The whole card content (left date panel, weekday header, rule, month grid) is re
 from __future__ import annotations
 
 import datetime
-from typing import Optional
 from PySide6.QtGui import QColor, QFontMetricsF, QPainter, QPixmap
 from PySide6.QtCore import QPointF, QRectF, Qt
 from ui.tokens import ISLAND, TYPE, qfont
@@ -128,9 +127,3 @@ class CalendarPageMixin:
             return
         pix = self._calendar_pixmap(data, getattr(self, "_paint_dpr", 1.0), scale)
         p.drawPixmap(QPointF(0.0, 0.0), pix)
-
-    def _draw_time_card(self, p: QPainter, w: float, h: float,
-                        now: float, dark: bool, primary: QColor, secondary: QColor,
-                        accent: Optional[QColor] = None) -> None:
-        """Expanded Calendar & Time Card."""
-        self._draw_calendar_card(p, w, h, now, dark, primary, secondary, accent or QColor(_C.accent))

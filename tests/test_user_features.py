@@ -13,7 +13,6 @@ from config import Config
 from gestures import GestureEngine, Hand, Pose
 import commands
 import voice
-import overlay
 
 
 class TestOpenPalmAndCameraRecovery(unittest.TestCase):
@@ -79,7 +78,7 @@ class TestMusicPlaybackAndIntelligence(unittest.TestCase):
         adapter = MagicMock(spec=MediaAdapter)
         set_media_adapter(adapter)
         try:
-            with patch("pyautogui.press") as mock_press:
+            with patch("win_input.press") as mock_press:
                 reply = commands.run_command("pause", ctx)
                 self.assertEqual(reply, "Done.")
                 adapter.play_pause.assert_called_once()
@@ -111,25 +110,6 @@ class TestWakeWordSiriExpansion(unittest.TestCase):
         ctx.chirp.assert_called_with("wake")
         # Verify voice spoke 'Yes, sir?'
         ctx.say.assert_called_with("Yes, sir?")
-
-    def test_dynamic_island_expands_to_siri_dimensions_when_listening(self):
-        """Dynamic Island dimensions when listening should expand to 380x52."""
-        if not overlay.PYSIDE6_AVAILABLE:
-            self.skipTest("PySide6 not available")
-        from PySide6.QtWidgets import QApplication
-        app = QApplication.instance() or QApplication([])
-
-        mgr = MagicMock()
-        mgr.cfg = Config()
-        island = overlay.AppleDynamicIsland(mgr)
-
-        # Set listening
-        island.listening_until = time.time() + 5.0
-        island.update_frame(time.time())
-
-        # Target spring dimensions must be 380 x 52
-        self.assertEqual(island.spring_w.target, 380.0)
-        self.assertEqual(island.spring_h.target, 52.0)
 
 
 class TestPhase5ReliabilityAndRecovery(unittest.TestCase):

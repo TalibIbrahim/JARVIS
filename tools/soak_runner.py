@@ -147,12 +147,14 @@ def run_soak(
          patch("system_control.volume_up", return_value=50), \
          patch("system_control.volume_down", return_value=50), \
          patch("system_control.get_foreground_window_title", return_value="Desktop"), \
-         patch("pyautogui.moveTo"), \
-         patch("pyautogui.click"), \
-         patch("pyautogui.doubleClick"), \
-         patch("pyautogui.mouseDown"), \
-         patch("pyautogui.mouseUp"), \
-         patch("pyautogui.scroll"):
+         patch("win_input.move_to"), \
+         patch("win_input.click"), \
+         patch("win_input.double_click"), \
+         patch("win_input.mouse_down"), \
+         patch("win_input.mouse_up"), \
+         patch("win_input.scroll"), \
+         patch("win_input.hotkey"), \
+         patch("win_input.press"):
 
         # Warm-up phase: exercise pipelines and trigger lazy imports/JIT caches
         for i in range(min(50, frames)):

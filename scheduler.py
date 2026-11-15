@@ -449,28 +449,8 @@ class LocalScheduler:
                     pass
 
     def _feed_island(self, now: Optional[float] = None) -> None:
-        """Feeds active timer status to island arbitrator and overlay."""
-        current = self._clock() if now is None else now
+        """Feeds active timer status to the overlay."""
         active_timer = self.get_active_timer()
-
-        # Update Island Arbitrator
-        try:
-            from island_arbitrator import get_island_arbitrator
-            arbitrator = get_island_arbitrator()
-            if active_timer:
-                rem = max(0.0, active_timer.target_time - current)
-                arbitrator.update_timer(
-                    is_active=True,
-                    remaining_seconds=rem,
-                    total_seconds=active_timer.duration_sec,
-                    label=active_timer.label,
-                    is_paused=active_timer.is_paused,
-                    has_finished=active_timer.has_finished,
-                )
-            else:
-                arbitrator.update_timer(is_active=False)
-        except Exception:
-            pass
 
         # Update Overlay timer_state
         if self._ctx and hasattr(self._ctx, "overlay") and self._ctx.overlay:
@@ -524,16 +504,6 @@ def get_scheduler(storage_path: Optional[str] = None, ctx: Any = None) -> LocalS
     elif ctx is not None and _SCHEDULER._ctx is None:
         _SCHEDULER._ctx = ctx
     return _SCHEDULER
-
-
-def set_scheduler(scheduler: Optional[LocalScheduler]) -> None:
-    global _SCHEDULER
-    if _SCHEDULER and _SCHEDULER != scheduler:
-        try:
-            _SCHEDULER.stop()
-        except Exception:
-            pass
-    _SCHEDULER = scheduler
 
 
 def handle_scheduler_command(text: str, ctx: Any = None, scheduler: Optional[LocalScheduler] = None) -> Optional[str]:

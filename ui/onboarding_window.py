@@ -16,9 +16,7 @@ ctx.reload_config), so the window still works when a piece is missing.
 
 from __future__ import annotations
 
-import json
 import math
-import os
 import re
 import sys
 import threading
@@ -39,11 +37,7 @@ from ui.components import (
 )
 from ui.onboarding import _StepProgressIndicator
 
-try:
-    from config import get_config_path, _atomic_write_json
-except ImportError:                                            # pragma: no cover
-    get_config_path = lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jarvis_config.json")
-    _atomic_write_json = None
+from config import get_config_path, update_key
 
 
 PAGES = ["hello", "name", "address", "voice", "usage", "privacy", "done"]
@@ -636,27 +630,7 @@ class OnboardingWindow(QDialog):
     def _save_cfg(self, key: str, value) -> None:
         """Same persistence path as SettingsWindow._save: set on cfg, atomic single-key write, reload hook."""
         cfg = self.cfg
-        if cfg is not None:
-            try:
-                setattr(cfg, key, value)
-            except Exception:
-                pass
-        try:
-            path = get_config_path()
-            data = {}
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            if not isinstance(data, dict):
-                data = {}
-            data[key] = value
-            if _atomic_write_json is not None:
-                _atomic_write_json(path, data)
-            else:
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=4)
-        except Exception as exc:
-            print(f"[onboarding] config save error: {exc}")
+        update_key(key, value, cfg, get_config_path())
         try:
             fn = getattr(self.ctx, "reload_config", None)
             if callable(fn) and cfg is not None:

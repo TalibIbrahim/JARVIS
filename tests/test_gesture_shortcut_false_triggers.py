@@ -1,7 +1,7 @@
 """Evidence tests: ordinary open-palm cursor motion must not be misread as swipe/slide shortcuts.
 
 Synthetic landmark streams at 30 fps drive GestureEngine.update (palm_fist scheme) with
-pyautogui / system_control mocked. Desired behaviour: ordinary moves -> 0 shortcuts and
+win_input / system_control mocked. Desired behaviour: ordinary moves -> 0 shortcuts and
 0 dropped cursor frames. A genuine fast flick may trigger.
 """
 import math
@@ -22,9 +22,9 @@ SHORTCUTS = ("switch_window", "volume_up", "volume_down", "island_page_step")
 
 @pytest.fixture(autouse=True)
 def _mock_devices(monkeypatch):
-    import pyautogui
+    import win_input
     import system_control
-    monkeypatch.setattr(pyautogui, "hotkey", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(win_input, "hotkey", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(system_control, "get_foreground_window_title", lambda: "win", raising=False)
     monkeypatch.setattr(system_control, "volume_up", lambda steps=1: 55, raising=False)
     monkeypatch.setattr(system_control, "volume_down", lambda steps=1: 45, raising=False)

@@ -216,40 +216,40 @@ def _write(tmp, d):
 
 
 class TestConfigMigrationV3(unittest.TestCase):
-    def test_aliases_map_to_canonical(self):
-        old = {
-            "config_version": 2,
-            "island_time_format": "24h",
-            "idle_display": "time",
-            "island_size": "large",
-            "expand_trigger": "click",
-            "hide_fullscreen": False,
-            "weather_city": "Paris",
-            "weather_units": "celsius",
-            "show_weather": False,
-            "show_now_playing": False,
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = load_config(_write(tmp, old))
-        self.assertEqual(cfg.island_clock_format, "24h")
-        self.assertEqual(cfg.island_idle_display, "time")
-        self.assertEqual(cfg.island_size_scale, "large")
-        self.assertEqual(cfg.island_expand_trigger, "click")
-        self.assertFalse(cfg.island_hide_fullscreen)
-        self.assertEqual(cfg.island_weather_city, "Paris")
-        self.assertEqual(cfg.island_weather_units, "celsius")
-        self.assertFalse(cfg.island_show_weather)
-        self.assertFalse(cfg.island_show_now_playing)
-        self.assertGreaterEqual(cfg.config_version, 3)
+    """The v3 alias keys are gone: an old file still loads, the old keys are ignored, the version is bumped."""
 
-    def test_size_alias_values(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = load_config(_write(tmp, {"config_version": 2, "island_size": "compact"}))
-        self.assertEqual(cfg.island_size_scale, "small")
+    OLD = {
+        "config_version": 2,
+        "island_time_format": "24h",
+        "idle_display": "time",
+        "island_size": "large",
+        "expand_trigger": "click",
+        "hide_fullscreen": False,
+        "show_weather": False,
+        "show_now_playing": False,
+        "island_compact_mode": "media_aware",
+        "time_format": "24h",
+        "glass_blur": True,
+    }
 
-    def test_user_set_canonical_not_overwritten(self):
-        old = {"config_version": 2, "island_time_format": "12h", "island_clock_format": "24h",
-               "weather_city": "Paris", "island_weather_city": "Tokyo"}
+    def test_old_alias_keys_are_ignored(self):
+        defaults = config_mod.Config()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, self.OLD)
+            cfg = load_config(path)
+            with open(path, encoding="utf-8") as f:
+                saved = json.load(f)
+        for key in ("island_clock_format", "island_idle_display", "island_size_scale", "island_expand_trigger",
+                    "island_hide_fullscreen", "island_show_weather", "island_show_now_playing"):
+            self.assertEqual(getattr(cfg, key), getattr(defaults, key), key)
+        for old in self.OLD:
+            if old != "config_version":
+                self.assertFalse(hasattr(cfg, old), old)
+        self.assertEqual(cfg.config_version, defaults.config_version)
+        self.assertEqual(saved["config_version"], defaults.config_version)
+
+    def test_canonical_keys_kept(self):
+        old = dict(self.OLD, island_clock_format="24h", island_weather_city="Tokyo")
         with tempfile.TemporaryDirectory() as tmp:
             cfg = load_config(_write(tmp, old))
         self.assertEqual(cfg.island_clock_format, "24h")
@@ -257,28 +257,8 @@ class TestConfigMigrationV3(unittest.TestCase):
 
     def test_media_aware_becomes_time_weather(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = load_config(_write(tmp, {"config_version": 2, "island_compact_mode": "media_aware"}))
-            self.assertEqual(cfg.island_idle_display, "time_weather")
-            cfg2 = load_config(_write(tmp, {"config_version": 3, "island_idle_display": "media_aware"}))
-            self.assertEqual(cfg2.island_idle_display, "time_weather")
-
-    def test_migration_runs_once(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = _write(tmp, {"config_version": 2, "island_time_format": "24h"})
-            cfg = load_config(path)
-            self.assertEqual(cfg.island_clock_format, "24h")
-            with open(path, encoding="utf-8") as f:
-                saved = json.load(f)
-            self.assertGreaterEqual(saved["config_version"], 3)
-            # user later changes the canonical key; the alias is still on disk but must not win again
-            saved["island_clock_format"] = "12h"
-            saved["island_time_format"] = "24h"
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(saved, f)
-            with mock.patch.object(config_mod, "_migrate_island_keys", wraps=config_mod._migrate_island_keys) as spy:
-                cfg2 = load_config(path)
-                spy.assert_not_called()
-            self.assertEqual(cfg2.island_clock_format, "12h")
+            cfg = load_config(_write(tmp, {"config_version": 3, "island_idle_display": "media_aware"}))
+        self.assertEqual(cfg.island_idle_display, "time_weather")
 
 
 # --------------------------------------------------------------------------- voice commands

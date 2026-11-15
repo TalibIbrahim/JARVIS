@@ -5,7 +5,7 @@ Comprehensive unit tests for J.A.R.V.I.S. Groq AI integration:
 - Client-side rate limiting and Retry-After honoring
 - Action whitelisting, JSON parsing, and rejection of unauthorized actions
 - Keyring credential storage and env var fallback (zero secrets in config)
-- Automatic fallback from Groq to Google SpeechRecognition
+- STT chain: Groq failure gives up gracefully (no third-party fallback)
 - In-memory conversation history and standby reset
 """
 import json
@@ -208,8 +208,32 @@ class TestKeyStorage(unittest.TestCase):
 
     @patch("keyring.set_password")
     def test_set_api_key_saves_to_keyring(self, mock_set_pw):
-        set_api_key("gsk_new_key_123")
+        with patch("ai._edit_config_file") as mock_edit:
+            set_api_key("gsk_new_key_123")
         mock_set_pw.assert_called_with("JARVIS", "groq_api_key", "gsk_new_key_123")
+        mock_edit.assert_not_called()   # default: never written to the config file
+
+    @patch("keyring.delete_password")
+    @patch("keyring.set_password")
+    def test_api_key_config_writes_are_atomic(self, mock_set_pw, mock_del_pw):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "jarvis_config.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"camera_index": 2}, f)
+            with patch("config.get_config_path", return_value=path), \
+                 patch("config._atomic_write_json", wraps=__import__("config")._atomic_write_json) as aw:
+                set_api_key("gsk_cfg_key", persist_to_config=True)
+                with open(path, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f), {"camera_index": 2, "groq_api_key": "gsk_cfg_key"})
+                mock_set_pw.side_effect = RuntimeError("no keyring")
+                set_api_key("gsk_fallback")      # keyring failed: kept in config, not lost
+                with open(path, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["groq_api_key"], "gsk_fallback")
+                delete_api_key()
+                with open(path, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f), {"camera_index": 2})
+                self.assertEqual(aw.call_count, 3)
 
     @patch("keyring.delete_password")
     def test_delete_api_key(self, mock_del_pw):
@@ -256,12 +280,12 @@ class TestJSONActionParsingAndWhitelist(unittest.TestCase):
         self.assertEqual(act, "none")
         self.assertEqual(reply, raw)
 
-    @patch("pyautogui.press")
+    @patch("win_input.press")
     def test_whitelisted_action_volume_executes(self, mock_press):
         ctx = MagicMock()
         ok, msg = execute_whitelisted_action("volume_up", {"steps": 3}, ctx)
         self.assertTrue(ok)
-        mock_press.assert_called_with("volumeup", presses=3, _pause=False)
+        mock_press.assert_called_with("volumeup", presses=3)
 
     def test_whitelist_rejection_of_unauthorized_action(self):
         ctx = MagicMock()
@@ -322,7 +346,7 @@ class TestConversationHistory(unittest.TestCase):
 
 
 class TestVoiceFallback(unittest.TestCase):
-    """Tests automatic fallback from Groq to Google SpeechRecognition in voice.py."""
+    """Tests the Groq leg of the STT chain in voice.py (local STT is not loaded in these tests)."""
 
     def setUp(self):
         self.cfg = Config()
@@ -336,75 +360,55 @@ class TestVoiceFallback(unittest.TestCase):
     @patch.object(GroqClient, "transcribe")
     def test_groq_whisper_success_path(self, mock_transcribe, mock_key):
         mock_transcribe.return_value = "hello jarvis"
-        recognizer = MagicMock()
-        audio = MagicMock()
-        # Mock 1 second of 16kHz audio data with non-zero RMS
-        dummy_samples = b"\x00\x10" * 4000
-        audio.get_raw_data.return_value = dummy_samples
-        audio.get_wav_data.return_value = b"RIFF....WAVE"
-        self.voice.audio_q.put(audio)
+        # 0.25 s of 16kHz audio data with non-zero RMS
+        self.voice.audio_q.put(b"\x00\x10" * 4000)
 
         processed = []
         self.voice._process = lambda text: processed.append(text)
-        self.voice._recognition_worker(recognizer, MagicMock())
+        self.voice._recognition_worker()
 
         self.assertEqual(processed, ["hello jarvis"])
         mock_transcribe.assert_called_once()
-        recognizer.recognize_google.assert_not_called()
+        self.assertTrue(mock_transcribe.call_args[0][0].startswith(b"RIFF"))
 
     @patch("voice.get_api_key", return_value="gsk_bad_key")
     @patch.object(GroqClient, "transcribe")
-    def test_groq_401_falls_back_to_google_and_shows_error_badge(self, mock_transcribe, mock_key):
+    def test_groq_401_gives_up_and_shows_error_badge(self, mock_transcribe, mock_key):
         mock_transcribe.side_effect = AuthenticationError("Invalid key")
-        recognizer = MagicMock()
-        recognizer.recognize_google.return_value = "google fallback text"
-        audio = MagicMock()
-        audio.get_raw_data.return_value = b"\x00\x10" * 4000
-        audio.get_wav_data.return_value = b"RIFF....WAVE"
-        self.voice.audio_q.put(audio)
+        self.voice.audio_q.put(b"\x00\x10" * 4000)
 
         processed = []
         self.voice._process = lambda text: processed.append(text)
-        self.voice._recognition_worker(recognizer, MagicMock())
+        self.voice._recognition_worker()
 
-        # Verified fallback occurred
-        recognizer.recognize_google.assert_called_once()
-        self.assertEqual(processed, ["google fallback text"])
+        self.assertEqual(processed, [])
         self.ctx.overlay.post.assert_called_with("ai_error", text="Invalid Groq Key")
 
     @patch("voice.get_api_key", return_value="gsk_test_key")
     @patch.object(GroqClient, "transcribe")
-    def test_groq_429_falls_back_to_google_and_sets_cooldown(self, mock_transcribe, mock_key):
+    def test_groq_429_sets_cooldown(self, mock_transcribe, mock_key):
         mock_transcribe.side_effect = RateLimitError("Rate limit", retry_after=15.0)
-        recognizer = MagicMock()
-        recognizer.recognize_google.return_value = "google fallback after rate limit"
-        audio = MagicMock()
-        audio.get_raw_data.return_value = b"\x00\x10" * 4000
-        audio.get_wav_data.return_value = b"RIFF....WAVE"
-        self.voice.audio_q.put(audio)
+        self.voice.audio_q.put(b"\x00\x10" * 4000)
 
         processed = []
         self.voice._process = lambda text: processed.append(text)
-        self.voice._recognition_worker(recognizer, MagicMock())
+        self.voice._recognition_worker()
 
         self.assertGreater(self.voice.groq_cooldown_until, time.time())
-        recognizer.recognize_google.assert_called_once()
+        self.assertEqual(processed, [])
         self.ctx.overlay.post.assert_called_with("ai_error", text="Groq Rate Limited")
 
     @patch("voice.get_api_key", return_value=None)
-    def test_no_key_bypasses_groq_and_uses_google_directly(self, mock_key):
-        recognizer = MagicMock()
-        recognizer.recognize_google.return_value = "pure google recognition"
-        audio = MagicMock()
-        audio.get_raw_data.return_value = b"\x00\x10" * 4000
-        self.voice.audio_q.put(audio)
+    def test_no_key_and_no_local_model_gives_up_quietly(self, mock_key):
+        self.voice.audio_q.put(b"\x00\x10" * 4000)
 
         processed = []
         self.voice._process = lambda text: processed.append(text)
-        self.voice._recognition_worker(recognizer, MagicMock())
+        with patch.object(GroqClient, "transcribe") as mock_transcribe:
+            self.voice._recognition_worker()
+            mock_transcribe.assert_not_called()
 
-        recognizer.recognize_google.assert_called_once()
-        self.assertEqual(processed, ["pure google recognition"])
+        self.assertEqual(processed, [])
 
 
 class TestSetupAICommand(unittest.TestCase):
@@ -429,12 +433,12 @@ class TestAICommandsDispatch(unittest.TestCase):
 
     @patch("commands.get_api_key", return_value="gsk_valid_key")
     @patch.object(GroqClient, "chat")
-    @patch("pyautogui.press")
+    @patch("win_input.press")
     def test_ai_query_executes_whitelisted_action_and_speaks_reply(self, mock_press, mock_chat, mock_key):
         mock_chat.return_value = '{"action": "volume_up", "args": {"steps": 5}, "reply": "Turning the volume up for you, sir."}'
         reply = run_command("increase the sound level please", self.ctx)
         self.assertEqual(reply, "Turning the volume up for you, sir.")
-        mock_press.assert_called_with("volumeup", presses=5, _pause=False)
+        mock_press.assert_called_with("volumeup", presses=5)
         self.ctx.overlay.post.assert_any_call("thinking", active=True)
         self.ctx.overlay.post.assert_any_call("thinking", active=False)
 
@@ -478,14 +482,12 @@ class TestVADSilenceRejection(unittest.TestCase):
         stop.is_set.side_effect = [False, True]
         voice = Voice(cfg, ctx, stop)
 
-        audio = MagicMock()
         # Near-silent audio samples with RMS < 30.0
-        audio.get_raw_data.return_value = b"\x01\x00" * 4000
-        voice.audio_q.put(audio)
+        voice.audio_q.put(b"\x01\x00" * 4000)
 
         with patch("voice.get_api_key", return_value="gsk_test"), \
              patch.object(GroqClient, "transcribe") as mock_transcribe:
-            voice._recognition_worker(MagicMock(), MagicMock())
+            voice._recognition_worker()
             mock_transcribe.assert_not_called()
 
 

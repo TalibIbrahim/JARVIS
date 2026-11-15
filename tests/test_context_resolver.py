@@ -332,7 +332,7 @@ class TestContextAndDisambiguationIntegration(unittest.TestCase):
         reply2 = run_command("open it", self.mock_ctx)
         self.assertIn("Opening github", reply2)
 
-    @patch("pyautogui.screenshot")
+    @patch("win_input.screenshot")
     def test_end_to_end_repeat_action(self, mock_shot):
         # 1. Turn 1: take a screenshot
         reply1 = run_command("take a screenshot", self.mock_ctx)

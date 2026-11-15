@@ -13,15 +13,12 @@ Strictly NO Qt imports. 100% unit-testable with interfaces and mocks.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import datetime
 import os
-import re
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 
 
 # ============================================================================
@@ -135,12 +132,12 @@ class PowerSessionBackendProtocol(Protocol):
 
 
 # ============================================================================
-# Audio Implementations (pycaw + Fallback + Mock)
+# Audio Implementations (pycaw + Fallback)
 # ============================================================================
 
 class FallbackAudioBackend:
     """
-    Fallback audio backend using pyautogui hardware key simulation
+    Fallback audio backend using simulated hardware volume keys (win_input)
     and internal volume tracking when pycaw is unavailable.
     """
 
@@ -159,8 +156,8 @@ class FallbackAudioBackend:
     def volume_up(self, steps: int = 5) -> int:
         steps_val = max(1, min(50, int(steps)))
         try:
-            import pyautogui
-            pyautogui.press("volumeup", presses=max(1, steps_val // 2), _pause=False)
+            import win_input
+            win_input.press("volumeup", presses=max(1, steps_val // 2))
         except Exception:
             pass
         self._volume = min(100, self._volume + steps_val)
@@ -169,8 +166,8 @@ class FallbackAudioBackend:
     def volume_down(self, steps: int = 5) -> int:
         steps_val = max(1, min(50, int(steps)))
         try:
-            import pyautogui
-            pyautogui.press("volumedown", presses=max(1, steps_val // 2), _pause=False)
+            import win_input
+            win_input.press("volumedown", presses=max(1, steps_val // 2))
         except Exception:
             pass
         self._volume = max(0, self._volume - steps_val)
@@ -178,8 +175,8 @@ class FallbackAudioBackend:
 
     def mute(self, toggle: bool = True) -> bool:
         try:
-            import pyautogui
-            pyautogui.press("volumemute", _pause=False)
+            import win_input
+            win_input.press("volumemute")
         except Exception:
             pass
         if toggle:
@@ -286,48 +283,8 @@ class PycawAudioBackend:
             return self._fallback.is_muted()
 
 
-class MockAudioBackend:
-    """In-memory mock audio backend for deterministic unit tests."""
-
-    def __init__(self, volume: int = 50, muted: bool = False):
-        self.volume = volume
-        self.muted = muted
-        self.calls: List[Tuple[str, Any]] = []
-
-    def get_volume(self) -> int:
-        self.calls.append(("get_volume", None))
-        return self.volume
-
-    def set_volume(self, level: int) -> int:
-        self.calls.append(("set_volume", level))
-        self.volume = max(0, min(100, int(level)))
-        return self.volume
-
-    def volume_up(self, steps: int = 5) -> int:
-        self.calls.append(("volume_up", steps))
-        self.volume = min(100, self.volume + steps)
-        return self.volume
-
-    def volume_down(self, steps: int = 5) -> int:
-        self.calls.append(("volume_down", steps))
-        self.volume = max(0, self.volume - steps)
-        return self.volume
-
-    def mute(self, toggle: bool = True) -> bool:
-        self.calls.append(("mute", toggle))
-        if toggle:
-            self.muted = not self.muted
-        else:
-            self.muted = True
-        return self.muted
-
-    def is_muted(self) -> bool:
-        self.calls.append(("is_muted", None))
-        return self.muted
-
-
 # ============================================================================
-# Display Implementations (WMI / CIM + Fallback + Mock)
+# Display Implementations (WMI / CIM + Fallback)
 # ============================================================================
 
 class FallbackDisplayBackend:
@@ -485,39 +442,6 @@ class WindowsDisplayBackend:
         return self._fallback.toggle_night_light()
 
 
-class MockDisplayBackend:
-    """In-memory mock display backend for testing."""
-
-    def __init__(self, brightness: int = 70, night_light: bool = False):
-        self.brightness = brightness
-        self.night_light = night_light
-        self.calls: List[Tuple[str, Any]] = []
-
-    def get_brightness(self) -> int:
-        self.calls.append(("get_brightness", None))
-        return self.brightness
-
-    def set_brightness(self, level: int) -> int:
-        self.calls.append(("set_brightness", level))
-        self.brightness = max(0, min(100, int(level)))
-        return self.brightness
-
-    def brightness_up(self, steps: int = 10) -> int:
-        self.calls.append(("brightness_up", steps))
-        self.brightness = min(100, self.brightness + steps)
-        return self.brightness
-
-    def brightness_down(self, steps: int = 10) -> int:
-        self.calls.append(("brightness_down", steps))
-        self.brightness = max(0, self.brightness - steps)
-        return self.brightness
-
-    def toggle_night_light(self) -> bool:
-        self.calls.append(("toggle_night_light", None))
-        self.night_light = not self.night_light
-        return self.night_light
-
-
 # ============================================================================
 # Windows UIPI / Elevated Window Detection
 # ============================================================================
@@ -599,26 +523,12 @@ def is_foreground_window_elevated() -> bool:
     return is_window_elevated(None)
 
 
-def check_uipi_elevation(hwnd: Optional[int] = None) -> Tuple[bool, str]:
-    """
-    Checks if a window action is blocked by Windows UIPI (target elevated, Jarvis standard).
-    Returns (is_blocked, explanation_message).
-    """
-    if sys.platform != "win32":
-        return False, ""
-    if is_current_process_elevated():
-        return False, ""
-    if is_window_elevated(hwnd):
-        return True, ELEVATED_WINDOW_EXPLANATION
-    return False, ""
-
-
 # ============================================================================
 # Window Management Implementations
 # ============================================================================
 
 class WindowsWindowBackend:
-    """Window management backend using Win32 API and pyautogui hotkeys."""
+    """Window management backend using Win32 API and win_input hotkeys."""
 
     def __init__(self, elevation_checker: Optional[Callable[[], bool]] = None):
         self._elevation_checker = elevation_checker
@@ -631,15 +541,15 @@ class WindowsWindowBackend:
     def snap_window(self, direction: str) -> bool:
         dir_clean = str(direction).lower().strip()
         try:
-            import pyautogui
+            import win_input
             if dir_clean in ("left", "west"):
-                pyautogui.hotkey("win", "left", _pause=False)
+                win_input.hotkey("win", "left")
             elif dir_clean in ("right", "east"):
-                pyautogui.hotkey("win", "right", _pause=False)
+                win_input.hotkey("win", "right")
             elif dir_clean in ("up", "maximize", "north"):
-                pyautogui.hotkey("win", "up", _pause=False)
+                win_input.hotkey("win", "up")
             elif dir_clean in ("down", "restore", "south"):
-                pyautogui.hotkey("win", "down", _pause=False)
+                win_input.hotkey("win", "down")
             else:
                 return False
             return True
@@ -648,16 +558,16 @@ class WindowsWindowBackend:
 
     def minimize_all(self) -> bool:
         try:
-            import pyautogui
-            pyautogui.hotkey("win", "d", _pause=False)
+            import win_input
+            win_input.hotkey("win", "d")
             return True
         except Exception:
             return False
 
     def move_to_other_monitor(self) -> bool:
         try:
-            import pyautogui
-            pyautogui.hotkey("win", "shift", "right", _pause=False)
+            import win_input
+            win_input.hotkey("win", "shift", "right")
             return True
         except Exception:
             return False
@@ -690,8 +600,8 @@ class WindowsWindowBackend:
             return False, f"Document '{doc_name}' has unsaved changes. Please confirm to close."
 
         try:
-            import pyautogui
-            pyautogui.hotkey("alt", "f4", _pause=False)
+            import win_input
+            win_input.hotkey("alt", "f4")
             return True, "Window closed."
         except Exception as exc:
             return False, f"Unable to close window: {exc}"
@@ -761,85 +671,6 @@ class WindowsWindowBackend:
             return False
 
 
-class MockWindowBackend:
-    """In-memory mock window backend for deterministic testing."""
-
-    def __init__(self, foreground_title: str = "Test Window", is_elevated: bool = False):
-        self.foreground_title = foreground_title
-        self.is_elevated = is_elevated
-        self.last_snap: Optional[str] = None
-        self.all_minimized = False
-        self.moved_monitor = False
-        self.closed = False
-        self.switched_apps: List[str] = []
-        self.calls: List[Tuple[str, Any]] = []
-
-    def is_foreground_elevated(self) -> bool:
-        return self.is_elevated
-
-    def snap_window(self, direction: str) -> bool:
-        self.calls.append(("snap_window", direction))
-        self.last_snap = direction
-        return True
-
-    def minimize_all(self) -> bool:
-        self.calls.append(("minimize_all", None))
-        self.all_minimized = True
-        return True
-
-    def switch_to_app(self, app_name: str) -> bool:
-        self.calls.append(("switch_to_app", app_name))
-        self.switched_apps.append(app_name)
-        return True
-
-    def move_to_other_monitor(self) -> bool:
-        self.calls.append(("move_to_other_monitor", None))
-        self.moved_monitor = True
-        return True
-
-    def get_foreground_window_title(self) -> str:
-        return self.foreground_title
-
-    def close_window(self, confirm: bool = False) -> Tuple[bool, str]:
-        self.calls.append(("close_window", confirm))
-        title = self.foreground_title
-        has_unsaved = ("*" in title or "untitled" in title.lower() or "unsaved" in title.lower())
-        if has_unsaved and not confirm:
-            return False, f"Document '{title}' has unsaved changes. Please confirm to close."
-        self.closed = True
-        return True, "Window closed."
-
-    def resolve_window_under_cursor(self, point: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
-        self.calls.append(("resolve_window_under_cursor", point))
-        has_unsaved = ("*" in self.foreground_title or "untitled" in self.foreground_title.lower() or "unsaved" in self.foreground_title.lower())
-        return {
-            "hwnd": 1234,
-            "raw_hwnd": 1234,
-            "title": self.foreground_title,
-            "process_id": 100,
-            "process_name": "notepad.exe",
-            "point": point or (100, 100),
-            "has_unsaved": has_unsaved,
-            "is_valid": True,
-        }
-
-    def open_this(self, point: Optional[Tuple[int, int]] = None) -> Tuple[bool, str]:
-        self.calls.append(("open_this", point))
-        return True, f"Opened target in '{self.foreground_title}', sir."
-
-    def copy_this(self, point: Optional[Tuple[int, int]] = None) -> Tuple[bool, str]:
-        self.calls.append(("copy_this", point))
-        return True, f"Copied selection from '{self.foreground_title}' to clipboard, sir."
-
-    def close_this(self, confirm: bool = False, point: Optional[Tuple[int, int]] = None) -> Tuple[bool, str]:
-        self.calls.append(("close_this", (confirm, point)))
-        has_unsaved = ("*" in self.foreground_title or "untitled" in self.foreground_title.lower() or "unsaved" in self.foreground_title.lower())
-        if has_unsaved and not confirm:
-            return False, f"Document '{self.foreground_title}' has unsaved changes. Please confirm to close."
-        self.closed = True
-        return True, f"Closed '{self.foreground_title}', sir."
-
-
 # ============================================================================
 # Power & Session Implementations
 # ============================================================================
@@ -877,12 +708,12 @@ class WindowsPowerSessionBackend:
 
     def take_screenshot(self, path: Optional[str] = None) -> Optional[str]:
         try:
-            import pyautogui
+            import win_input
             if not path:
                 folder = os.path.join(os.path.expanduser("~"), "Pictures", "Jarvis")
                 os.makedirs(folder, exist_ok=True)
                 path = os.path.join(folder, time.strftime("shot-%Y%m%d-%H%M%S.png"))
-            pyautogui.screenshot(path)
+            win_input.screenshot(path)
             return path
         except Exception:
             return None
@@ -973,67 +804,6 @@ class WindowsPowerSessionBackend:
             return True, "System reboot initiated. Restarting in 10 seconds, sir."
         except Exception as exc:
             return False, f"Failed to initiate restart: {exc}"
-
-
-class MockPowerSessionBackend:
-    """Mock power and session backend for safe unit testing."""
-
-    def __init__(self):
-        self.locked = False
-        self.slept = False
-        self.screenshots: List[str] = []
-        self.wifi_toggled = False
-        self.bluetooth_toggled = False
-        self.dnd_toggled = False
-        self.shutdown_executed = False
-        self.restart_executed = False
-        self.calls: List[Tuple[str, Any]] = []
-
-    def lock_workstation(self) -> bool:
-        self.calls.append(("lock_workstation", None))
-        self.locked = True
-        return True
-
-    def sleep_system(self) -> bool:
-        self.calls.append(("sleep_system", None))
-        self.slept = True
-        return True
-
-    def take_screenshot(self, path: Optional[str] = None) -> Optional[str]:
-        p = path or "mock_screenshot.png"
-        self.calls.append(("take_screenshot", p))
-        self.screenshots.append(p)
-        return p
-
-    def toggle_wifi(self) -> Tuple[bool, str]:
-        self.calls.append(("toggle_wifi", None))
-        self.wifi_toggled = not self.wifi_toggled
-        state = "enabled" if self.wifi_toggled else "disabled"
-        return True, f"Wi-Fi {state}."
-
-    def toggle_bluetooth(self) -> Tuple[bool, str]:
-        self.calls.append(("toggle_bluetooth", None))
-        self.bluetooth_toggled = not self.bluetooth_toggled
-        return True, "Bluetooth toggled."
-
-    def toggle_do_not_disturb(self) -> Tuple[bool, str]:
-        self.calls.append(("toggle_do_not_disturb", None))
-        self.dnd_toggled = not self.dnd_toggled
-        return True, "Do Not Disturb toggled."
-
-    def shutdown_system(self, confirmed: bool = False) -> Tuple[bool, str]:
-        self.calls.append(("shutdown_system", confirmed))
-        if not confirmed:
-            return False, "Shutdown requires confirmation. Please say 'confirm shutdown' to proceed."
-        self.shutdown_executed = True
-        return True, "System shutdown initiated."
-
-    def restart_system(self, confirmed: bool = False) -> Tuple[bool, str]:
-        self.calls.append(("restart_system", confirmed))
-        if not confirmed:
-            return False, "Restart requires confirmation. Please say 'confirm restart' to proceed."
-        self.restart_executed = True
-        return True, "System restart initiated."
 
 
 # ============================================================================

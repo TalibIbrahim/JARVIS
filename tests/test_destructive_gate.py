@@ -143,7 +143,7 @@ def _destructive_calls(guard):
     bad = []
     for call in guard.calls:
         name, a, k = call
-        if name in ("system_control.sleep_system", "ctx.quit", "ctx.set_active", "pyautogui.hotkey"):
+        if name in ("system_control.sleep_system", "ctx.quit", "ctx.set_active", "win_input.hotkey"):
             bad.append(call)
         elif name in ("system_control.shutdown_system", "system_control.restart_system"):
             if _confirmed(call):
@@ -178,7 +178,7 @@ def test_system2_exact_local_phrase_still_runs_the_action(guard):
     assert guard.of("system_control.sleep_system")
     guard.calls.clear()
     _system2(guard, "clean_slate", {}, "execute clean slate")
-    assert any(c[0] == "pyautogui.hotkey" for c in guard.calls)
+    assert any(c[0] == "win_input.hotkey" for c in guard.calls)
 
 
 def test_system2_unknown_utterance_fails_closed_through_execute_whitelisted_action(guard):
@@ -216,7 +216,7 @@ def test_sleep_pc_executes(guard):
 def test_execute_clean_slate_executes(guard):
     ctx = make_ctx(guard)
     commands.run_command("execute clean slate", ctx)
-    assert ("pyautogui.hotkey", ("win", "d"), {"_pause": False}) in guard.calls
+    assert ("win_input.hotkey", ("win", "d"), {}) in guard.calls
     assert ("ctx.set_active", (False,), {}) in guard.calls
 
 

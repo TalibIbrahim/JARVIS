@@ -696,11 +696,11 @@ class GestureEngine:
             pass
 
         try:
-            import pyautogui
+            import win_input
             if right:
-                pyautogui.hotkey("alt", "tab", _pause=False)
+                win_input.hotkey("alt", "tab")
             else:
-                pyautogui.hotkey("alt", "shift", "tab", _pause=False)
+                win_input.hotkey("alt", "shift", "tab")
         except Exception:
             pass
 

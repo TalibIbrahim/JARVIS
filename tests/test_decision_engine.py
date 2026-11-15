@@ -198,20 +198,20 @@ class TestDecisionEngineExecution(unittest.TestCase):
         self.ctx = MagicMock()
         self.ctx.engine.cfg = self.cfg
 
-    @patch("pyautogui.press")
+    @patch("win_input.press")
     def test_run_command_executes_volume_up_locally(self, mock_press):
         """Un-regexed command 'crank up the audio' triggers System 1 in commands.py."""
         reply = run_command("crank up the audio", self.ctx)
         self.assertIn("Adjusting the volume upward", reply)
-        mock_press.assert_called_with("volumeup", presses=5, _pause=False)
+        mock_press.assert_called_with("volumeup", presses=5)
         self.ctx.overlay.post.assert_any_call("action_executed", action="volume_up", success=True)
 
-    @patch("pyautogui.hotkey")
+    @patch("win_input.hotkey")
     def test_run_command_executes_show_desktop(self, mock_hotkey):
         """'hide all my windows' executes show_desktop via Win+d."""
         reply = run_command("hide all my open windows", self.ctx)
         self.assertIn("desktop", reply.lower())
-        mock_hotkey.assert_called_with("win", "d", _pause=False)
+        mock_hotkey.assert_called_with("win", "d")
 
     @patch("ctypes.windll.user32.LockWorkStation", create=True)
     def test_run_command_executes_lock_workstation(self, mock_lock):

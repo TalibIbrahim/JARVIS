@@ -185,9 +185,9 @@ class TestIslandWidgetsPhase2(unittest.TestCase):
         dlg._save("island_idle_display", "time")
         self.assertEqual(getattr(self.cfg, "island_idle_display"), "time")
 
-        dlg._save("island_size", "large")
-        self.assertEqual(getattr(self.cfg, "island_size"), "large")
-        dlg._save("island_size", "default")
+        dlg._save("island_size_scale", "large")
+        self.assertEqual(getattr(self.cfg, "island_size_scale"), "large")
+        dlg._save("island_size_scale", "medium")
         dlg._save("island_idle_display", "time_weather")
         dlg.close()
 

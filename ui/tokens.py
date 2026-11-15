@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
 try:
-    from PySide6.QtGui import QColor, QFont, QLinearGradient
+    from PySide6.QtGui import QColor, QFont
     _QT = True
     if not hasattr(QColor, "resolve"):
         QColor.resolve = lambda self, is_dark=True, high_contrast=False: self
@@ -367,9 +367,6 @@ class TypeToken(NamedTuple):
             f.setFeature(b"tnum", 1)   # Qt 6.7+ font feature
         return f
 
-    def family_fallback(self) -> str:
-        return self.family
-
 
 # Font family precedence: prefer Inter if installed, fall back to Segoe UI Variable, then Segoe UI
 _ISLAND_FONT = "Segoe UI Variable Text"       # island v2 roles (falls back to Segoe UI on Windows 10)
@@ -516,10 +513,6 @@ class SpringToken(NamedTuple):
         return math.sqrt(self.stiffness)
 
     @property
-    def zeta(self) -> float:
-        return self.damping / (2.0 * math.sqrt(self.stiffness))
-
-    @property
     def period(self) -> float:
         return 2.0 * math.pi / math.sqrt(self.stiffness)
 
@@ -632,23 +625,6 @@ def is_reduce_motion() -> bool:
         return not pv.value   # False means animations are OFF → reduce motion
     except Exception:
         return False
-
-
-def windows_accent_color() -> "QColor":
-    """Return the current Windows accent color as a QColor."""
-    if sys.platform != "win32" or not _QT:
-        return _c("#007AFF")
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM")
-        val, _ = winreg.QueryValueEx(key, "AccentColor")
-        winreg.CloseKey(key)
-        b = (val >> 16) & 0xFF
-        g = (val >> 8) & 0xFF
-        r = val & 0xFF
-        return QColor(r, g, b)
-    except Exception:
-        return _c("#007AFF")
 
 
 # ──────────────────────────────────────────────
@@ -1038,23 +1014,3 @@ class T:
     @staticmethod
     def font(token: TypeToken, dpi_scale: float = 1.0) -> "QFont":
         return qfont(token, dpi_scale)
-
-    @staticmethod
-    def capsule_gradient(height: float = 1.0) -> "QLinearGradient":
-        """Linear vertical gradient for Dynamic Island capsule: surface_top -> surface_bottom."""
-        if not _QT:
-            return None
-        grad = QLinearGradient(0.0, 0.0, 0.0, float(height))
-        grad.setColorAt(0.0, COLOR.surface_top)
-        grad.setColorAt(1.0, COLOR.surface_bottom)
-        return grad
-
-    @staticmethod
-    def specular_gradient(height: float = 1.0) -> "QLinearGradient":
-        """Top 40% specular sheen gradient: 12% alpha white -> 0% alpha white."""
-        if not _QT:
-            return None
-        grad = QLinearGradient(0.0, 0.0, 0.0, float(height) * 0.40)
-        grad.setColorAt(0.0, COLOR.sheen_top)
-        grad.setColorAt(1.0, COLOR.sheen_bottom)
-        return grad

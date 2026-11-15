@@ -8,7 +8,7 @@ import time
 import unicodedata
 import urllib.parse
 import webbrowser
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import jarvis_log as _jl
 import personal
@@ -27,7 +27,6 @@ from ai import (
     RateLimitError,
     OfflineError,
     TimeoutError,
-    AIError,
     answer_cache_get,
     answer_cache_put,
     rate_limit_reply,
@@ -972,7 +971,7 @@ def run_command(text, ctx):
 
 def _run_single_command(text, ctx):
     """Internal single-command evaluator."""
-    import pyautogui
+    import win_input
     text = cap_utterance(text)
     t = text.lower().strip(" ,.!?")
     # Strip conversational filler prefixes
@@ -1229,12 +1228,12 @@ def _run_single_command(text, ctx):
         _post_action(ctx, "house_party", True)
         return "House Party Protocol initiated, sir. Bringing primary workstations online."
     if _any(clean_t, "stealth mode", "protocol stealth", "go dark", "silent mode"):
-        pyautogui.press("volumemute", _pause=False)
-        pyautogui.hotkey("win", "down", _pause=False)
+        win_input.press("volumemute")
+        win_input.hotkey("win", "down")
         _post_action(ctx, "stealth_mode", True)
         return "Stealth mode engaged, sir. Audio muted and visual signatures minimized."
     if _exact(clean_t, *CLEAN_SLATE_PHRASES):
-        pyautogui.hotkey("win", "d", _pause=False)
+        win_input.hotkey("win", "d")
         reset_ai_history()
         if ctx:
             ctx.set_active(False)
@@ -1341,17 +1340,9 @@ def _run_single_command(text, ctx):
         _post_action(ctx, "diagnostics", True, text=text)
         return get_system_telemetry(ctx)
     if _any(clean_t, "what's the weather", "weather forecast"):
-        from weather_client import get_weather_client
+        from weather_client import weather_for_cfg
         cfg = getattr(ctx, "cfg", None) or getattr(getattr(ctx, "engine", None), "cfg", None)
-        city = getattr(cfg, "weather_city", "New York") if cfg else "New York"
-        lat = getattr(cfg, "weather_lat", 40.7128) if cfg else 40.7128
-        lon = getattr(cfg, "weather_lon", -74.0060) if cfg else -74.0060
-        units = getattr(cfg, "weather_units", "auto") if cfg else "auto"
-
-        client = get_weather_client()
-        weather = client.get_weather(lat, lon, city=city, units=units)
-        if not weather and city:
-            weather = client.get_weather_for_city(city, units=units)
+        weather = weather_for_cfg(cfg)
 
         if weather:
             temp_int = int(round(weather.temperature))
@@ -1481,7 +1472,7 @@ def _run_single_command(text, ctx):
             system_control.volume_up(5)
         except Exception:
             pass
-        pyautogui.press("volumeup", presses=5, _pause=False)
+        win_input.press("volumeup", presses=5)
         _post_action(ctx, "volume_up", True, args={"steps": 5}, text=text)
         return "Volume up."
 
@@ -1491,7 +1482,7 @@ def _run_single_command(text, ctx):
             system_control.volume_down(5)
         except Exception:
             pass
-        pyautogui.press("volumedown", presses=5, _pause=False)
+        win_input.press("volumedown", presses=5)
         _post_action(ctx, "volume_down", True, args={"steps": 5}, text=text)
         return "Volume down."
 
@@ -1750,27 +1741,27 @@ def _run_single_command(text, ctx):
             system_control.minimize_all()
         except Exception:
             pass
-        pyautogui.hotkey("win", "d", _pause=False)
+        win_input.hotkey("win", "d")
         _post_action(ctx, "show_desktop", True)
         return "Desktop."
     if re.search(r"\b(minimize|minimise)\b", t):
-        pyautogui.hotkey("win", "down", _pause=False)
+        win_input.hotkey("win", "down")
         _post_action(ctx, "minimize_window", True)
         return "Minimised."
     if re.search(r"\b(maximize|maximise)\b", t):
-        pyautogui.hotkey("win", "up", _pause=False)
+        win_input.hotkey("win", "up")
         _post_action(ctx, "maximize_window", True)
         return "Maximised."
     if _any(t, "switch window", "next window"):
-        pyautogui.hotkey("alt", "tab", _pause=False)
+        win_input.hotkey("alt", "tab")
         _post_action(ctx, "switch_window", True)
         return "Switching."
     if "scroll down" in t:
-        pyautogui.scroll(-600, _pause=False)
+        win_input.scroll(-600)
         _post_action(ctx, "scroll", True)
         return None
     if "scroll up" in t:
-        pyautogui.scroll(600, _pause=False)
+        win_input.scroll(600)
         _post_action(ctx, "scroll", True)
         return None
 

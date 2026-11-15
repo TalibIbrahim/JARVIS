@@ -158,7 +158,7 @@ Speak naturally after the wake word *"Jarvis"*:
 - **Wake word**: say *"Jarvis"* or *"Hey Jarvis"*, then your command. JARVIS ducks other apps' audio while it listens and restores it afterwards.
 - **Listen for "Jarvis"** (Settings → Voice): turn it off and the microphone stays closed and nothing is recorded until you make the 🤙 listen gesture.
 - **Voice Over Music (experimental)**: cancels this PC's own playback from the microphone so commands get through over music (about 15% of one CPU core, only while audio plays).
-- Speech is transcribed with Groq Whisper (Google fallback). If there is no internet, the island shows *"No internet – speech unavailable"*.
+- Speech is transcribed on this PC (faster-whisper), with Groq Whisper as a fallback when the local result is unsure. If there is no internet, the island shows *"No internet – speech unavailable"*.
 
 ### Intelligent System Components
 
@@ -219,7 +219,6 @@ python main.py
 - `python main.py --preview`: Opens the camera HUD window showing hand skeletons and live telemetry.
 - `python main.py --island-demo`: Cycles through all 23 Dynamic Island states, widgets, and gesture HUDs.
 - `python main.py --test-mic`: Runs interactive microphone and speech recognition diagnostics.
-- `python main.py --diagnose`: Runs jitter, latency, anchor point, and pre-click drift benchmarks.
 - `python main.py --no-voice`: Disables speech recognition for presentation environments.
 - `python main.py --camera 1`: Selects an alternate camera index.
 - `python main.py --self-test`: Checks camera, microphone, models, network, media, mutex and the speech detector against your room noise, with timings.

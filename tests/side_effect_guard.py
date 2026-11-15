@@ -2,7 +2,7 @@
 
 Everything that could touch the real machine is replaced by a recorder for the duration of the
 `with SideEffectGuard() as g:` block: system_control (all public functions and the adapter),
-pycaw/comtypes, pyautogui, subprocess, os.startfile/system/popen, webbrowser, requests/urllib/socket,
+pycaw/comtypes, win_input, subprocess, os.startfile/system/popen, webbrowser, requests/urllib/socket,
 ctypes.windll, the media adapter, file_ops opener/explorer, screen/camera capture, the scheduler
 singleton (never started), clipboard/typing in productivity, and the Groq client.
 
@@ -111,14 +111,8 @@ class SideEffectGuard:
             sys.modules[modname] = mock.MagicMock(name=modname)
             st.callback(lambda m=modname, h=had, p=prev: sys.modules.__setitem__(m, p) if h else sys.modules.pop(m, None))
 
-        # pyautogui: every public function is a recorder
-        import pyautogui
-        for n in dir(pyautogui):
-            o = getattr(pyautogui, n, None)
-            if not n.startswith("_") and isinstance(o, types.FunctionType):
-                patch_attr(pyautogui, n, self.rec("pyautogui." + n))
-
-        # win_input (SendInput wrapper used by controller): recorders too; reads return a fixed point/size
+        # win_input (the SendInput wrapper all synthetic input goes through): every public function is a
+        # recorder; reads return a fixed point/size
         import win_input
         for n in dir(win_input):
             o = getattr(win_input, n, None)

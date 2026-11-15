@@ -840,7 +840,6 @@ def main():
                         help="started at login: no welcome speech or popups; island as normal")
     parser.add_argument("--no-voice", action="store_true", help="disable voice commands")
     parser.add_argument("--camera", type=int, default=None, help="camera index (default 0)")
-    parser.add_argument("--diagnose", action="store_true", help="run diagnostic jitter, latency, and precision measurement")
     parser.add_argument("--test-mic", action="store_true", help="test microphone input levels and speech recognition")
     parser.add_argument("--island-demo", action="store_true", help="run Dynamic Island demo mode without requiring camera/gestures")
     parser.add_argument("--perf-report", action="store_true", help="print latency budget performance report and exit")
@@ -857,11 +856,6 @@ def main():
         from self_test import run_self_test
         code = run_self_test()
         sys.exit(code)
-
-    if args.diagnose:
-        from diagnose import run_diagnose
-        run_diagnose()
-        sys.exit(0)
 
     if args.test_mic:
         import subprocess
@@ -933,7 +927,7 @@ def main():
     controller = speaker = media_adapter = hardware_feed = None
 
     def _start_workers():
-        """Heavy startup (controller/pyautogui, Speaker/Piper, Tracker, Voice, media, feeds); runs off the GUI thread."""
+        """Heavy startup (controller, Speaker/Piper, Tracker, Voice, media, feeds); runs off the GUI thread."""
         nonlocal controller, speaker, media_adapter, hardware_feed
         try:
             _start_workers_impl()
@@ -961,7 +955,7 @@ def main():
         )
         supervisor.start("AutoUpdater")
 
-        from controller import Controller   # pyautogui -> cv2/numpy: deliberately after the island is up
+        from controller import Controller   # deliberately after the island is up
         from tracker import Tracker
         from voice import Speaker, Voice
         controller = Controller(cfg)

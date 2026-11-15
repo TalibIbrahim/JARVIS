@@ -30,13 +30,15 @@ from commands import run_command
 from config import Config
 from decision_engine import get_decision_engine, evaluate_decision
 import system_control
-from system_control import (
-    FallbackAudioBackend,
-    FallbackDisplayBackend,
+from system_control_mocks import (
     MockAudioBackend,
     MockDisplayBackend,
     MockPowerSessionBackend,
     MockWindowBackend,
+)
+from system_control import (
+    FallbackAudioBackend,
+    FallbackDisplayBackend,
     PycawAudioBackend,
     SystemControlAdapter,
     WindowsDisplayBackend,
@@ -84,22 +86,22 @@ class TestAudioControl(unittest.TestCase):
         self.assertTrue(backend.mute(toggle=False))
         self.assertTrue(backend.is_muted())
 
-    @patch("pyautogui.press")
+    @patch("win_input.press")
     def test_fallback_audio_backend(self, mock_press):
         backend = FallbackAudioBackend(initial_volume=40, initial_muted=False)
         self.assertEqual(backend.get_volume(), 40)
 
         new_vol = backend.volume_up(10)
         self.assertEqual(new_vol, 50)
-        mock_press.assert_called_with("volumeup", presses=5, _pause=False)
+        mock_press.assert_called_with("volumeup", presses=5)
 
         new_vol = backend.volume_down(15)
         self.assertEqual(new_vol, 35)
-        mock_press.assert_called_with("volumedown", presses=7, _pause=False)
+        mock_press.assert_called_with("volumedown", presses=7)
 
         muted = backend.mute(toggle=True)
         self.assertTrue(muted)
-        mock_press.assert_called_with("volumemute", _pause=False)
+        mock_press.assert_called_with("volumemute")
 
     def test_pycaw_audio_backend_with_mocked_endpoint(self):
         backend = PycawAudioBackend()
@@ -236,20 +238,20 @@ class TestWindowManagement(unittest.TestCase):
         self.assertIn("unsaved changes", msg)
         self.assertFalse(backend.closed)
 
-    @patch("pyautogui.hotkey")
+    @patch("win_input.hotkey")
     def test_windows_window_backend_snap(self, mock_hotkey):
         backend = WindowsWindowBackend()
         self.assertTrue(backend.snap_window("left"))
-        mock_hotkey.assert_called_with("win", "left", _pause=False)
+        mock_hotkey.assert_called_with("win", "left")
 
         self.assertTrue(backend.snap_window("right"))
-        mock_hotkey.assert_called_with("win", "right", _pause=False)
+        mock_hotkey.assert_called_with("win", "right")
 
         self.assertTrue(backend.snap_window("up"))
-        mock_hotkey.assert_called_with("win", "up", _pause=False)
+        mock_hotkey.assert_called_with("win", "up")
 
         self.assertTrue(backend.snap_window("down"))
-        mock_hotkey.assert_called_with("win", "down", _pause=False)
+        mock_hotkey.assert_called_with("win", "down")
 
         self.assertFalse(backend.snap_window("invalid_direction"))
 
@@ -557,7 +559,7 @@ class TestReflexIntentsAndCommands(unittest.TestCase):
         import commands
         commands._PENDING_CONFIRMATION = None
 
-    @patch("pyautogui.press")
+    @patch("win_input.press")
     def test_audio_reflexes(self, mock_press):
         reply = run_command("volume up", self.ctx)
         self.assertIn("Volume up", reply)

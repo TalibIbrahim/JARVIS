@@ -135,7 +135,7 @@ class TestWindowResolver(unittest.TestCase):
     def setUp(self):
         self.mock_api = MockWin32API()
         self.mock_pag = MagicMock()
-        self.resolver = WindowResolver(api=self.mock_api, pyautogui_module=self.mock_pag)
+        self.resolver = WindowResolver(api=self.mock_api, input_module=self.mock_pag)
 
     def test_resolve_window_under_cursor_normal_window(self):
         """Verifies accurate extraction of window handle, title, process ID, and coords."""
@@ -160,7 +160,8 @@ class TestWindowResolver(unittest.TestCase):
         ok, msg = self.resolver.open_this()
         self.assertTrue(ok)
         self.assertEqual(self.mock_api.foreground_hwnd, 2002)
-        self.mock_pag.click.assert_called_with(150, 250, _pause=False)
+        self.mock_pag.move_to.assert_called_with(150, 250)
+        self.mock_pag.click.assert_called_with()
         self.assertIn("Document.txt - Notepad", msg)
 
     def test_copy_this_focuses_and_sends_ctrl_c(self):
@@ -168,7 +169,7 @@ class TestWindowResolver(unittest.TestCase):
         ok, msg = self.resolver.copy_this()
         self.assertTrue(ok)
         self.assertEqual(self.mock_api.foreground_hwnd, 2002)
-        self.mock_pag.hotkey.assert_called_with("ctrl", "c", _pause=False)
+        self.mock_pag.hotkey.assert_called_with("ctrl", "c")
         self.assertIn("Copied selection", msg)
 
     def test_close_this_blocks_unsaved_without_confirmation(self):
@@ -273,10 +274,10 @@ class TestGestureShortcutsAndHUD(unittest.TestCase):
         """Right flick sends Alt+Tab, posts 'hud_switch_window', emits rewind and a move per frame."""
         engine, mock_overlay, t = self._engine(gesture_swipe_switch=True)
         frames = self._flick("x", +1)
-        with patch("pyautogui.hotkey") as mock_hotkey, \
+        with patch("win_input.hotkey") as mock_hotkey, \
              patch("system_control.get_foreground_window_title", return_value="Visual Studio Code"):
             acts, t = feed_engine(engine, frames, t)
-        mock_hotkey.assert_called_with("alt", "tab", _pause=False)
+        mock_hotkey.assert_called_with("alt", "tab")
         mock_overlay.post.assert_any_call("hud_switch_window", title="Visual Studio Code")
         self.assertIn("switch_window", [a.kind for a in acts])
         self._assert_flick_extras(acts, len(frames))
@@ -285,10 +286,10 @@ class TestGestureShortcutsAndHUD(unittest.TestCase):
         """Left flick sends Alt+Shift+Tab."""
         engine, mock_overlay, t = self._engine(gesture_swipe_switch=True)
         frames = self._flick("x", -1)
-        with patch("pyautogui.hotkey") as mock_hotkey, \
+        with patch("win_input.hotkey") as mock_hotkey, \
              patch("system_control.get_foreground_window_title", return_value="Visual Studio Code"):
             acts, t = feed_engine(engine, frames, t)
-        mock_hotkey.assert_called_with("alt", "shift", "tab", _pause=False)
+        mock_hotkey.assert_called_with("alt", "shift", "tab")
         mock_overlay.post.assert_any_call("hud_switch_window", title="Visual Studio Code")
         self.assertIn("switch_window", [a.kind for a in acts])
         self._assert_flick_extras(acts, len(frames))
@@ -297,7 +298,7 @@ class TestGestureShortcutsAndHUD(unittest.TestCase):
         """Old slow 0.08-over-3-frames swipe (either direction) triggers nothing."""
         for sign in (-1, +1):
             engine, mock_overlay, t = self._engine(gesture_swipe_switch=True)
-            with patch("pyautogui.hotkey") as mock_hotkey:
+            with patch("win_input.hotkey") as mock_hotkey:
                 acts, t = feed_engine(engine, self._slow("x", sign), t)
             mock_hotkey.assert_not_called()
             self._assert_nothing_fired(acts, mock_overlay)

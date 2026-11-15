@@ -17,7 +17,6 @@ import re
 import sys
 import threading
 import time
-import urllib.parse
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Any, Iterator, Union, Callable
 
@@ -448,33 +447,40 @@ def get_api_key(cfg=None) -> Optional[str]:
     return None
 
 
-def set_api_key(api_key: str, persist_to_config: bool = True) -> None:
+def _edit_config_file(edit) -> None:
+    """Atomic read-modify-write of jarvis_config.json; edit(data) returns True when it changed something."""
+    from config import _atomic_write_json, get_config_path
+    cfg_path = get_config_path()
+    data = {}
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    if isinstance(data, dict) and edit(data):
+        _atomic_write_json(cfg_path, data)
+
+
+def set_api_key(api_key: str, persist_to_config: bool = False) -> None:
     """
-    Saves the API key to Windows Credential Manager via keyring,
-    and optionally persists to jarvis_config.json.
+    Saves the API key to Windows Credential Manager via keyring. It is also written to
+    jarvis_config.json only when persist_to_config is True or the keyring write failed
+    (so the key is never silently lost).
     """
     if not api_key or not api_key.strip():
         delete_api_key()
         return
 
     clean_key = api_key.strip()
+    stored = False
     try:
         import keyring
         keyring.set_password(SERVICE_NAME, KEY_USERNAME, clean_key)
+        stored = True
     except Exception as exc:
         print(f"[ai] keyring write note: {exc}")
 
-    if persist_to_config:
+    if persist_to_config or not stored:
         try:
-            from config import get_config_path
-            cfg_path = get_config_path()
-            data = {}
-            if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            data["groq_api_key"] = clean_key
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
+            _edit_config_file(lambda d: d.__setitem__("groq_api_key", clean_key) or True)
         except Exception as exc:
             print(f"[ai] save key to config note: {exc}")
 
@@ -488,15 +494,7 @@ def delete_api_key() -> None:
         pass
 
     try:
-        from config import get_config_path
-        cfg_path = get_config_path()
-        if os.path.exists(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if "groq_api_key" in data:
-                del data["groq_api_key"]
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=4)
+        _edit_config_file(lambda d: d.pop("groq_api_key", None) is not None)
     except Exception:
         pass
 
@@ -1356,18 +1354,6 @@ def prewarm_connection(api_key: Optional[str] = None, async_prewarm: bool = True
     return client.prewarm_connection(async_prewarm=async_prewarm)
 
 
-def clear_ai_cache() -> None:
-    """Clears persistent session and connection cache."""
-    global _SESSION
-    with _SESSION_LOCK:
-        if _SESSION is not None:
-            try:
-                _SESSION.close()
-            except Exception:
-                pass
-            _SESSION = None
-
-
 # =====================================================================
 # System Prompt & Action Dispatch
 # =====================================================================
@@ -1651,7 +1637,6 @@ def stream_ai_query(
 
     accumulated = ""
     last_posted_text = ""
-    first_sentence_posted = False
 
     for token in chat_result:
         accumulated += token
@@ -1719,7 +1704,7 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
     if action not in WHITELIST_ACTIONS or action == "none":
         return False, f"Action '{action}' is not executable"
 
-    import pyautogui
+    import win_input
     from commands import APPS, SITES, _launch
 
     try:
@@ -1730,7 +1715,7 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
                 system_control.volume_up(steps=steps)
             except Exception:
                 pass
-            pyautogui.press("volumeup", presses=steps, _pause=False)
+            win_input.press("volumeup", presses=steps)
             return True, f"Volume increased by {steps}"
 
         elif action == "volume_down":
@@ -1740,7 +1725,7 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
                 system_control.volume_down(steps=steps)
             except Exception:
                 pass
-            pyautogui.press("volumedown", presses=steps, _pause=False)
+            win_input.press("volumedown", presses=steps)
             return True, f"Volume decreased by {steps}"
 
         elif action == "mute":
@@ -1749,7 +1734,7 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
                 system_control.mute(toggle=True)
             except Exception:
                 pass
-            pyautogui.press("volumemute", _pause=False)
+            win_input.press("volumemute")
             return True, "Mute toggled"
 
         elif action == "play_pause":
@@ -1768,16 +1753,9 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             return True, "Previous track"
 
         elif action == "weather":
-            from weather_client import get_weather_client
+            from weather_client import weather_for_cfg
             cfg = getattr(ctx, "cfg", None) or getattr(getattr(ctx, "engine", None), "cfg", None)
-            city = str(args.get("city", getattr(cfg, "weather_city", "New York") if cfg else "New York"))
-            lat = float(args.get("lat", getattr(cfg, "weather_lat", 40.7128) if cfg else 40.7128))
-            lon = float(args.get("lon", getattr(cfg, "weather_lon", -74.0060) if cfg else -74.0060))
-            units = getattr(cfg, "weather_units", "auto") if cfg else "auto"
-            client = get_weather_client()
-            w = client.get_weather(lat, lon, city=city, units=units)
-            if not w and city:
-                w = client.get_weather_for_city(city, units=units)
+            w = weather_for_cfg(cfg, city=str(args.get("city") or "") or None)
             if w:
                 temp_int = int(round(w.temperature))
                 c_name = w.city.split(",")[0]
@@ -1882,7 +1860,7 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             folder = os.path.join(os.path.expanduser("~"), "Pictures", "Jarvis")
             os.makedirs(folder, exist_ok=True)
             shot_path = os.path.join(folder, time.strftime("shot-%Y%m%d-%H%M%S.png"))
-            pyautogui.screenshot(shot_path)
+            win_input.screenshot(shot_path)
             return True, f"Screenshot saved to {shot_path}"
 
         elif action == "lock_workstation":
@@ -1893,19 +1871,19 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             return False, "Lock not supported on this platform"
 
         elif action == "show_desktop":
-            pyautogui.hotkey("win", "d", _pause=False)
+            win_input.hotkey("win", "d")
             return True, "Desktop shown"
 
         elif action == "minimize_window":
-            pyautogui.hotkey("win", "down", _pause=False)
+            win_input.hotkey("win", "down")
             return True, "Window minimized"
 
         elif action == "maximize_window":
-            pyautogui.hotkey("win", "up", _pause=False)
+            win_input.hotkey("win", "up")
             return True, "Window maximized"
 
         elif action == "switch_window":
-            pyautogui.hotkey("alt", "tab", _pause=False)
+            win_input.hotkey("alt", "tab")
             return True, "Window switched"
 
         elif action == "close_window":
@@ -1967,12 +1945,12 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             return True, "House Party Protocol initiated"
 
         elif action == "stealth_mode":
-            pyautogui.press("volumemute", _pause=False)
-            pyautogui.hotkey("win", "down", _pause=False)
+            win_input.press("volumemute")
+            win_input.hotkey("win", "down")
             return True, "Stealth mode engaged"
 
         elif action == "clean_slate":
-            pyautogui.hotkey("win", "d", _pause=False)
+            win_input.hotkey("win", "d")
             reset_ai_history()
             if ctx:
                 ctx.set_active(False)
@@ -2102,7 +2080,7 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             sched = scheduler.get_scheduler(ctx=ctx)
             duration = float(args.get("duration", 60.0))
             label = str(args.get("label", "Timer"))
-            item = sched.set_timer(duration, label=label)
+            sched.set_timer(duration, label=label)
             return True, f"Timer set for {scheduler.format_duration(duration)} ({label})"
 
         elif action == "cancel_timer":
@@ -2125,7 +2103,7 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             sched = scheduler.get_scheduler(ctx=ctx)
             target = float(args.get("target_time", time.time() + 3600))
             label = str(args.get("label", "Alarm"))
-            item = sched.set_alarm(target, label=label)
+            sched.set_alarm(target, label=label)
             return True, f"Alarm set for {label}"
 
         elif action == "set_reminder":
@@ -2133,7 +2111,7 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             sched = scheduler.get_scheduler(ctx=ctx)
             target = float(args.get("target_time", time.time() + 3600))
             text_val = str(args.get("text", "Reminder"))
-            item = sched.set_reminder(target, text=text_val)
+            sched.set_reminder(target, text=text_val)
             return True, f"Reminder set: {text_val}"
 
         elif action == "calculate":

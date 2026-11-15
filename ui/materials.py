@@ -103,28 +103,6 @@ def _dwm_set(hwnd: int, attr: int, value: int) -> bool:
         return False
 
 
-def _dwm_set_color(hwnd: int, attr: int, abgr: int) -> bool:
-    """Set a DWMWA color attribute (COLORREF = ABGR)."""
-    if sys.platform != "win32":
-        return False
-    try:
-        dwm = ctypes.windll.dwmapi
-        v = ctypes.c_uint(abgr)
-        result = dwm.DwmSetWindowAttribute(
-            hwnd, attr, ctypes.byref(v), ctypes.sizeof(v)
-        )
-        return result == 0
-    except Exception:
-        return False
-
-
-def _to_abgr(hex_str: str) -> int:
-    """Convert '#RRGGBB' to a Windows COLORREF int (0x00BBGGRR)."""
-    h = hex_str.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return b << 16 | g << 8 | r
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # DWM caption extension (needed for Mica to fill title bar area)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -167,11 +145,6 @@ def set_rounded_corners(hwnd: int, small: bool = False) -> bool:
     """Apply rounded window corners (Windows 11+ only)."""
     pref = DWMWCP_SMALL if small else DWMWCP_ROUND
     return _dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, pref)
-
-
-def set_border_color(hwnd: int, hex_color: str) -> bool:
-    """Apply a custom DWM border color (Windows 11+)."""
-    return _dwm_set_color(hwnd, DWMWA_BORDER_COLOR, _to_abgr(hex_color))
 
 
 def apply_mica(hwnd: int, dark: bool = True) -> bool:
@@ -449,14 +422,3 @@ def make_snap_layouts_compatible(hwnd: int) -> None:
     except Exception:
         pass
 
-
-def solid_tint_stylesheet(dark: bool, opacity: float = 1.0) -> str:
-    """
-    Return a QWidget stylesheet for a solid tinted fallback background
-    (used when transparency is off or on Windows 10 without blur support).
-    """
-    if dark:
-        alpha = int(max(0.0, min(1.0, float(opacity))) * 255)
-        return f"background-color: rgba(19, 22, 23, {alpha / 255.0:.2f});"
-    else:
-        return "background-color: #F2F2F7;"

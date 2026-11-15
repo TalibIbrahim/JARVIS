@@ -2,7 +2,7 @@
 
 One lazily-created singleton. The model is loaded on a background thread (first run downloads it into
 %LOCALAPPDATA%\\JARVIS\\models\\stt) so the first command is never blocked; until it is ready, or if it
-cannot load, `available()` is False and the caller uses Groq/Google. Nothing here logs audio or text.
+cannot load, `available()` is False and the caller uses Groq. Nothing here logs audio or text.
 """
 import math
 import os
@@ -70,7 +70,7 @@ class LocalTranscriber:
                       int((time.monotonic() - t0) * 1000))
         except Exception as exc:
             self._state = FAILED
-            _log.warning("local STT unavailable (%r); using Groq/Google", exc)
+            _log.warning("local STT unavailable (%r); using Groq", exc)
 
     def transcribe(self, pcm16: bytes, prompt: str = None, hotwords: str = None):
         """Transcribe 16 kHz mono int16 PCM. Returns (text, confidence 0..1). Raises if not ready.

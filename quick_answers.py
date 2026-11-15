@@ -258,27 +258,6 @@ def get_wikipedia_client() -> WikipediaClient:
     return _WIKI_CLIENT
 
 
-def set_wikipedia_client(client: WikipediaClient) -> None:
-    global _WIKI_CLIENT
-    _WIKI_CLIENT = client
-
-
-def is_factual_query(text: str) -> bool:
-    """Detects if user is asking a factual question suitable for Wikipedia or quick lookup."""
-    if not text:
-        return False
-    t = text.lower().strip(" ,.!?")
-    patterns = [
-        r"^who (?:was|is)\s+(.+)",
-        r"^what (?:is|was|are)\s+(.+)",
-        r"^tell me about\s+(.+)",
-        r"^define\s+(.+)",
-        r"^summarize\s+(.+)",
-        r"^(?:wiki|wikipedia)\s+(.+)",
-    ]
-    return any(re.search(p, t) for p in patterns)
-
-
 def extract_factual_topic(text: str) -> Optional[str]:
     """Extracts search term / topic from a factual question."""
     t = text.lower().strip(" ,.!?")

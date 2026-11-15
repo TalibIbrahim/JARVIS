@@ -63,7 +63,6 @@ from gestures import (
     WRIST,
     Action,
     GestureEngine,
-    Hand,
     Pose,
 )
 
@@ -166,9 +165,6 @@ class ReplayFrame:
     timestamp: float
     hands: List[List[Tuple[float, float]]]
     metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def to_hand_objects(self) -> List[Hand]:
-        return [Hand(lm=lm) for lm in self.hands]
 
 
 @dataclass

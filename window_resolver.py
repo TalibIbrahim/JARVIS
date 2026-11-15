@@ -20,10 +20,8 @@ Strictly NO Qt imports. 100% unit-testable with interfaces and mocks.
 from __future__ import annotations
 
 import ctypes
-import os
 import sys
-import time
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 try:
     from ctypes import wintypes
@@ -223,19 +221,16 @@ class WindowResolver:
     def __init__(
         self,
         api: Optional[Win32APIProtocol] = None,
-        pyautogui_module: Optional[Any] = None,
+        input_module: Optional[Any] = None,
     ):
         self.api: Win32APIProtocol = api or DefaultWin32API()
-        self._pyautogui = pyautogui_module
+        self._input = input_module
 
-    def _get_pyautogui(self):
-        if self._pyautogui is not None:
-            return self._pyautogui
-        try:
-            import pyautogui
-            return pyautogui
-        except ImportError:
-            return None
+    def _get_input(self):
+        if self._input is not None:
+            return self._input
+        import win_input
+        return win_input
 
     def resolve_window_under_cursor(
         self, point: Optional[Tuple[int, int]] = None
@@ -255,7 +250,7 @@ class WindowResolver:
             if ok:
                 cx, cy = int(pt.x), int(pt.y)
             else:
-                pag = self._get_pyautogui()
+                pag = self._get_input()
                 if pag:
                     try:
                         pos = pag.position()
@@ -340,11 +335,12 @@ class WindowResolver:
         if hwnd:
             self.api.SetForegroundWindow(hwnd)
 
-        pag = self._get_pyautogui()
+        pag = self._get_input()
         if pag:
             try:
                 # Click target location under cursor
-                pag.click(px, py, _pause=False)
+                pag.move_to(px, py)
+                pag.click()
             except Exception:
                 pass
 
@@ -365,10 +361,10 @@ class WindowResolver:
         if hwnd:
             self.api.SetForegroundWindow(hwnd)
 
-        pag = self._get_pyautogui()
+        pag = self._get_input()
         if pag:
             try:
-                pag.hotkey("ctrl", "c", _pause=False)
+                pag.hotkey("ctrl", "c")
             except Exception as exc:
                 return False, f"Unable to trigger copy: {exc}"
         else:
@@ -408,12 +404,12 @@ class WindowResolver:
             closed = False
 
         if not closed:
-            pag = self._get_pyautogui()
+            pag = self._get_input()
             if pag:
                 try:
                     if hwnd:
                         self.api.SetForegroundWindow(hwnd)
-                    pag.hotkey("alt", "f4", _pause=False)
+                    pag.hotkey("alt", "f4")
                     closed = True
                 except Exception as exc:
                     return False, f"Failed to close window: {exc}"

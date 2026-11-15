@@ -4,7 +4,7 @@ for J.A.R.V.I.S. Apple HIG UI Redesign.
 
 Tests covered:
   1. Module Exports & Subpackage Integrity (ui/ imports, tokens, materials, components)
-  2. Overlay Manager Integration (_NEW_UI_AVAILABLE, island, cursor, tray)
+  2. Overlay Manager Integration (island, cursor, tray)
   3. Dynamic Island State Transitions & Waveform Springs (all 8 states)
   4. Cursor Feedback Overlay (dwell progress ring, completion pulse, radial menu)
   5. System Settings Window (all 7 tabs, search filter, controls, timers, clean teardown)
@@ -39,7 +39,7 @@ from ui.cursor_overlay import CursorFeedbackOverlay
 from ui.settings_window import SettingsWindow, _CATEGORIES, _SIDEBAR_LABELS
 from ui.onboarding import OnboardingDialog
 from ui.tray import JarvisTray
-from overlay import Overlay, _NEW_UI_AVAILABLE
+from overlay import Overlay
 
 
 class DummyContext:
@@ -69,7 +69,6 @@ class TestFullUIFunctional(unittest.TestCase):
     # ── 1. Module Exports & Subpackage Integrity ───────────────────────────
     def test_01_subpackage_exports(self):
         """Verify new ui/ package is loaded by default in overlay.py."""
-        self.assertTrue(_NEW_UI_AVAILABLE, "_NEW_UI_AVAILABLE must be True")
         self.assertIsNotNone(T)
         self.assertIsNotNone(AppleSwitch)
         self.assertIsNotNone(SegmentedControl)

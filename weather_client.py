@@ -505,6 +505,25 @@ class WeatherClient:
         self._geo_cache.clear()
 
 
+_HERE = ("", "auto", "my location", "current location", "here", "local")
+
+
+def weather_for_cfg(cfg, city: Optional[str] = None) -> Optional[WeatherData]:
+    """Weather for voice answers: the asked-for city, else the island's city (Settings), geocoded; lat/lon only
+    for "auto". The island and voice answers therefore always agree."""
+    units = (getattr(cfg, "island_weather_units", None) or getattr(cfg, "weather_units", "auto")) if cfg else "auto"
+    if not city:
+        city = (getattr(cfg, "island_weather_city", None) or getattr(cfg, "weather_city", "")) if cfg else ""
+    client = get_weather_client()
+    if str(city).strip().lower() not in _HERE:
+        w = client.get_weather_for_city(str(city), units=units)
+        if w:
+            return w
+    lat = getattr(cfg, "weather_lat", 40.7128) if cfg else 40.7128
+    lon = getattr(cfg, "weather_lon", -74.0060) if cfg else -74.0060
+    return client.get_weather(lat, lon, city=str(city or ""), units=units)
+
+
 # Global singleton client
 _WEATHER_CLIENT: Optional[WeatherClient] = None
 

@@ -655,7 +655,9 @@ def build_config_cases(seed=4242):
     base = dataclasses.asdict(config.Config())
     keys = list(base)
     good = json.dumps(base, indent=4).encode()
-    alias_keys = [o for o, _ in config._ISLAND_KEY_ALIASES] + ["glass_blur", "island_backdrop_blur",
+    alias_keys = ["time_format", "island_time_format", "idle_display", "island_compact_mode", "show_now_playing",
+                  "show_weather", "weather_city", "weather_units", "expand_trigger", "hide_fullscreen",
+                  "island_size"] + ["glass_blur", "island_backdrop_blur",
                                                                  "island_backdrop_opacity"]
     cases = []
 

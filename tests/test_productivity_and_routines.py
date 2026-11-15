@@ -322,13 +322,16 @@ class TestProductivity:
         productivity.set_dictation_mode(False)
         assert productivity.is_dictation_mode() is False
 
-    @patch("productivity.pyautogui")
-    def test_type_text(self, mock_pyautogui):
-        mock_pyautogui.write = MagicMock()
-        mock_pyautogui.hotkey = MagicMock()
-
-        ok = productivity.type_text("Hello Jarvis world")
+    @patch("productivity.win_input")
+    def test_type_text(self, mock_input):
+        with patch("productivity.set_clipboard_text") as mock_clip:
+            ok = productivity.type_text("Hello Jarvis world")
         assert ok is True
+        mock_clip.assert_called_once_with("Hello Jarvis world")
+        mock_input.hotkey.assert_called_once_with("ctrl", "v")
+        ok = productivity.type_text("Hello", use_paste_fallback=False)
+        assert ok is True
+        mock_input.write.assert_called_once_with("Hello", interval=0.01)
 
     def test_clipboard_reader_and_summarizer(self):
         sample_text = (

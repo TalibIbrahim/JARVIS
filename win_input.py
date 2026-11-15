@@ -1,14 +1,17 @@
-"""Minimal Win32 SendInput wrapper replacing pyautogui in the hot input path.
+"""Minimal Win32 SendInput wrapper: all synthetic mouse/keyboard input in J.A.R.V.I.S. goes through here.
 
-Semantics match what controller.py used from pyautogui (PAUSE=0, no failsafe, no duration):
+Semantics match pyautogui with _pause=False (no failsafe, no duration):
 - click / double_click / right_click act at the CURRENT cursor position (no move).
 - mouse_down / mouse_up default to the left button.
 - scroll(n) sends one MOUSEEVENTF_WHEEL event with dwData == n (callers pass 120 * notches).
 - hotkey(*keys) presses keys in order and releases them in reverse order.
-Importing this module is cheap (ctypes only: no cv2/numpy/Pillow).
+- write(text, interval) types each character as a Unicode key event, sleeping `interval` between them.
+- screenshot(path) grabs the primary screen with Pillow's ImageGrab (what pyautogui/pyscreeze used).
+Importing this module is cheap (ctypes only: Pillow is imported inside screenshot()).
 """
 import ctypes
 import sys
+import time
 from ctypes import wintypes
 
 _WIN = sys.platform == "win32"
@@ -26,6 +29,7 @@ MOUSEEVENTF_WHEEL = 0x0800
 
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
 
 _ULONG_PTR = ctypes.c_size_t
 
@@ -189,3 +193,41 @@ def press(key, presses=1):
 def hotkey(*keys):
     vks = [_vk(k) for k in keys]
     _send([_key_input(v, False) for v in vks] + [_key_input(v, True) for v in reversed(vks)])
+
+
+def _unicode_inputs(ch):
+    """Down/up KEYEVENTF_UNICODE events for one character (UTF-16 surrogate pairs above U+FFFF)."""
+    code = ord(ch)
+    units = [code] if code <= 0xFFFF else [0xD800 + ((code - 0x10000) >> 10), 0xDC00 + ((code - 0x10000) & 0x3FF)]
+    out = []
+    for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+        for u in units:
+            i = INPUT()
+            i.type = INPUT_KEYBOARD
+            i.ki = KEYBDINPUT(0, u, flags, 0, 0)
+            out.append(i)
+    return out
+
+
+_WRITE_KEYS = {"\n": "enter", "\r": "enter", "\t": "tab"}
+
+
+def write(text, interval=0.0):
+    """Types `text` into the focused window (pyautogui.write equivalent; Enter/Tab for newline/tab)."""
+    for n, ch in enumerate(str(text)):
+        if n and interval:
+            time.sleep(interval)
+        key = _WRITE_KEYS.get(ch)
+        if key:
+            press(key)
+        else:
+            _send(_unicode_inputs(ch))
+
+
+def screenshot(path=None):
+    """Grabs the primary screen as a PIL Image; saves it to `path` when given."""
+    from PIL import ImageGrab
+    img = ImageGrab.grab()
+    if path:
+        img.save(path)
+    return img

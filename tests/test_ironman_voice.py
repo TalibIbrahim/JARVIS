@@ -17,7 +17,7 @@ from ai import (
     build_system_prompt,
     parse_ai_response,
 )
-from overlay import Overlay, AppleDynamicIsland
+from overlay import Overlay
 
 
 class TestSiriPromptDisplay(unittest.TestCase):
@@ -41,17 +41,15 @@ class TestSiriPromptDisplay(unittest.TestCase):
 
     def test_voice_posts_transcribing_visual_feedback(self):
         """When speech audio is captured, overlay is notified of active transcription."""
-        recognizer = MagicMock()
-        audio = MagicMock()
-        audio.get_raw_data.return_value = b"\x00\x10" * 4000
-        audio.get_wav_data.return_value = b"RIFF....WAVE"
-        self.voice.audio_q.put(audio)
+        self.voice.audio_q.put(b"\x00\x10" * 4000)
         self.stop.is_set.side_effect = [False, True]
+        local = MagicMock()
+        local.transcribe.return_value = ("hello", 0.9)
 
         with patch("voice.get_api_key", return_value=None):
-            with patch.object(self.voice, "_fallback_google", return_value="hello"):
+            with patch.object(self.voice, "_local_stt_ready", return_value=local):
                 with patch.object(self.voice, "_process"):
-                    self.voice._recognition_worker(recognizer, MagicMock())
+                    self.voice._recognition_worker()
 
         # Verify listening with transcribing=True was posted
         post_calls = [call for call in self.ctx.overlay.post.call_args_list if call[0][0] == "listening"]
@@ -113,21 +111,21 @@ class TestIronManSystemTelemetryAndCommands(unittest.TestCase):
         self.assertIn("House Party Protocol initiated", reply)
         mock_launch.assert_called_with("chrome")
 
-    @patch("pyautogui.press")
-    @patch("pyautogui.hotkey")
+    @patch("win_input.press")
+    @patch("win_input.hotkey")
     def test_command_stealth_mode(self, mock_hotkey, mock_press):
         reply = run_command("stealth mode", self.ctx)
         self.assertIn("Stealth mode engaged", reply)
-        mock_press.assert_called_with("volumemute", _pause=False)
-        mock_hotkey.assert_called_with("win", "down", _pause=False)
+        mock_press.assert_called_with("volumemute")
+        mock_hotkey.assert_called_with("win", "down")
 
-    @patch("pyautogui.hotkey")
+    @patch("win_input.hotkey")
     def test_command_clean_slate_protocol(self, mock_hotkey):
         reply = run_command("clean slate protocol", self.ctx)
         self.assertIn("Clean Slate Protocol executed", reply)
         self.assertNotIn("Mr. Stark", reply)
         self.assertIn("sir", reply)
-        mock_hotkey.assert_called_with("win", "d", _pause=False)
+        mock_hotkey.assert_called_with("win", "d")
         self.ctx.set_active.assert_called_with(False)
 
     @patch("webbrowser.open")
@@ -170,24 +168,24 @@ class TestIronManAIWhitelistedActions(unittest.TestCase):
         self.assertTrue(ok)
         mock_launch.assert_called_with("chrome")
 
-    @patch("pyautogui.press")
-    @patch("pyautogui.hotkey")
+    @patch("win_input.press")
+    @patch("win_input.hotkey")
     def test_execute_stealth_mode_action(self, mock_hotkey, mock_press):
         ok, msg = execute_whitelisted_action("stealth_mode", {}, self.ctx)
         self.assertTrue(ok)
-        mock_press.assert_called_with("volumemute", _pause=False)
-        mock_hotkey.assert_called_with("win", "down", _pause=False)
+        mock_press.assert_called_with("volumemute")
+        mock_hotkey.assert_called_with("win", "down")
 
-    @patch("pyautogui.hotkey")
+    @patch("win_input.hotkey")
     def test_execute_clean_slate_action(self, mock_hotkey):
         # Destructive gate: runs only when the user's own words are the exact phrase.
         self.ctx._current_utterance = "execute clean slate"
         ok, msg = execute_whitelisted_action("clean_slate", {}, self.ctx)
         self.assertTrue(ok)
-        mock_hotkey.assert_called_with("win", "d", _pause=False)
+        mock_hotkey.assert_called_with("win", "d")
         self.ctx.set_active.assert_called_with(False)
 
-    @patch("pyautogui.hotkey")
+    @patch("win_input.hotkey")
     def test_execute_clean_slate_action_blocked_without_phrase(self, mock_hotkey):
         self.ctx._current_utterance = "bye"
         ok, msg = execute_whitelisted_action("clean_slate", {}, self.ctx)
@@ -375,15 +373,15 @@ class TestVoiceProfileAndSpeakerVerification(unittest.TestCase):
         voice = Voice(Config(), self.ctx, MagicMock())
         voice.listening_until = 0.0  # passive standby
 
-        audio = MagicMock()
-        audio.get_raw_data.return_value = self._generate_synthetic_voice()
-        voice.audio_q.put(audio)
+        voice.audio_q.put(self._generate_synthetic_voice())
+        local = MagicMock()
+        local.transcribe.return_value = ("just ambient background sound", 0.9)
 
         with patch("voice.get_api_key", return_value=None):
-            with patch.object(voice, "_fallback_google", return_value="just ambient background sound"):
+            with patch.object(voice, "_local_stt_ready", return_value=local):
                 # Run one cycle
                 voice.stop.is_set.side_effect = [False, True]
-                voice._recognition_worker(MagicMock(), MagicMock())
+                voice._recognition_worker()
 
         # listening_done must have been posted to clean the island
         self.ctx.overlay.post.assert_any_call("listening_done")

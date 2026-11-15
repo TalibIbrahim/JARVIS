@@ -93,7 +93,7 @@ def test_capture_answer_silence_returns_empty(monkeypatch):
 
 def test_capture_works_while_listen_for_jarvis_off(monkeypatch):
     v, wd, dispatched = _running_voice(monkeypatch, Config(listen_for_jarvis=False))
-    v._transcribe_blocking = MagicMock(return_value=("hello", None, "google"))
+    v._transcribe_blocking = MagicMock(return_value=("hello", None, "groq"))
     try:
         assert wait_until(lambda: wd.mic_state() == ("ok", "Listening off"))
         assert v.capture_answer(timeout=5.0) == "hello"
@@ -172,11 +172,9 @@ def _item_voice(monkeypatch, cfg, personal, text="open mallenia guide"):
 
 
 def _run_item(v):
-    import speech_recognition as sr
     rng = np.random.default_rng(3)
     raw = rng.integers(-3000, 3000, 16000).astype(np.int16).tobytes()
-    v._handle_audio_item(MagicMock(), sr, MagicMock(is_enrolled=False), sr.AudioData(raw, 16000, 2),
-                         True, time.time(), "u1")
+    v._handle_audio_item(MagicMock(is_enrolled=False), raw, True, time.time(), "u1")
 
 
 def test_corrections_applied_before_dispatch_only_when_enabled(monkeypatch):
@@ -541,3 +539,27 @@ def test_onboarding_never_downloads_voices():
     from ui import onboarding_window
     src = inspect.getsource(onboarding_window)
     assert "voice_models" not in src and "download(" not in src
+
+
+# ------------------------------------------------------------------ speech-only "J.A.R.V.I.S." -> "Jarvis"
+@pytest.mark.parametrize("text,spoken", [
+    ("Hello, I'm J.A.R.V.I.S.", "Hello, I'm Jarvis."),                          # sentence end keeps its break
+    ("I am J. A. R. V. I. S. How can I help?", "I am Jarvis. How can I help?"),
+    ("J.A.R.V.I.S., online.", "Jarvis, online."),
+    ("Call me J.A.R.V.I.S. now", "Call me Jarvis now"),
+    ("j.a.r.v.i.s online", "Jarvis online"),
+    ("Jarvis is here. JARVIS too.", "Jarvis is here. JARVIS too."),             # plain names untouched
+])
+def test_speech_text_rewrites_acronym_only(text, spoken):
+    assert voice._speech_text(text) == spoken
+
+
+def test_speaker_speaks_acronym_as_word_on_both_engines():
+    for engine in ("system", "piper"):
+        sp = Speaker(enabled=True, cfg=Config(tts_engine=engine))
+        sp._say_system, sp._say_piper, sp._init_piper = MagicMock(), MagicMock(), MagicMock()
+        sp.q.put("Hello, I'm J.A.R.V.I.S. Ready.")
+        sp.q.put(None)
+        sp._run_body()
+        target = sp._say_piper if engine == "piper" else sp._say_system
+        target.assert_called_once_with("Hello, I'm Jarvis. Ready.")

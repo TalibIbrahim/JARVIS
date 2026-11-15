@@ -115,7 +115,7 @@ def env(monkeypatch):
 
     def make(autostart=False, idle=0.0):
         cfg = SimpleNamespace(camera_index=0, frame_width=64, frame_height=48, camera_mjpg=False, camera_fps=30,
-                              threaded_capture=True, camera_autostart=autostart, gesture_idle_timeout_s=idle,
+                              camera_autostart=autostart, gesture_idle_timeout_s=idle,
                               show_preview=False, model_complexity=0, min_detection_confidence=0.5,
                               min_tracking_confidence=0.5)
         stop = threading.Event()

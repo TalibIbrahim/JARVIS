@@ -22,7 +22,7 @@ import os
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Dict, List, Optional
 
 
 import re
@@ -144,28 +144,6 @@ class PrivacyEvent:
         )
 
 
-class PrivacyLogProtocol(Protocol):
-    """Protocol interface for Privacy Log implementations."""
-
-    def record(
-        self,
-        destination: str,
-        payload_summary: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        status: str = "success",
-    ) -> PrivacyEvent:
-        ...
-
-    def get_events(self, limit: Optional[int] = None, reverse: bool = False) -> List[Dict[str, Any]]:
-        ...
-
-    def clear(self) -> None:
-        ...
-
-    def sync_to_disk(self) -> bool:
-        ...
-
-
 class PrivacyLog:
     """
     Thread-safe ring buffer (last 50 events) with persistent JSON synchronization
@@ -234,11 +212,6 @@ class PrivacyLog:
         if limit is not None and limit > 0:
             return events[:limit]
         return events
-
-    def get_event_objects(self) -> List[PrivacyEvent]:
-        """Returns shallow copy of PrivacyEvent objects."""
-        with self._lock:
-            return list(self._events)
 
     def count(self) -> int:
         """Returns total number of events currently in the buffer."""

@@ -13,7 +13,6 @@ Theme:     Full light + dark support; live system-theme polling.
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import sys
@@ -133,13 +132,8 @@ def _groq_client_cls():
         return None
 
 
-try:
-    from config import get_config_path, _atomic_write_json, Config as _ConfigCls
-    _CONFIG_FIELDS = frozenset(_ConfigCls.__dataclass_fields__)
-except ImportError:
-    get_config_path = lambda: os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jarvis_config.json")
-    _atomic_write_json = None
-    _CONFIG_FIELDS = None
+from config import get_config_path, update_key, Config as _ConfigCls
+_CONFIG_FIELDS = frozenset(_ConfigCls.__dataclass_fields__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -360,10 +354,6 @@ class _SidebarWidget(QWidget):
 
     def select(self, category_id: str) -> None:
         self._select(category_id)
-
-    def _tick_pill(self) -> None:
-        # Refresh theme every ~3 s to react to live Windows theme changes
-        pass  # polling handled at SettingsWindow level
 
     def paintEvent(self, event) -> None:
         p = QPainter(self)
@@ -2071,9 +2061,6 @@ class SettingsWindow(QDialog):
 
         # Actions card
         act_card = GroupedCard()
-        btn_diag = PrimaryButton("Run Diagnostics")
-        btn_diag.setFixedWidth(148)
-        btn_diag.clicked.connect(self._run_diagnose_action)
         btn_tp   = PlainButton("Target Practice")
         btn_tp.setFixedWidth(148)
         btn_tp.clicked.connect(self._open_target_practice)
@@ -2082,7 +2069,6 @@ class SettingsWindow(QDialog):
         row_hl = QHBoxLayout(row_w)
         row_hl.setContentsMargins(0, 0, 0, 0)
         row_hl.setSpacing(8)
-        row_hl.addWidget(btn_diag)
         row_hl.addWidget(btn_tp)
         row_hl.addStretch()
         act_card.add_row("Benchmarks", "Measure jitter, drift, and 24×24 px target accuracy", row_w)
@@ -3854,13 +3840,6 @@ class SettingsWindow(QDialog):
         self._save("frame_width",  w)
         self._save("frame_height", h)
 
-    def _run_diagnose_action(self) -> None:
-        import subprocess
-        base = os.path.dirname(os.path.abspath(__file__))
-        s = os.path.join(base, "..", "diagnose.py")
-        if os.path.exists(s):
-            subprocess.Popen([sys.executable, s])
-
     def _run_preflight_diagnostics(self) -> None:
         if hasattr(self, "btn_diag_health"):
             self.btn_diag_health.setEnabled(False)
@@ -3982,29 +3961,10 @@ class SettingsWindow(QDialog):
     def _save(self, key: str, value) -> None:
         if key != "groq_api_key" and any(s in key.lower() for s in ("secret", "token", "password")):
             return
-        if _CONFIG_FIELDS is not None and key not in _CONFIG_FIELDS:
+        if key not in _CONFIG_FIELDS:
             print(f"[settings] ignoring non-Config key: {key}")
             return
-        try:
-            setattr(self.cfg, key, value)
-        except Exception:
-            pass
-        try:
-            cfg_path = get_config_path()
-            data = {}
-            if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            if not isinstance(data, dict):
-                data = {}
-            data[key] = value
-            if _atomic_write_json is not None:
-                _atomic_write_json(cfg_path, data)  # tmp + fsync + .bak + os.replace
-            else:
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=4)
-        except Exception as exc:
-            print(f"[settings] save error: {exc}")
+        update_key(key, value, self.cfg, get_config_path())
         try:
             # 1. Propagate live reload via Context & Overlay if available
             if hasattr(self, "ctx") and self.ctx:

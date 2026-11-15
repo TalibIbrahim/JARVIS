@@ -12,7 +12,7 @@ Features:
   - Missing artwork fallback generator.
   - Seeking with app-without-seek fallback.
   - Playback commands with debouncing: play_pause(), next_track(), previous_track(), seek().
-  - Media-key fallback (pyautogui & Win32 keybd_event) when SMTC commands fail.
+  - Media-key fallback (Win32 SendInput via win_input) when SMTC commands fail.
   - 100% unit-testable with mock backends; strictly NO Qt imports.
 """
 
@@ -25,7 +25,7 @@ import io
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, List, Optional, Protocol, Tuple
 
 # Try to import PIL for dominant color extraction and artwork generation
 try:
@@ -550,12 +550,12 @@ class MediaAdapter:
         backend: Optional[SMTCBackendProtocol] = None,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SEC,
         debounce_sec: float = DEFAULT_DEBOUNCE_SEC,
-        use_pyautogui_fallback: bool = True,
+        use_key_fallback: bool = True,
     ):
         self._backend: SMTCBackendProtocol = backend or WinRTSMTCBackend()
         self._poll_interval = poll_interval
         self._debounce_sec = debounce_sec
-        self._use_fallback = use_pyautogui_fallback
+        self._use_fallback = use_key_fallback
 
         self._lock = threading.Lock()
         self._metadata: Optional[MediaMetadata] = None
@@ -660,37 +660,17 @@ class MediaAdapter:
     def _fallback_key(self, key_name: str) -> bool:
         """
         Sends simulated hardware media key when SMTC command fails.
-        Tries pyautogui first, then Win32 user32 keybd_event.
         """
         if not self._use_fallback:
             return False
 
         sent = False
         try:
-            import pyautogui
-            pyautogui.press(key_name, _pause=False)
+            import win_input
+            win_input.press(key_name)
             sent = True
         except Exception as exc:
-            print(f"[media_adapter] PyAutoGUI fallback '{key_name}' failed: {exc}")
-
-        if not sent and sys.platform == "win32":
-            try:
-                import ctypes
-                VK_MAP = {
-                    "playpause": 0xB3,  # VK_MEDIA_PLAY_PAUSE
-                    "nexttrack": 0xB0,  # VK_MEDIA_NEXT_TRACK
-                    "prevtrack": 0xB1,  # VK_MEDIA_PREV_TRACK
-                    "stop": 0xB2,       # VK_MEDIA_STOP
-                }
-                vk = VK_MAP.get(key_name)
-                if vk:
-                    KEYEVENTF_EXTENDEDKEY = 0x0001
-                    KEYEVENTF_KEYUP = 0x0002
-                    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
-                    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
-                    sent = True
-            except Exception as exc:
-                print(f"[media_adapter] Win32 keybd_event fallback failed: {exc}")
+            print(f"[media_adapter] media-key fallback '{key_name}' failed: {exc}")
 
         return sent
 

@@ -15,7 +15,6 @@ class Config:
     frame_height: int = 480
     camera_fps: int = 30
     camera_mjpg: bool = True
-    threaded_capture: bool = True
     model_complexity: int = 1           # 0 = lightweight, 1 = higher accuracy
     min_detection_confidence: float = 0.6
     min_tracking_confidence: float = 0.6
@@ -90,7 +89,6 @@ class Config:
     dwell_mode: str = "click"           # "off", "click", "radial"
     dwell_time: float = 1.0             # seconds of stationarity required to trigger
     dwell_radius: float = 14.0          # radius in screen pixels allowed during dwell
-    dwell_repeat_delay: float = 0.8     # must leave radius before next dwell
 
     # --- voice ---
     voice_enabled: bool = True
@@ -120,13 +118,11 @@ class Config:
     mic_dynamic_energy: bool = False    # adapt threshold dynamically (False prevents runaway threshold on laptop mics)
     mic_pause_threshold: float = 0.5    # seconds of silence that end a command (VAD endpoint)
     mic_phrase_time_limit: float = 10.0 # maximum seconds per voice command phrase
-    voice_profile_enabled: bool = True  # enable speaker recognition and voice profile
     voice_speaker_verification: bool = False # strict speaker verification (filters out other voices when trained)
     debug_log_transcripts: bool = False  # write full transcripts to the diagnostic log (default: only lengths)
 
     # --- ui / apple hig appearance ---
     theme_mode: str = "auto"            # "auto" (follows Windows), "dark", "light"
-    glass_blur: bool = True             # DEPRECATED alias (migrated to glass_mode/glass_transparency at config_version 4); kept so old files load
     glass_mode: str = "tinted"          # "clear" | "tinted"
     glass_transparency: float = 0.6     # 0.0 (solid) .. 1.0 (most transparent); clamped on load
     reduce_motion: bool = False         # reduce UI animations
@@ -137,17 +133,10 @@ class Config:
     show_health_panel: bool = True      # Diagnostic health card in Settings About tab
 
     # --- dynamic island & widgets ---
-    idle_display: str = "time_weather"  # deprecated alias -> island_idle_display
-    show_now_playing: bool = True       # deprecated alias -> island_show_now_playing
-    show_weather: bool = True           # deprecated alias -> island_show_weather
-    weather_city: str = "New York"      # deprecated alias -> island_weather_city
+    weather_city: str = "New York"      # city for voice weather answers (the island uses island_weather_city)
     weather_lat: float = 40.7128        # default latitude
     weather_lon: float = -74.0060       # default longitude
-    weather_units: str = "auto"         # deprecated alias -> island_weather_units ("auto", "celsius", "fahrenheit")
-    time_format: str = "auto"           # deprecated alias -> island_clock_format
-    expand_trigger: str = "hover"       # deprecated alias -> island_expand_trigger
-    hide_fullscreen: bool = True        # deprecated alias -> island_hide_fullscreen
-    island_size: str = "default"        # deprecated alias -> island_size_scale
+    weather_units: str = "auto"         # units for voice weather answers ("auto", "celsius", "fahrenheit")
 
     # --- dynamic island pages & settings (Phase 1) ---
     island_pages: list[str] = field(default_factory=lambda: ["media", "calendar", "weather", "hardware", "jarvis"])
@@ -158,8 +147,6 @@ class Config:
         "hardware": True,
         "jarvis": True,
     })
-    island_compact_mode: str = "time_weather"       # deprecated alias -> island_idle_display ("media_aware" collapses to time_weather)
-    island_time_format: str = "auto"               # deprecated alias -> island_clock_format
     island_first_weekday: str = "locale"           # "locale", "sunday", "monday"
     island_hardware_layout: str = "grid"           # "grid", "strip"
     island_size_scale: str = "medium"              # "medium", "small", "large"
@@ -169,7 +156,6 @@ class Config:
     island_pin_open: bool = False                  # suppress auto-collapse when pinned
     island_expand_trigger: str = "hover"           # "hover", "click", "dwell", "fist", "voice"
     island_hide_fullscreen: bool = True            # hide island when fullscreen app active
-    # canonical keys (Phase 3 unification; old keys above kept as deprecated aliases)
     island_clock_format: str = "auto"              # "auto", "12h", "24h"
     island_idle_display: str = "time_weather"      # "off", "time", "time_weather"
     island_surface: str = "gradient"   # "gradient" (default), "near_black", "black", "white"; media album-art tint always wins
@@ -197,7 +183,6 @@ class Config:
 
     # --- ai / groq intelligence ---
     ai_enabled: bool = False
-    ai_provider: str = "groq"
     ai_llm_model: str = "openai/gpt-oss-120b"
     ai_stt_model: str = "whisper-large-v3-turbo"
     stt_engine: str = "local"           # "local" (faster-whisper, Groq fallback when unsure) or "groq"
@@ -228,7 +213,6 @@ class Config:
     ])
     # --- productivity, notes & routines (phase 6) ---
     notes_file_path: str = field(default_factory=lambda: os.path.join(os.path.expanduser("~"), "Documents", "Jarvis_Notes.md"))
-    scheduler_file_path: str = ""
     routines: dict = field(default_factory=lambda: {
         "work mode": [
             {"action": "open_app", "args": {"app": "code"}},
@@ -289,48 +273,6 @@ _DEPRECATED_WAKE_ALIASES = ("service", "harvest", "travis", "jar is")
 
 
 _REMOVED_KEYS = ("island_backdrop_blur", "island_backdrop_opacity")
-
-# (deprecated alias, canonical key). Copied when the user set the alias but not the canonical key.
-_ISLAND_KEY_ALIASES = (
-    ("time_format", "island_clock_format"),
-    ("island_time_format", "island_clock_format"),
-    ("idle_display", "island_idle_display"),
-    ("island_compact_mode", "island_idle_display"),
-    ("show_now_playing", "island_show_now_playing"),
-    ("show_weather", "island_show_weather"),
-    ("weather_city", "island_weather_city"),
-    ("weather_units", "island_weather_units"),
-    ("expand_trigger", "island_expand_trigger"),
-    ("hide_fullscreen", "island_hide_fullscreen"),
-    ("island_size", "island_size_scale"),
-)
-_SIZE_ALIAS_VALUES = {"compact": "small", "small": "small", "default": "medium", "medium": "medium", "large": "large"}
-
-
-def _migrate_island_keys(cfg, data: dict) -> bool:
-    """Copy deprecated alias values into canonical keys (config_version 3). Returns True if anything changed."""
-    import jarvis_log
-    log = jarvis_log.get_logger("config")
-    defaults = Config()
-    changed = False
-    for old, new in _ISLAND_KEY_ALIASES:
-        if old not in data:
-            continue
-        old_val = getattr(cfg, old)
-        if old_val == getattr(defaults, old):
-            continue  # alias left at default: nothing to carry over
-        # canonical wins when the user explicitly set it to a non-default value
-        if new in data and getattr(cfg, new) != getattr(defaults, new):
-            continue
-        if new == "island_size_scale":
-            old_val = _SIZE_ALIAS_VALUES.get(str(old_val).lower(), getattr(defaults, new))
-        if new == "island_idle_display" and old_val == "media_aware":
-            old_val = "time_weather"
-        if getattr(cfg, new) != old_val:
-            setattr(cfg, new, old_val)
-            log.info("config migration v3: %s -> %s", old, new)
-            changed = True
-    return changed
 
 
 def get_config_path(explicit_path=None):
@@ -563,17 +505,12 @@ def load_config(path=None):
         cfg.config_version = 2
         migrated = True
 
-    # One-time migration (config_version 3): unify duplicate island keys into canonical island_* keys.
-    if isinstance(data, dict) and _loaded_version(data) < 3:
-        if _migrate_island_keys(cfg, data):
-            migrated = True
-        cfg.config_version = 3
-        migrated = True
+    # config_version 3 (island key unification) left nothing to do: the old alias keys are ignored.
 
     # One-time migration (config_version 4): dead glass_blur bool -> glass_mode / glass_transparency.
     if isinstance(data, dict) and _loaded_version(data) < 4:
         import jarvis_log
-        if "glass_blur" in data and cfg.glass_blur is False:
+        if "glass_blur" in data and _coerce_field_value("glass_blur", data["glass_blur"], True) is False:
             cfg.glass_mode = "tinted"
             cfg.glass_transparency = 0.0
             jarvis_log.get_logger("config").info(
@@ -661,6 +598,29 @@ def save_config(cfg: Config, path=None) -> bool:
         return _atomic_write_json(config_path, existing)
     except Exception as exc:
         print(f"[config] save error: {exc}")
+        return False
+
+
+def update_key(key: str, value: Any, cfg: Optional[Config] = None, path=None) -> bool:
+    """Set one setting live on `cfg` (when given) and persist only that key: atomic read-modify-write of
+    the config file, leaving every other key on disk as it is. Returns True when the file was written."""
+    if cfg is not None:
+        try:
+            setattr(cfg, key, value)
+        except Exception:
+            pass
+    try:
+        config_path = get_config_path(path)
+        data = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+        data[key] = value
+        return _atomic_write_json(config_path, data)  # tmp + fsync + .bak + os.replace
+    except Exception as exc:
+        print(f"[config] save {key} error: {exc}")
         return False
 
 

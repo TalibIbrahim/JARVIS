@@ -1,7 +1,7 @@
 """
 Voice command subsystem for J.A.R.V.I.S.
 Handles:
-- Speech recognition via Google Speech API (with local audio capture and decoupling).
+- Speech recognition via local faster-whisper, then Groq Whisper (with local audio capture and decoupling).
 - Intelligent microphone selection (filters out dead virtual cables and auto-detects active hardware microphones).
 - Live audio input level probing for UI volume meters.
 - Standalone microphone diagnostic test tool.
@@ -27,15 +27,9 @@ from ai import (
     RateLimitError,
     OfflineError,
     TimeoutError,
-    AIError,
 )
 from chime import (
     play_chime,
-    play_wake_chime,
-    set_chime_muted,
-    is_chime_muted,
-    set_chime_volume,
-    get_chime_volume,
     set_audio_lock,
 )
 
@@ -716,10 +710,75 @@ def probe_mic_level(device_index=None, chunk_samples=1024):
             own.terminate()
 
 
+def _pcm16_wav(raw_bytes, rate=16000):
+    """16-bit mono PCM -> WAV file bytes (the container Groq Whisper uploads expect)."""
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(raw_bytes)
+    return buf.getvalue()
+
+
+def _local_stt_for(cfg):
+    """The local transcriber when cfg.stt_engine == "local" and its model is loaded, else None."""
+    if str(getattr(cfg, "stt_engine", "local")).lower() != "local":
+        return None
+    import local_stt
+    lt = local_stt.get_local_transcriber(getattr(cfg, "local_stt_model", "base.en"))
+    return lt if lt.available() else None
+
+
+def _record_pcm16(device_index, duration, level_cb=None, chunk=1024):
+    """Record `duration` seconds of 16 kHz mono PCM16 from a private PyAudio instance (device rate +
+    resample when the device refuses 16 kHz). level_cb(0..1) is called once per chunk."""
+    import pyaudio
+    rate = 16000
+    with _PORTAUDIO_LOCK:
+        own = pyaudio.PyAudio()
+        try:
+            dev = device_index if device_index is not None else own.get_default_input_device_info()["index"]
+            kw = dict(format=pyaudio.paInt16, channels=1, input=True, input_device_index=dev,
+                      frames_per_buffer=chunk)
+            try:
+                stream = own.open(rate=rate, **kw)
+            except Exception:
+                rate = int(own.get_device_info_by_index(dev).get("defaultSampleRate", 44100))
+                stream = own.open(rate=rate, **kw)
+            _log_mic_open(own, dev, rate, 1, chunk, "OK", "test_microphone_recognition")
+        except Exception:
+            own.terminate()
+            raise
+    frames = []
+    try:
+        for _ in range(max(1, int(duration * rate / chunk))):
+            data = stream.read(chunk, exception_on_overflow=False)
+            frames.append(data)
+            if level_cb is not None:
+                a = np.frombuffer(data, dtype=np.int16).astype(float)
+                level_cb(min(max((float(np.sqrt(np.mean(a ** 2))) - 20.0) / 2500.0, 0.0), 1.0))
+    finally:
+        with _PORTAUDIO_LOCK:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception as exc:
+                _vlog.warning("test_microphone_recognition close failed: %r", exc)
+            own.terminate()
+    raw = b"".join(frames)
+    if rate != 16000 and raw:
+        x = _resample_fft(np.frombuffer(raw, dtype=np.int16).astype(np.float32), rate, 16000)
+        raw = np.clip(x, -32768, 32767).astype(np.int16).tobytes()
+    return raw
+
+
 def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
     """
     Records audio for duration seconds from device_index, computes energy levels,
-    and attempts Google speech recognition.
+    and transcribes it with the local speech model (the audio never leaves the PC).
     Returns:
         {
             "success": bool,
@@ -730,7 +789,6 @@ def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
             "device_name": str
         }
     """
-    import speech_recognition as sr
     mics = list_microphones()
     dev_name = "Default Microphone"
     for m in mics:
@@ -748,34 +806,33 @@ def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
     }
 
     try:
-        with _PORTAUDIO_LOCK:
-            r = sr.Recognizer()
-            r.energy_threshold = 300
-            r.dynamic_energy_threshold = True
-
-            mic = sr.Microphone(device_index=device_index)
-            with mic as source:
-                r.adjust_for_ambient_noise(source, duration=0.6)
-                # Record phrase
-                audio = r.listen(source, timeout=2.0, phrase_time_limit=duration)
-
-        # Compute level from captured audio
-        raw_bytes = audio.get_raw_data()
+        raw_bytes = _record_pcm16(device_index, duration, level_cb)
         if raw_bytes:
             arr = np.frombuffer(raw_bytes, dtype=np.int16)
             rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
             result["avg_level"] = rms
             result["max_level"] = float(np.max(np.abs(arr)))
 
-        # Speech recognition
+        import local_stt
         try:
-            recognized_text = r.recognize_google(audio)
+            from config import load_config
+            model = getattr(load_config(), "local_stt_model", "base.en")
+        except Exception:
+            model = "base.en"
+        lt = local_stt.get_local_transcriber(model)
+        lt.start_loading()
+        deadline = time.monotonic() + 20.0
+        while lt.state == local_stt.LOADING and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if not lt.available():
+            result["error"] = "Audio recorded, but the local speech model is not ready yet."
+            return result
+        recognized_text, _conf = lt.transcribe(raw_bytes)
+        if recognized_text:
             result["success"] = True
             result["text"] = recognized_text
-        except sr.UnknownValueError:
+        else:
             result["error"] = "Audio recorded, but speech could not be understood (try speaking closer)."
-        except sr.RequestError as re_err:
-            result["error"] = f"Speech service unreachable: {re_err}"
 
     except Exception as exc:
         result["error"] = str(exc)
@@ -800,6 +857,20 @@ PRE_RENDERED_PHRASES = [
     "Right away, sir.",
     "Yes, sir?",
 ]
+
+
+_RE_SPELLED_NAME = re.compile(r"\bJ[.\s]{1,2}A[.\s]{1,2}R[.\s]{1,2}V[.\s]{1,2}I[.\s]{1,2}S\b(\.)?", re.I)
+
+
+def _speech_text(text: str) -> str:
+    """Speech-only rewrite: TTS spells out the dotted "J.A.R.V.I.S.", so it is said as "Jarvis". Plain "Jarvis"
+    or "JARVIS" is untouched; the acronym's dot is kept only where a sentence really ends."""
+    def repl(m):
+        rest = m.string[m.end():]
+        ends = m.group(1) and (not rest.strip() or (rest[:1].isspace() and rest.lstrip()[:1] in "\"'(" + "0123456789"
+                                                    or rest[:1].isspace() and rest.lstrip()[:1].isupper()))
+        return "Jarvis." if ends else "Jarvis"
+    return _RE_SPELLED_NAME.sub(repl, text)
 
 
 def _normalize_phrase_key(text: str) -> str:
@@ -937,7 +1008,6 @@ def _resample_fft(audio, src_sr, dst_sr):
 
 def _warm_piper_cache(voice):
     """Pre-renders frequent short phrases in memory so playback begins in < 1 ms."""
-    global _AUDIO_PHRASE_CACHE
     if voice is None:
         return
     for phrase in PRE_RENDERED_PHRASES:
@@ -1253,6 +1323,7 @@ class Speaker(threading.Thread):
                 continue
             if text is None:
                 return
+            text = _speech_text(text)    # single synthesis entry (Piper, its phrase cache, and system TTS)
             t_say = time.monotonic()
             try:
                 engine_type = getattr(self.cfg, "tts_engine", "system") if self.cfg else "system"
@@ -1862,25 +1933,24 @@ class WakeWordDetector(threading.Thread):
             self.is_recording = False
 
     def transcribe(self, raw_bytes: bytes) -> str:
-        """Transcribes 16 kHz raw PCM bytes via Groq Whisper or Google fallback."""
+        """Transcribes 16 kHz raw PCM bytes: local model first, then Groq Whisper when AI is on, else ""."""
         if not raw_bytes:
             return ""
         try:
-            import speech_recognition as sr
-            audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
+            lt = _local_stt_for(self.cfg)
+            if lt is not None:
+                try:
+                    return lt.transcribe(raw_bytes)[0]
+                except Exception as e:
+                    print(f"[voice] local transcribe failed: {e}")
             key = get_api_key()
             ai_enabled = getattr(self.cfg, "ai_enabled", False) if self.cfg else False
             if ai_enabled and key:
-                try:
-                    wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-                    stt_model = getattr(self.cfg, "ai_stt_model", "whisper-large-v3-turbo") if self.cfg else "whisper-large-v3-turbo"
-                    timeout = getattr(self.cfg, "ai_timeout", 10) if self.cfg else 10
-                    client = GroqClient(api_key=key, timeout=timeout)
-                    return client.transcribe(wav_bytes, model=stt_model, language="en")
-                except Exception as e:
-                    print(f"[voice] Groq transcribe fallback note: {e}")
-            r = sr.Recognizer()
-            return r.recognize_google(audio)
+                stt_model = getattr(self.cfg, "ai_stt_model", "whisper-large-v3-turbo") if self.cfg else "whisper-large-v3-turbo"
+                timeout = getattr(self.cfg, "ai_timeout", 10) if self.cfg else 10
+                client = GroqClient(api_key=key, timeout=timeout)
+                return client.transcribe(_pcm16_wav(raw_bytes), model=stt_model, language="en")
+            return ""
         except Exception as exc:
             print(f"[voice] transcription error: {exc}")
             return ""
@@ -2534,7 +2604,7 @@ class Voice(threading.Thread):
         now = time.time()
         wd = self.wake_detector
         if not is_command and now >= self.listening_until and not (wd and now < wd.listening_until):
-            # Wake-less speech in standby. Without a local transcriber it would cost a Groq call (or Google)
+            # Wake-less speech in standby. Without a local transcriber it would cost a Groq call
             # only to be dropped by the wake-word check, so require the wake model to have stirred first.
             if self._local_stt_ready() is None and wd is not None:
                 peak = getattr(wd, "last_burst_wake_peak", None)
@@ -2545,9 +2615,7 @@ class Voice(threading.Thread):
                                                peak=f"{peak:.2f}", thr=f"{thr:.2f}")
                     return
         try:
-            import speech_recognition as sr
-            audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
-            if not self._enqueue_audio((audio, is_command, time.time(), uid), is_command):
+            if not self._enqueue_audio((raw_bytes, is_command, time.time(), uid), is_command):
                 qs = self.audio_q.qsize()
                 jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="audio_q_full", qsize=qs)
                 _vlog.warning("audio_q full (qsize=%d): dropping utterance %s", qs, uid)
@@ -2594,19 +2662,7 @@ class Voice(threading.Thread):
             self._restore_media("voice_stop", force=True)
 
     def _run_body(self):
-        try:
-            import speech_recognition as sr
-        except ImportError:
-            if hasattr(self.ctx, "say"):
-                self.ctx.say("Voice control needs the SpeechRecognition package.")
-            return
-
         self._start_local_stt()
-        recognizer = sr.Recognizer()
-        recognizer.dynamic_energy_threshold = getattr(self.cfg, "mic_dynamic_energy", False)
-        recognizer.pause_threshold = getattr(self.cfg, "mic_pause_threshold", 1.0)
-        recognizer.phrase_threshold = 0.3
-        recognizer.non_speaking_duration = 0.5
 
         # Probed microphone
         dev_idx, dev_name = find_best_microphone(self.cfg, require_16k=True)
@@ -2620,7 +2676,7 @@ class Voice(threading.Thread):
 
         # STT background worker
         worker = threading.Thread(target=jarvis_log.run_logged,
-                                  args=("STTWorker", self._recognition_worker, recognizer, sr),
+                                  args=("STTWorker", self._recognition_worker),
                                   name="STTWorker", daemon=True)
         worker.start()
 
@@ -2683,42 +2739,7 @@ class Voice(threading.Thread):
             except Exception:
                 _vlog.warning("offline notice post failed", exc_info=True)
 
-    def _fallback_google(self, recognizer, audio, sr):
-        """Falls back to Google SpeechRecognition if Groq is unavailable."""
-        t0 = time.monotonic()
-        try:
-            nbytes = len(audio.get_raw_data())
-            jarvis_log.utterance_event(jarvis_log.STT_SENT, engine="google", bytes=nbytes,
-                                       dur_s=f"{nbytes / 32000.0:.2f}")
-        except Exception:
-            pass
-        try:
-            print("[voice] Falling back to Google SpeechRecognition...")
-            text = recognizer.recognize_google(audio)
-            print(f"[voice] Google Heard: \"{redact(text)}\"")
-            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", text=text, ok=bool(text),
-                                       ms=int((time.monotonic() - t0) * 1000))
-            return text
-        except sr.UnknownValueError as exc:
-            print("[voice] (Audio captured, but speech could not be understood)")
-            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", ok=False, err=type(exc).__name__,
-                                       ms=int((time.monotonic() - t0) * 1000))
-            return None
-        except sr.RequestError as re_err:
-            print(f"[voice] Google speech service error: {re_err}")
-            self._google_net_err = True
-            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", ok=False, err=type(re_err).__name__,
-                                       ms=int((time.monotonic() - t0) * 1000))
-            self.ctx.say("The speech service is unreachable, sir.")
-            time.sleep(4)
-            return None
-        except Exception as exc:
-            print(f"[voice] Google recognition error: {exc}")
-            jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, engine="google", ok=False, err=type(exc).__name__,
-                                       ms=int((time.monotonic() - t0) * 1000))
-            return None
-
-    def _recognition_worker(self, recognizer, sr):
+    def _recognition_worker(self):
         vp = get_voice_profile()
 
         while not self.stop.is_set() and not self._own_stop.is_set():
@@ -2741,17 +2762,13 @@ class Voice(threading.Thread):
 
             jarvis_log.set_current_utterance(uid)
             try:
-                self._handle_audio_item(recognizer, sr, vp, audio, is_command, enqueued_at, uid)
+                self._handle_audio_item(vp, audio, is_command, enqueued_at, uid)
             finally:
                 jarvis_log.set_current_utterance(None)
 
     def _local_stt_ready(self):
         """The local transcriber when cfg.stt_engine == "local" and its model is loaded, else None."""
-        if str(getattr(self.cfg, "stt_engine", "local")).lower() != "local":
-            return None
-        import local_stt
-        lt = local_stt.get_local_transcriber(getattr(self.cfg, "local_stt_model", "base.en"))
-        return lt if lt.available() else None
+        return _local_stt_for(self.cfg)
 
     def _start_local_stt(self):
         """Load the local model in the background at voice start (first run downloads it)."""
@@ -2797,12 +2814,8 @@ class Voice(threading.Thread):
                                    conf=f"{conf:.2f}", ms=ms, queue_ms=queue_ms)
         return text, conf
 
-    def _stt_groq(self, recognizer, sr, audio, raw_bytes, uid, key, google_fallback=True):
-        """Groq Whisper with the shared cooldown handling. Returns (text, net_fail). On failure the text is
-        the Google fallback result, or None when google_fallback is False."""
-        def fb():
-            return self._fallback_google(recognizer, audio, sr) if google_fallback else None
-
+    def _stt_groq(self, raw_bytes, uid, key):
+        """Groq Whisper with the shared cooldown handling. Returns (text, net_fail); text is None on failure."""
         text = None
         groq_net_fail = False
         t_groq = time.monotonic()
@@ -2812,7 +2825,7 @@ class Voice(threading.Thread):
 
         try:
             # Convert in-memory audio chunk to 16 kHz mono WAV (zero temp files)
-            wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+            wav_bytes = _pcm16_wav(raw_bytes)
             stt_model = getattr(self.cfg, "ai_stt_model", "whisper-large-v3-turbo")
             timeout = getattr(self.cfg, "ai_timeout", 10)
             client = _get_groq_stt_client(key, timeout)
@@ -2830,7 +2843,6 @@ class Voice(threading.Thread):
             print(f"[voice] Groq key authentication failed: {auth_err}")
             self.groq_cooldown_until = time.time() + 300.0  # 5 min cooldown on auth failure
             self._post_ai_error("Invalid Groq Key")
-            text = fb()
         except RateLimitError as rl_err:
             jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
                                        err=type(rl_err).__name__, ms=ms())
@@ -2838,7 +2850,6 @@ class Voice(threading.Thread):
             wait_sec = rl_err.retry_after if rl_err.retry_after else 10.0
             self.groq_cooldown_until = time.time() + wait_sec
             self._post_ai_error("Groq Rate Limited")
-            text = fb()
         except (OfflineError, TimeoutError) as net_err:
             jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
                                        err=type(net_err).__name__, ms=ms())
@@ -2846,12 +2857,10 @@ class Voice(threading.Thread):
             self.groq_cooldown_until = time.time() + 15.0
             groq_net_fail = True
             self._post_ai_error("Groq Offline")
-            text = fb()
         except Exception as exc:
             jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="groq", ok=False,
                                        err=type(exc).__name__, ms=ms())
-            print(f"[voice] Groq error ({exc}), falling back...")
-            text = fb()
+            print(f"[voice] Groq error ({exc})")
         return text, groq_net_fail
 
     def _post_ai_error(self, text):
@@ -2861,11 +2870,10 @@ class Voice(threading.Thread):
             except Exception:
                 pass
 
-    def _handle_audio_item(self, recognizer, sr, vp, audio, is_command, enqueued_at, uid):
+    def _handle_audio_item(self, vp, raw_bytes, is_command, enqueued_at, uid):
         # (body of the former _recognition_worker loop; `continue` -> `return`)
         if True:
             # Energy-based VAD validation before sending audio
-            raw_bytes = audio.get_raw_data()
             if not raw_bytes or len(raw_bytes) < 3200:
                 jarvis_log.utterance_event(jarvis_log.DROPPED, uid, reason="too_short",
                                            bytes=len(raw_bytes) if raw_bytes else 0)
@@ -2907,14 +2915,13 @@ class Voice(threading.Thread):
 
             text = None
             groq_net_fail = False
-            self._google_net_err = False
             passive = not is_active_session
             key = get_api_key(self.cfg)
             ai_enabled = getattr(self.cfg, "ai_enabled", False)
             use_groq = bool(ai_enabled and key and now >= self.groq_cooldown_until)
             if ai_enabled and key and not use_groq and self._groq_cd_logged != self.groq_cooldown_until:
                 self._groq_cd_logged = self.groq_cooldown_until
-                _vlog.warning("Groq cooling down until %s (%.0fs left); using Google",
+                _vlog.warning("Groq cooling down until %s (%.0fs left); local STT only",
                               time.strftime("%H:%M:%S", time.localtime(self.groq_cooldown_until)),
                               self.groq_cooldown_until - now)
 
@@ -2931,8 +2938,7 @@ class Voice(threading.Thread):
                     if conf < min_conf and not passive and use_groq:
                         # Unsure local result in an active session: let Groq have a go; keep local text if it fails.
                         _vlog.info("local STT conf=%.2f < %.2f: retrying with Groq", conf, min_conf)
-                        gtext, groq_net_fail = self._stt_groq(recognizer, sr, audio, raw_bytes, uid, key,
-                                                              google_fallback=False)
+                        gtext, groq_net_fail = self._stt_groq(raw_bytes, uid, key)
                         if gtext:
                             text, engine = gtext, "groq"
                 except Exception as exc:
@@ -2941,17 +2947,17 @@ class Voice(threading.Thread):
                                                err=type(exc).__name__)
                     text, done = None, False
 
-            if not done:
-                if use_groq:
-                    text, groq_net_fail = self._stt_groq(recognizer, sr, audio, raw_bytes, uid, key)
-                    engine = "groq"
-                else:
-                    text = self._fallback_google(recognizer, audio, sr)
-                    engine = "google"
+            if not done and use_groq:
+                text, groq_net_fail = self._stt_groq(raw_bytes, uid, key)
+                engine = "groq"
 
-            # Every STT engine tried failed on the network: tell the user once per interval.
-            if not text and self._google_net_err and (groq_net_fail or not use_groq):
-                self._notify_stt_offline(uid)
+            # No engine could transcribe (text None, not merely empty): offline notice, or a short spoken
+            # "didn't catch that" in an active session. Passive standby noise stays silent.
+            if text is None:
+                if groq_net_fail:
+                    self._notify_stt_offline(uid)
+                elif is_active_session and hasattr(self.ctx, "say"):
+                    self.ctx.say("I didn't catch that, sir.")
 
             if text:
                 text = self._apply_corrections(text)
@@ -3026,10 +3032,7 @@ class Voice(threading.Thread):
 
     def _transcribe_blocking(self, raw_bytes):
         """(text, confidence|None, engine) for a PCM16 clip on the calling thread, same engine order as
-        the command path: local, then Groq, then Google. Text is "" when nothing was recognised."""
-        import speech_recognition as sr
-        audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
-        recognizer = sr.Recognizer()
+        the command path: local, then Groq. Text is "" when nothing was recognised."""
         lt = self._local_stt_ready()
         if lt is not None:
             try:
@@ -3039,9 +3042,9 @@ class Voice(threading.Thread):
                 _vlog.warning("local STT failed in capture (%r); falling back", exc)
         key = get_api_key(self.cfg)
         if getattr(self.cfg, "ai_enabled", False) and key and time.time() >= self.groq_cooldown_until:
-            text, _ = self._stt_groq(recognizer, sr, audio, raw_bytes, None, key)
+            text, _ = self._stt_groq(raw_bytes, None, key)
             return text or "", None, "groq"
-        return self._fallback_google(recognizer, audio, sr) or "", None, "google"
+        return "", None, None
 
     def capture_answer(self, timeout: float = 8.0, on_level=None) -> str:
         """Record ONE utterance without a wake word and return its transcript ("" on silence/timeout/

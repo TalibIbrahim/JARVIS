@@ -9,13 +9,12 @@ Features:
 - Failsafe mouse button and modifier key release on all exit/error paths.
 """
 import atexit
-import collections
 import ctypes
 import math
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 
 import jarvis_log
 import win_input

@@ -90,7 +90,6 @@ def _drive(monkeypatch, engine_active, hand_in_first_frame, show_preview=False, 
     monkeypatch.setattr(tracker.cv2, "destroyWindow", lambda *a, **k: None, raising=False)
 
     cfg = Config()
-    cfg.threaded_capture = True
     cfg.camera_autostart = True      # camera on-demand: default is off
     cfg.show_preview = show_preview
     engine = types.SimpleNamespace(active=engine_active, update=lambda found, now: [],

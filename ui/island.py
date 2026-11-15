@@ -2730,11 +2730,6 @@ class AppleDynamicIsland(
         c_crest = QColor(min(255, int(r * 0.35 + 255 * 0.65)), min(255, int(g * 0.35 + 255 * 0.65)), min(255, int(b * 0.35 + 255 * 0.65)), 255)
         return [c_dark, c_bright, c_main, c_crest, c_main, c_bright, c_dark]
 
-    def _get_waveform_base_color(self) -> QColor:
-        """Returns the primary base QColor for waveform accent elements."""
-        cols = self._get_waveform_colors()
-        return cols[2]
-
     def _draw_waveform_bars(self, p: QPainter, w: float, cy: float) -> None:
         n       = 7
         bar_w   = 3.0

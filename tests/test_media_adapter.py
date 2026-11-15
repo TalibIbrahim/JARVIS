@@ -111,7 +111,7 @@ class TestMediaAdapter(unittest.TestCase):
             backend=self.mock_backend,
             poll_interval=0.05,
             debounce_sec=0.20,
-            use_pyautogui_fallback=True,
+            use_key_fallback=True,
         )
 
     def tearDown(self):
@@ -168,16 +168,16 @@ class TestMediaAdapter(unittest.TestCase):
         self.assertTrue(res3)
         self.assertEqual(self.mock_backend.play_pause_calls, 2)
 
-    @patch("pyautogui.press")
-    def test_05_pyautogui_fallback_when_backend_fails(self, mock_press):
+    @patch("win_input.press")
+    def test_05_media_key_fallback_when_backend_fails(self, mock_press):
         """When SMTC backend returns False, falls back to hardware media key."""
         self.mock_backend.play_pause_succeeds = False
 
         res = self.adapter.play_pause()
         self.assertTrue(res)
-        mock_press.assert_called_with("playpause", _pause=False)
+        mock_press.assert_called_with("playpause")
 
-    @patch("pyautogui.press")
+    @patch("win_input.press")
     def test_06_skip_commands_with_fallback(self, mock_press):
         """next_track and previous_track execute backend or fallback."""
         # Next track backend success
@@ -188,7 +188,7 @@ class TestMediaAdapter(unittest.TestCase):
         # Previous track with backend failure triggers fallback
         self.mock_backend.prev_succeeds = False
         self.adapter.previous_track()
-        mock_press.assert_called_with("prevtrack", _pause=False)
+        mock_press.assert_called_with("prevtrack")
 
     def test_07_background_polling_thread(self):
         """Background thread polls and pushes updates to listeners."""

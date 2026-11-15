@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pyautogui
+import win_input
 import pytest
 
 import commands
@@ -36,8 +36,8 @@ def audio(monkeypatch):
         power_backend=MagicMock())
     monkeypatch.setattr(system_control, "_SYSTEM_CONTROL", adapter)
     keys = MagicMock()
-    monkeypatch.setattr(pyautogui, "press", keys)
-    monkeypatch.setattr(pyautogui, "hotkey", keys)
+    monkeypatch.setattr(win_input, "press", keys)
+    monkeypatch.setattr(win_input, "hotkey", keys)
     ep.keys = keys
     return ep
 

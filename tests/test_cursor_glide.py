@@ -1,4 +1,4 @@
-"""Cursor glide replay harness: real Controller + cursor thread, mocked _move/pyautogui, no devices.
+"""Cursor glide replay harness: real Controller + cursor thread, mocked _move/win_input, no devices.
 
 Hand updates are replayed at 15/20/30 Hz (with +-20% jitter) in real time; the cursor position is sampled at 240 Hz.
 Every loop is bounded by a wall-clock duration and the controller is always shut down.

@@ -24,10 +24,9 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(privacy_log, "_PRIVACY_LOG",
                         privacy_log.PrivacyLog(max_events=50, log_file=str(tmp_path / "privacy_log.json")))
     # Never let a test press real keys or launch anything.
-    import pyautogui
-    for name in ("press", "hotkey", "scroll", "click", "moveTo", "typewrite", "write", "keyDown", "keyUp"):
-        if hasattr(pyautogui, name):
-            monkeypatch.setattr(pyautogui, name, lambda *a, **k: None)
+    import win_input
+    for name in ("press", "hotkey", "scroll", "click", "move_to", "write", "key_down", "key_up"):
+        monkeypatch.setattr(win_input, name, lambda *a, **k: None)
     monkeypatch.setattr(commands.subprocess, "Popen", MagicMock())
     monkeypatch.setattr(commands.webbrowser, "open", MagicMock(return_value=True))
     yield
@@ -59,7 +58,7 @@ def _install_media(monkeypatch, mode, method):
     """mode 'smtc': adapter call itself performs the toggle (SMTC success).
     mode 'fallback': SMTC fails, adapter falls back to pressing the media key itself."""
     import media_adapter
-    import pyautogui
+    import win_input
     rec = _Toggles()
     key = {"play_pause": "playpause", "next_track": "nexttrack", "previous_track": "prevtrack"}[method]
 
@@ -71,7 +70,7 @@ def _install_media(monkeypatch, mode, method):
             def fn():
                 rec.adapter_calls.append(name)
                 if mode == "fallback":
-                    pyautogui.press(key, _pause=False)
+                    win_input.press(key)
                 return mode == "smtc"
             return fn
 
@@ -82,7 +81,7 @@ def _install_media(monkeypatch, mode, method):
             return None
 
     monkeypatch.setattr(media_adapter, "get_media_adapter", lambda: FakeAdapter())
-    monkeypatch.setattr(pyautogui, "press",
+    monkeypatch.setattr(win_input, "press",
                         lambda k, *a, **kw: rec.keys.append(k))
     return rec
 

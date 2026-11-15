@@ -96,7 +96,7 @@ class TestPhase2VoiceIntents(unittest.TestCase):
         reply_none = commands.run_command("what song is this", self.ctx)
         self.assertIn("No media is currently", reply_none)
 
-    @patch("pyautogui.press")
+    @patch("win_input.press")
     def test_04_media_controls_play_pause_skip(self, mock_press):
         """play, pause, skip, next track, and previous track control media."""
         mock_adapter = MagicMock(spec=MediaAdapter)

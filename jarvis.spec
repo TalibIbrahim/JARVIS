@@ -25,7 +25,7 @@ datas += copy_metadata('mediapipe')
 datas += copy_metadata('openwakeword')
 
 # Never imported at runtime (verified against a full import of the app's runtime deps):
-#  - tkinter: overlay.py only falls back to it when PySide6 is missing, and PySide6 is always bundled.
+#  - tkinter: nothing imports it (the UI is PySide6 only).
 #  - jax/jaxlib (~240 MB): only mediapipe.tasks.python.genai.converter (LLM weight converter) imports them.
 #  - sklearn: only openwakeword.custom_verifier_model (training), which voice.py stubs out.
 #  - pytest/pygments/narwhals/IPython/pandas: dev/test tooling pulled in transitively by the analyser.
@@ -43,7 +43,7 @@ a = Analysis(
     pathex=[],
     binaries=collect_dynamic_libs('ctranslate2'),
     datas=datas,
-    hiddenimports=['PySide6', 'speech_recognition', 'pyttsx3.drivers', 'pyttsx3.drivers.sapi5', 'keyring', 'keyring.backends.Windows', 'win32cred', 'pywintypes', 'certifi', 'requests', 'piper', 'sounddevice', '_sounddevice', 'onnxruntime', 'scipy', 'scipy.signal', 'psutil', 'pynvml', 'PIL', 'PIL.Image', 'pycaw', 'comtypes', 'openwakeword', 'openwakeword.model', 'openwakeword.vad', 'aec_audio_processing', 'faster_whisper', 'ctranslate2', 'local_stt', 'tokenizers', 'huggingface_hub', 'av', 'pyaudiowpatch'],
+    hiddenimports=['PySide6', 'pyttsx3.drivers', 'pyttsx3.drivers.sapi5', 'keyring', 'keyring.backends.Windows', 'win32cred', 'pywintypes', 'certifi', 'requests', 'piper', 'sounddevice', '_sounddevice', 'onnxruntime', 'scipy', 'scipy.signal', 'psutil', 'pynvml', 'PIL', 'PIL.Image', 'pycaw', 'comtypes', 'openwakeword', 'openwakeword.model', 'openwakeword.vad', 'aec_audio_processing', 'faster_whisper', 'ctranslate2', 'local_stt', 'tokenizers', 'huggingface_hub', 'av', 'pyaudiowpatch'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

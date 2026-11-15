@@ -8,7 +8,7 @@ import os
 import tempfile
 import unittest
 
-from config import Config, load_config, save_config, remember_folder_alias, _atomic_write_json
+from config import Config, load_config, save_config, remember_folder_alias, update_key, _atomic_write_json
 
 
 class TestConfigAtomicAndRecovery(unittest.TestCase):
@@ -55,24 +55,24 @@ class TestConfigAtomicAndRecovery(unittest.TestCase):
             target = os.path.join(tmp_dir, "jarvis_config.json")
 
             cfg = Config()
-            cfg.time_format = "24h"
+            cfg.island_clock_format = "24h"
             save_config(cfg, target)
 
-            cfg.time_format = "12h"
+            cfg.island_clock_format = "12h"
             save_config(cfg, target)
 
             # Intentionally corrupt main file with partial/invalid JSON
             with open(target, "w", encoding="utf-8") as f:
-                f.write('{"time_format": "truncated_in')
+                f.write('{"island_clock_format": "truncated_in')
 
             # Load should catch error, recover from .bak, and repair target
             loaded = load_config(target)
-            self.assertEqual(loaded.time_format, "24h")
+            self.assertEqual(loaded.island_clock_format, "24h")
 
             # Verify the main file is now healthy valid JSON
             with open(target, "r", encoding="utf-8") as f:
                 repaired = json.load(f)
-            self.assertEqual(repaired.get("time_format"), "24h")
+            self.assertEqual(repaired.get("island_clock_format"), "24h")
 
     def test_missing_main_file_recovers_from_backup(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -126,6 +126,18 @@ class TestConfigAtomicAndRecovery(unittest.TestCase):
             self.assertFalse(loaded.ui_cancel_hint_enabled)
             self.assertFalse(loaded.ui_progressive_shimmer_enabled)
             self.assertFalse(loaded.show_health_panel)
+
+    def test_update_key_sets_live_value_and_writes_only_that_key(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = os.path.join(tmp_dir, "jarvis_config.json")
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump({"pointer_speed": 1.5, "old_unknown_key": 1}, f)
+            cfg = Config()
+            self.assertTrue(update_key("island_surface", "black", cfg, target))
+            self.assertEqual(cfg.island_surface, "black")
+            with open(target, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data, {"pointer_speed": 1.5, "old_unknown_key": 1, "island_surface": "black"})
 
 
 if __name__ == "__main__":

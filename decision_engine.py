@@ -1191,17 +1191,9 @@ def evaluate_decision(user_text: str, ctx: Any = None) -> Optional[str]:
     elif action == "previous_track":
         reply = "Returning to the previous track, sir."
     elif action == "weather":
-        from weather_client import get_weather_client
+        from weather_client import weather_for_cfg
         cfg = getattr(ctx, "cfg", None) or getattr(getattr(ctx, "engine", None), "cfg", None)
-        city = getattr(cfg, "weather_city", "New York") if cfg else "New York"
-        lat = getattr(cfg, "weather_lat", 40.7128) if cfg else 40.7128
-        lon = getattr(cfg, "weather_lon", -74.0060) if cfg else -74.0060
-        units = getattr(cfg, "weather_units", "auto") if cfg else "auto"
-
-        client = get_weather_client()
-        w = client.get_weather(lat, lon, city=city, units=units)
-        if not w and city:
-            w = client.get_weather_for_city(city, units=units)
+        w = weather_for_cfg(cfg)
         if w:
             temp_int = int(round(w.temperature))
             c_name = w.city.split(",")[0]
