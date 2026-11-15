@@ -82,6 +82,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+; Silent updates from the in-app updater relaunch Jarvis in the background once files are replaced.
+Filename: "{app}\{#AppExeName}"; Parameters: "--background"; WorkingDir: "{app}"; Flags: nowait; Check: WizardSilent
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
