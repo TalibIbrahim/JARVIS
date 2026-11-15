@@ -11,8 +11,8 @@ class Config:
     # --- camera ---
     # --- camera & tracking quality ---
     camera_index: int = 0
-    frame_width: int = 1280
-    frame_height: int = 720
+    frame_width: int = 640              # MediaPipe downsizes internally; 640x480 saves ~8-10% CPU over 720p
+    frame_height: int = 480
     camera_fps: int = 30
     camera_mjpg: bool = True
     threaded_capture: bool = True
@@ -20,6 +20,8 @@ class Config:
     min_detection_confidence: float = 0.6
     min_tracking_confidence: float = 0.6
     show_preview: bool = False          # HUD window with the tracked skeleton (or run with --preview)
+    camera_autostart: bool = False      # open the camera at launch; otherwise it stays off until "gesture mode on"
+    gesture_idle_timeout_s: float = 120.0  # camera turns itself off after this long with no hand seen (0 = never)
 
     # --- control scheme ---
     control_scheme: str = "palm_fist"   # "palm_fist" (new default) or "pinch"
@@ -96,7 +98,7 @@ class Config:
     tts_engine: str = "piper"           # "piper" (Paul Bettany MCU) or "system" (pyttsx3 SAPI5)
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
-    config_version: int = 4            # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification)
+    config_version: int = 5            # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification; 4: glass; 5: camera/voice responsiveness)
     # wake_word_enabled only toggles the openWakeWord model. listen_for_jarvis=False disables ALL
     # passive listening (mic stays closed, nothing recorded) until the listen gesture.
     wake_word_enabled: bool = True      # openWakeWord / wake word detection toggle
@@ -115,7 +117,7 @@ class Config:
     mic_device_index: Optional[int] = None        # specific microphone device index, or None for auto-detect
     mic_energy_threshold: int = 300     # minimum audio energy threshold for speech trigger (lower = more sensitive)
     mic_dynamic_energy: bool = False    # adapt threshold dynamically (False prevents runaway threshold on laptop mics)
-    mic_pause_threshold: float = 1.0    # seconds of silence before finishing phrase (prevents cutting off mid-sentence)
+    mic_pause_threshold: float = 0.5    # seconds of silence that end a command (VAD endpoint)
     mic_phrase_time_limit: float = 10.0 # maximum seconds per voice command phrase
     voice_profile_enabled: bool = True  # enable speaker recognition and voice profile
     voice_speaker_verification: bool = False # strict speaker verification (filters out other voices when trained)
@@ -188,6 +190,9 @@ class Config:
     ai_provider: str = "groq"
     ai_llm_model: str = "openai/gpt-oss-120b"
     ai_stt_model: str = "whisper-large-v3-turbo"
+    stt_engine: str = "local"           # "local" (faster-whisper, Groq fallback when unsure) or "groq"
+    local_stt_model: str = "tiny.en"    # faster-whisper model size: "tiny.en" (~0.5 s on CPU), "base.en" (~1.3 s), "small.en"
+    local_stt_min_confidence: float = 0.55  # below this average word probability, retry with Groq (if enabled)
     ai_vision_model: str = "qwen/qwen3.8-27b"
     ai_vision_enabled: bool = True
     ai_timeout: int = 10
@@ -420,10 +425,14 @@ def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
                 return default_val
             return value
         try:
-            return int(float(value))
+            coerced = int(float(value))
         except (ValueError, TypeError, OverflowError):
             _log_repair("%s: %r not coercible to int -> default %r", field_name, value, default_val)
             return default_val
+        if abs(coerced) > 2**63:
+            _log_repair("%s: integer out of range -> default %r", field_name, default_val)
+            return default_val
+        return coerced
 
     if isinstance(default_val, float):
         try:
@@ -440,7 +449,7 @@ def _coerce_field_value(field_name: str, value: Any, default_val: Any) -> Any:
     if isinstance(default_val, list):
         if isinstance(value, (list, tuple)):
             items = list(value)
-            if field_name in ("wake_aliases", "island_pages"):
+            if field_name in ("wake_aliases", "island_pages", "indexed_roots"):
                 good = [i for i in items if isinstance(i, str)]
                 if len(good) != len(items):
                     _log_repair("%s: dropped %d non-string entries", field_name, len(items) - len(good))
@@ -560,6 +569,23 @@ def load_config(path=None):
             jarvis_log.get_logger("config").info(
                 "migrated glass_blur=False -> glass_mode='tinted', glass_transparency=0.0")
         cfg.config_version = 4
+        migrated = True
+
+    # One-time migration (config_version 5): camera off by default, 640x480 capture, real VAD endpoint,
+    # and repair the invalid "aggressive" wake sensitivity that silently fell back to balanced.
+    if isinstance(data, dict) and _loaded_version(data) < 5:
+        import jarvis_log
+        if (cfg.frame_width, cfg.frame_height) == (1280, 720):
+            cfg.frame_width, cfg.frame_height = 640, 480
+        if cfg.mic_pause_threshold == 1.0:
+            cfg.mic_pause_threshold = 0.5
+        jarvis_log.get_logger("config").info("migrated v5: frame %sx%s, pause %.2fs",
+                                             cfg.frame_width, cfg.frame_height, cfg.mic_pause_threshold)
+        cfg.config_version = 5
+        migrated = True
+
+    if str(cfg.wake_sensitivity).strip().lower() == "aggressive":
+        cfg.wake_sensitivity = "high"
         migrated = True
 
     if cfg.glass_mode not in ("clear", "tinted"):

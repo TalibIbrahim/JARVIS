@@ -862,7 +862,7 @@ def test_corrupt_config_is_repaired_with_backup_kept(tmp_path):
     with _quiet():
         cfg = config.load_config(path)
     assert isinstance(cfg, config.Config)
-    assert json.load(open(path, encoding="utf-8"))["config_version"] == 4
+    assert json.load(open(path, encoding="utf-8"))["config_version"] == config.Config().config_version
     assert open(path + ".bak", "rb").read() == garbage
 
 

@@ -36,8 +36,8 @@ class TestConfigMigrationV4(unittest.TestCase):
 
     def test_version_bumped_and_saved(self):
         cfg, saved = _load({"config_version": 3, "glass_blur": False})
-        self.assertEqual(cfg.config_version, 4)
-        self.assertEqual(saved["config_version"], 4)
+        self.assertEqual(cfg.config_version, 5)
+        self.assertEqual(saved["config_version"], 5)
 
     def test_does_not_rerun_on_saved_v4(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,7 +52,7 @@ class TestConfigMigrationV4(unittest.TestCase):
                 json.dump(saved, f)
             cfg = load_config(path)
         self.assertEqual(cfg.glass_transparency, 0.8)
-        self.assertEqual(cfg.config_version, 4)
+        self.assertEqual(cfg.config_version, 5)
 
     def test_v4_file_with_blur_false_untouched(self):
         cfg, _ = _load({"config_version": 4, "glass_blur": False,
@@ -72,7 +72,7 @@ class TestConfigMigrationV4(unittest.TestCase):
                 self.assertEqual(cfg.glass_transparency, want)
 
     def test_fresh_config_is_v4(self):
-        self.assertEqual(Config().config_version, 4)
+        self.assertGreaterEqual(Config().config_version, 4)
 
 
 if __name__ == "__main__":

@@ -120,7 +120,7 @@ class TestSettingsWindowInteractions(unittest.TestCase):
     def test_voice_mic_settings_defaults(self):
         cfg = Config()
         self.assertFalse(cfg.mic_dynamic_energy)
-        self.assertEqual(cfg.mic_pause_threshold, 1.0)
+        self.assertEqual(cfg.mic_pause_threshold, 0.5)
         self.assertEqual(cfg.mic_energy_threshold, 300)
         self.assertEqual(cfg.mic_phrase_time_limit, 10.0)
 

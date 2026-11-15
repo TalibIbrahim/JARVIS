@@ -167,7 +167,7 @@ class TestConfigFuzzingAndAutoRepair(unittest.TestCase):
 
                 # Safe defaults preserved
                 self.assertEqual(cfg.camera_index, 0)
-                self.assertEqual(cfg.frame_width, 1280)
+                self.assertEqual(cfg.frame_width, 640)
                 self.assertTrue(isinstance(cfg.pointer_speed, float))
                 self.assertTrue(isinstance(cfg.voice_enabled, bool))
 
