@@ -344,33 +344,25 @@ class TestPiperStreamingAndWarmCache(unittest.TestCase):
         np.testing.assert_array_equal(cached[0], dummy_audio)
         self.assertEqual(cached[1], 44100)
 
+    @patch("sounddevice.OutputStream")
     @patch("sounddevice.play")
-    @patch("sounddevice.get_stream")
-    def test_sentence_streaming_calls_sounddevice_per_sentence(self, mock_get_stream, mock_play):
-        """Sentence streaming plays each sentence sequentially via sounddevice."""
+    def test_sentence_streaming_uses_one_stream_not_play_per_sentence(self, mock_play, mock_stream):
+        """A multi-sentence reply is queued on ONE output stream (no sd.play per sentence)."""
         import voice
         from voice import Speaker
-
-        # Playback completion is now detected by polling sd.get_stream().active.
-        mock_get_stream.return_value = MagicMock(active=False)
+        import voice as _v
 
         mock_voice = MagicMock()
         class DummyChunk:
             sample_rate = 22050
             audio_float_array = np.zeros(2205, dtype=np.float32)
-
-        mock_voice.synthesize.return_value = [DummyChunk()]
-
+        mock_voice.synthesize.return_value = [DummyChunk(), DummyChunk(), DummyChunk()]
         speaker = Speaker(enabled=True)
         speaker._piper_voice = mock_voice
-
-        with patch.object(voice, "get_shared_piper", return_value=mock_voice):
-            with patch.object(voice, "_AUDIO_PHRASE_CACHE", {}):
-                text = "First sentence. Second sentence! Third sentence."
-                speaker._say_piper(text)
-
-                # Sounddevice play must have been called 3 times (once per sentence)
-                self.assertEqual(mock_play.call_count, 3)
+        with patch.object(voice.Speaker, "_init_piper", return_value=mock_voice),                 patch.object(voice, "_AUDIO_PHRASE_CACHE", {}),                 patch.object(_v._ReplyPlayer, "finish_and_wait", return_value=True):
+            speaker._say_piper("First sentence. Second sentence! Third sentence.")
+        self.assertEqual(mock_stream.call_count, 1)
+        self.assertEqual(mock_play.call_count, 0)
 
     def test_audio_fidelity_headroom_and_clipping(self):
         """Synthesized audio must have 0.88x headroom scaling and clipped within [-0.95, 0.95]."""

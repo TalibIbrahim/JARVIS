@@ -72,11 +72,13 @@ class LocalTranscriber:
             self._state = FAILED
             _log.warning("local STT unavailable (%r); using Groq/Google", exc)
 
-    def transcribe(self, pcm16: bytes, prompt: str = None):
+    def transcribe(self, pcm16: bytes, prompt: str = None, hotwords: str = None):
         """Transcribe 16 kHz mono int16 PCM. Returns (text, confidence 0..1). Raises if not ready.
 
         No default prompt: measured with base.en and tiny.en, ANY initial_prompt/hotwords containing "Jarvis"
-        makes Whisper drop a leading "Jarvis" from the transcript, which would break "Jarvis open chrome"."""
+        makes Whisper drop a leading "Jarvis" from the transcript, which would break "Jarvis open chrome".
+        `hotwords` (the user's own vocabulary, never the wake aliases; see personal.vocabulary) was verified
+        to keep a leading "Jarvis" and to fix near-miss names ("Maliniopos" -> "Malenia")."""
         import numpy as np
         if self._model is None:
             raise RuntimeError("local STT model not loaded")
@@ -85,7 +87,8 @@ class LocalTranscriber:
             segments, _info = self._model.transcribe(
                 audio, language="en", beam_size=1, vad_filter=False,
                 condition_on_previous_text=False, initial_prompt=prompt,
-                temperature=0.0, without_timestamps=True)
+                temperature=0.0, without_timestamps=True,
+                hotwords=hotwords or None)
             segs = list(segments)
         return summarize_segments(segs)
 

@@ -209,6 +209,41 @@ _WHISPER_NOISE_NORMALIZED = frozenset(_normalize_noise_text(p) for p in WHISPER_
 MIN_SPEECH_CHUNKS = 3
 
 
+def _get_personal():
+    """The personal-learning module (clips, corrections, vocabulary), or None when it is not available."""
+    try:
+        import personal
+        return personal
+    except Exception:
+        return None
+
+
+def _level_01(rms: float) -> float:
+    """Mic RMS (int16 units) -> 0..1 for level meters: -60 dBFS maps to 0, 0 dBFS to 1."""
+    if rms <= 0:
+        return 0.0
+    db = 20.0 * math.log10(max(rms, 1e-9) / 32768.0)
+    return float(min(1.0, max(0.0, (db + 60.0) / 60.0)))
+
+
+def analyze_levels(pcm16: bytes, chunk: int = 1280) -> dict:
+    """Level metrics of a 16 kHz int16 recording: speech level (RMS of the louder half of 80 ms chunks),
+    noise floor (10th percentile chunk RMS), both in dBFS, and the SNR between them."""
+    arr = np.frombuffer(pcm16, dtype=np.int16).astype(np.float64)
+    n = len(arr) // chunk
+    if n < 2:
+        return {"level_db": -120.0, "noise_db": -120.0, "snr_db": 0.0, "speech_rms": 0.0, "noise_rms": 0.0}
+    rms = np.sqrt(np.mean(arr[:n * chunk].reshape(n, chunk) ** 2, axis=1))
+    noise = float(np.percentile(rms, 10))
+    loud = rms[rms >= np.median(rms)]
+    speech = float(np.sqrt(np.mean(loud ** 2)))
+
+    def db(x):
+        return 20.0 * math.log10(max(x, 1.0) / 32768.0)
+    return {"level_db": round(db(speech), 1), "noise_db": round(db(noise), 1),
+            "snr_db": round(db(speech) - db(noise), 1), "speech_rms": speech, "noise_rms": noise}
+
+
 class VADDetector:
     """
     Voice Activity Detection: Silero VAD (ONNX) AND an adaptive RMS gate.
@@ -748,30 +783,6 @@ def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
     return result
 
 
-def ensure_piper_model(model_path, config_path):
-    """Verifies that the Piper model and config exist, downloading them if missing."""
-    if os.path.exists(model_path) and os.path.exists(config_path):
-        return True
-    try:
-        import requests
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        base_url = "https://huggingface.co/jgkawell/jarvis/resolve/main/en/en_GB/jarvis/medium"
-        print("[voice] Paul Bettany J.A.R.V.I.S. voice model not found locally. Downloading (~60MB)...")
-        for fname, dest in [("jarvis-medium.onnx.json", config_path), ("jarvis-medium.onnx", model_path)]:
-            if not os.path.exists(dest):
-                resp = requests.get(f"{base_url}/{fname}", stream=True, timeout=60)
-                resp.raise_for_status()
-                with open(dest, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-        print("[voice] Paul Bettany J.A.R.V.I.S. voice model downloaded successfully.")
-        return True
-    except Exception as exc:
-        print(f"[voice] Could not download Paul Bettany model: {exc}")
-        return False
-
-
 _SHARED_PIPER_VOICE = None
 _SHARED_PIPER_LOCK = threading.RLock()
 _SHARED_PIPER_PATH = None
@@ -826,53 +837,76 @@ def split_into_sentences(text: str) -> list[str]:
     return parts if parts else [text]
 
 
+# Piper settings picked by listening tests ("piper_fixed A"): lower noise scales remove the choppy,
+# warbling delivery of the defaults; a slightly longer length_scale is a touch calmer.
+PIPER_SYN_PARAMS = {"noise_scale": 0.333, "noise_w_scale": 0.333, "length_scale": 1.05}
+REPLY_PAUSE_S = 0.18        # silence between sentences of one reply
+REPLY_FADE_IN_S = 0.005     # fade only at the very start ...
+REPLY_FADE_OUT_S = 0.012    # ... and the very end of a reply
+
+
+def _piper_syn_config():
+    try:
+        from piper import SynthesisConfig
+        return SynthesisConfig(**PIPER_SYN_PARAMS)
+    except Exception as exc:
+        _vlog.warning("piper SynthesisConfig unavailable (%r); synthesizing with library defaults", exc)
+        return None
+
+
+def _iter_reply_audio(voice, text: str, target_sr: int = None):
+    """Synthesize a whole reply in ONE Piper call and yield (float32 audio, sample_rate) pieces to be
+    played back-to-back on a single stream. Piper's synthesize() is a generator that yields one chunk per
+    sentence, so the first piece is ready after the first sentence while later ones are still being made.
+    Pieces: 0.88x headroom (clipped to +/-0.95), resampled to the device rate, REPLY_PAUSE_S of silence
+    between sentences, a fade only at the start of the first and the end of the last sentence."""
+    if voice is None or not text.strip():
+        return
+    gen = iter(voice.synthesize(text, syn_config=_piper_syn_config()))
+    held = None      # tail of the previous sentence; faded only if it turns out to be the last
+    sr = target_sr
+    first = True
+    while True:
+        with _SHARED_PIPER_LOCK:
+            chunk = next(gen, None)
+        if chunk is None:
+            break
+        raw = chunk.audio_float_array
+        if len(raw) == 0:
+            continue
+        raw_sr = chunk.sample_rate
+        if sr is None:
+            sr = _get_output_sample_rate(default=raw_sr)
+        arr = np.clip(raw.astype(np.float32) * 0.88, -0.95, 0.95).astype(np.float32)
+        if raw_sr != sr:
+            arr = _resample_fft(arr, raw_sr, sr)
+        if first:
+            n = min(int(sr * REPLY_FADE_IN_S), len(arr))
+            if n > 1:
+                arr[:n] *= np.linspace(0.0, 1.0, n, dtype=np.float32)
+            first = False
+        if held is not None:
+            yield held, sr
+            yield np.zeros(int(sr * REPLY_PAUSE_S), dtype=np.float32), sr
+        n_tail = min(int(sr * REPLY_FADE_OUT_S), len(arr))
+        if len(arr) > n_tail:
+            yield arr[:-n_tail], sr
+        held = arr[len(arr) - n_tail:].copy()
+    if held is not None and len(held):
+        held *= np.linspace(1.0, 0.0, len(held), dtype=np.float32)
+        yield held, sr
+
+
 def _synthesize_sentence_audio(voice, text_sentence: str, target_sr: int = None) -> tuple:
-    """
-    Synthesizes a single sentence or phrase using PiperVoice, applying:
-    1. 5ms micro-fade to eliminate DC offsets and inter-chunk boundary clicks.
-    2. 60ms natural pause between sentences.
-    3. 0.88x headroom scaling (clipped [-0.95, 0.95]) to eliminate inter-sample clipping crackle.
-    4. Resampling to output device native sample rate (polyphase filter / linear fallback).
-    Returns (audio_float_array, target_sr).
-    """
-    if voice is None or not text_sentence.strip():
+    """Whole-text synthesis joined into ONE continuous buffer (see _iter_reply_audio).
+    Returns (audio_float_array, sample_rate)."""
+    pieces = []
+    sr = target_sr
+    for audio, sr in _iter_reply_audio(voice, text_sentence, target_sr):
+        pieces.append(audio)
+    if not pieces:
         return np.array([], dtype=np.float32), (target_sr or 44100)
-
-    with _SHARED_PIPER_LOCK:
-        chunks = list(voice.synthesize(text_sentence))
-
-    if not chunks:
-        return np.array([], dtype=np.float32), (target_sr or 44100)
-
-    raw_sr = chunks[0].sample_rate
-
-    # 1. Clean DC offsets and prevent inter-chunk boundary clicks
-    fade_len = int(raw_sr * 0.005)  # 5ms micro-fade
-    silence = np.zeros(int(raw_sr * 0.06), dtype=np.float32)  # 60ms natural pause between sentences
-    processed_chunks = []
-    for c in chunks:
-        arr = c.audio_float_array.copy()
-        if len(arr) > fade_len * 2:
-            ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-            arr[:fade_len] *= ramp
-            arr[-fade_len:] *= ramp[::-1]
-        processed_chunks.append(arr)
-        processed_chunks.append(silence)
-
-    audio = np.concatenate(processed_chunks)
-
-    # 2. Headroom scaling: Prevent digital inter-sample clipping on DAC / Windows mixer
-    # 0.88x provides ~1.2 dB of headroom.
-    audio = np.clip(audio * 0.88, -0.95, 0.95).astype(np.float32)
-
-    # 3. Resample to hardware output device's native sample rate
-    if target_sr is None:
-        target_sr = _get_output_sample_rate(default=raw_sr)
-
-    if raw_sr != target_sr:
-        audio = _resample_fft(audio, raw_sr, target_sr)
-
-    return audio, target_sr
+    return np.concatenate(pieces).astype(np.float32), sr
 
 
 def _resample_fft(audio, src_sr, dst_sr):
@@ -946,9 +980,6 @@ def get_shared_piper(model_path: str, config_path: str):
         if _SHARED_PIPER_VOICE is not None and (_SHARED_PIPER_PATH == model_path or _SHARED_PIPER_PATH is None):
             return _SHARED_PIPER_VOICE
 
-        if not (os.path.exists(model_path) and os.path.exists(config_path)):
-            ensure_piper_model(model_path, config_path)
-
         if os.path.exists(model_path) and os.path.exists(config_path):
             try:
                 print(f"[voice] Loading Paul Bettany J.A.R.V.I.S. neural voice ({os.path.basename(model_path)})...")
@@ -963,31 +994,78 @@ def get_shared_piper(model_path: str, config_path: str):
         return None
 
 
-def _play_and_wait_bounded(sd, audio, samplerate):
-    """
-    sd.play() under _PORTAUDIO_LOCK, then a bounded wait instead of the unbounded sd.wait().
-    Polls sd.get_stream().active every 0.05 s (Speaker heartbeat inside the loop so a long reply
-    does not look like a stall). Deadline = audio duration + 2.0 s; on expiry sd.stop() and a WARNING.
-    Returns True if playback finished, False if it was cut at the deadline.
-    """
-    with _PORTAUDIO_LOCK:
-        sd.play(audio, samplerate=samplerate, latency="high")
-    duration = len(audio) / float(samplerate)
-    deadline = duration + 2.0
-    t0 = time.monotonic()
-    while True:
-        jarvis_log.heartbeat("Speaker", speaking=True, playing=round(time.monotonic() - t0, 1))
-        if not sd.get_stream().active:
-            return True
-        if time.monotonic() - t0 >= deadline:
-            try:
-                dev = sd.query_devices(kind="output").get("name", "?")
-            except Exception as exc:
-                dev = f"? ({exc!r})"
-            sd.stop()
-            _vlog.warning("playback did not finish within %.1fs, device=%s", deadline, dev)
-            return False
-        time.sleep(0.05)
+class _ReplyPlayer:
+    """One sounddevice OutputStream for a whole reply. Audio pieces are queued with push(); the stream's
+    callback drains them (silence if synthesis ever lags), so there is no per-sentence device restart.
+    Opened/closed under _PORTAUDIO_LOCK; the wait for the tail is bounded (audio length + 2 s)."""
+
+    def __init__(self, sd, samplerate):
+        self.sd = sd
+        self.samplerate = int(samplerate)
+        self._chunks = collections.deque()
+        self._cur = None
+        self._pos = 0
+        self._frames_left = 0
+        self._lock = threading.Lock()
+        self._done = False
+        self.finished = threading.Event()
+        with _PORTAUDIO_LOCK:
+            self.stream = sd.OutputStream(samplerate=self.samplerate, channels=1, dtype="float32",
+                                          latency="high", callback=self._callback,
+                                          finished_callback=self.finished.set)
+            self.stream.start()
+
+    def push(self, audio):
+        if self.finished.is_set():
+            raise RuntimeError("output stream ended before the reply was queued")
+        with self._lock:
+            self._chunks.append(audio)
+            self._frames_left += len(audio)
+
+    def _callback(self, outdata, frames, time_info, status):
+        out = outdata[:, 0]
+        filled = 0
+        with self._lock:
+            while filled < frames:
+                if self._cur is None:
+                    if not self._chunks:
+                        break
+                    self._cur, self._pos = self._chunks.popleft(), 0
+                take = min(frames - filled, len(self._cur) - self._pos)
+                out[filled:filled + take] = self._cur[self._pos:self._pos + take]
+                filled += take
+                self._pos += take
+                self._frames_left -= take
+                if self._pos >= len(self._cur):
+                    self._cur = None
+            stop = self._done and self._cur is None and not self._chunks
+        if filled < frames:
+            out[filled:] = 0.0
+        if stop:
+            raise self.sd.CallbackStop
+
+    def finish_and_wait(self) -> bool:
+        """No more audio: wait (bounded) for the buffered tail to play. False if cut at the deadline."""
+        with self._lock:
+            self._done = True
+            remaining = self._frames_left / float(self.samplerate)
+        deadline = time.monotonic() + remaining + 2.0
+        t0 = time.monotonic()
+        while not self.finished.wait(0.05):
+            jarvis_log.heartbeat("Speaker", speaking=True, playing=round(time.monotonic() - t0, 1))
+            if time.monotonic() >= deadline:
+                _vlog.warning("playback did not finish within %.1fs", remaining + 2.0)
+                return False
+        return True
+
+    def close(self):
+        try:
+            with _PORTAUDIO_LOCK:
+                if not self.finished.is_set():
+                    self.stream.abort()
+                self.stream.close()
+        except Exception as exc:
+            _vlog.warning("closing output stream failed: %r", exc)
 
 
 class Speaker(threading.Thread):
@@ -1053,27 +1131,34 @@ class Speaker(threading.Thread):
                 self.is_speaking = False
                 Voice.is_speaking = False
 
+    DEFAULT_MODEL_REL = "models/voice/jarvis-medium.onnx"
+
     def _get_piper_paths(self):
-        rel_model = getattr(self.cfg, "tts_model_path", "models/voice/jarvis-medium.onnx") if self.cfg else "models/voice/jarvis-medium.onnx"
-        if os.path.isabs(rel_model):
-            model_path = rel_model
-        else:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            candidate = os.path.join(base_dir, rel_model)
-            if os.path.exists(candidate):
-                model_path = candidate
-            else:
-                appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
-                appdata_model = os.path.join(appdata, "Jarvis", rel_model)
-                if os.path.exists(appdata_model):
-                    model_path = appdata_model
-                else:
-                    model_path = candidate if not getattr(sys, "frozen", False) else appdata_model
-        config_path = model_path + ".json"
-        return model_path, config_path
+        """(model, config) of the selected Piper voice, or (None, None) when it is not installed.
+        Never downloads: voices are installed from Settings via voice_models.download()."""
+        import voice_models
+        rel_model = getattr(self.cfg, "tts_model_path", self.DEFAULT_MODEL_REL) if self.cfg else self.DEFAULT_MODEL_REL
+        if rel_model and rel_model != self.DEFAULT_MODEL_REL:      # explicit custom model file
+            custom = rel_model if os.path.isabs(rel_model) else os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), rel_model)
+            if os.path.exists(custom) and os.path.exists(custom + ".json"):
+                return custom, custom + ".json"
+        voice_id = getattr(self.cfg, "tts_voice", "jarvis") if self.cfg else "jarvis"
+        paths = voice_models.get_paths(voice_id)
+        if paths and paths.get("engine") == "piper":
+            return paths["model"], paths["config"]
+        return None, None
 
     def _init_piper(self):
         model_path, config_path = self._get_piper_paths()
+        if model_path is None:
+            if not getattr(self, "_piper_missing_logged", False):
+                self._piper_missing_logged = True
+                _vlog.warning("Piper voice not installed; speaking with the system voice "
+                              "(install one from Settings > Voice)")
+            self._piper_voice = None
+            return None
+        self._piper_missing_logged = False
         voice = get_shared_piper(model_path, config_path)
         self._piper_voice = voice
         self._loaded_model_path = model_path
@@ -1087,70 +1172,29 @@ class Speaker(threading.Thread):
 
         self.is_speaking = True
         Voice.is_speaking = True
-        stop_synth = threading.Event()
+        player = None
         try:
             import sounddevice as sd
 
-            sentences = split_into_sentences(text)
-            if not sentences:
+            if not split_into_sentences(text):
                 return
-
-            def get_sentence_audio(sentence: str):
-                key = _normalize_phrase_key(sentence)
-                cached = _AUDIO_PHRASE_CACHE.get(key)
-                if cached is not None:
-                    return cached
-                return _synthesize_sentence_audio(voice, sentence)
-
-            # Single sentence optimization
-            if len(sentences) == 1:
-                audio, target_sr = get_sentence_audio(sentences[0])
-                if len(audio) > 0:
-                    _play_and_wait_bounded(sd, audio, target_sr)
-                return
-
-            # Multi-sentence streaming:
-            # 1. Synthesize and start playing the first sentence immediately
-            audio0, sr0 = get_sentence_audio(sentences[0])
-
-            # 2. Pipeline remaining sentences in background
-            synth_queue = queue.Queue(maxsize=len(sentences))
-
-            def _bg_synthesizer():
-                try:
-                    for s in sentences[1:]:
-                        if stop_synth.is_set():
-                            break
-                        item = get_sentence_audio(s)
-                        synth_queue.put(item)
-                except Exception as exc:
-                    synth_queue.put(exc)
-                finally:
-                    synth_queue.put(None)
-
-            bg_thread = threading.Thread(target=_bg_synthesizer, daemon=True)
-            bg_thread.start()
-
-            # 3. Play first sentence immediately via sounddevice
-            if len(audio0) > 0:
-                _play_and_wait_bounded(sd, audio0, sr0)
-
-            # 4. Stream remaining sentences as they complete synthesis
-            while True:
-                item = synth_queue.get()
-                if item is None:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                audio_next, sr_next = item
-                if len(audio_next) > 0:
-                    _play_and_wait_bounded(sd, audio_next, sr_next)
-
+            cached = _AUDIO_PHRASE_CACHE.get(_normalize_phrase_key(text))
+            pieces = iter([cached]) if cached is not None else _iter_reply_audio(voice, text)
+            for audio, sr in pieces:
+                if player is None:
+                    player = _ReplyPlayer(sd, sr)
+                player.push(audio)
+            if player is not None:
+                player.finish_and_wait()
         except Exception as exc:
-            print(f"[voice] Piper synthesis/playback error: {exc}, falling back to system TTS")
-            self._say_system(text)
+            if player is None:
+                print(f"[voice] Piper synthesis/playback error: {exc}, falling back to system TTS")
+                self._say_system(text)
+            else:
+                _vlog.warning("Piper playback error mid-reply: %r", exc)
         finally:
-            stop_synth.set()
+            if player is not None:
+                player.close()
             self.is_speaking = False
             Voice.is_speaking = False
 
@@ -1231,6 +1275,10 @@ class WakeWordDetector(threading.Thread):
         self.on_push_to_talk_done = on_push_to_talk_done
         self._ptt_event = threading.Event()   # set by request_listen(); consumed on this thread only
         self._ptt_source = ""
+        self._capture_req = None              # set by request_capture(); consumed on this thread only
+        self._capture_lock = threading.Lock()
+        self._level_cb = None                 # per-chunk level meter callback while a capture runs
+        self._capture_active = False
         self._was_speaking = False
         self.cfg = cfg  # property: also keeps self.vad.cfg in sync (live mic_energy_threshold)
         self.on_wake = on_wake
@@ -1430,6 +1478,64 @@ class WakeWordDetector(threading.Thread):
                 self.on_push_to_talk_done(source)
             except Exception as cb_err:
                 print(f"[voice] on_push_to_talk_done error: {cb_err}")
+
+    CAPTURE_SPEAKING_WAIT_S = 10.0
+
+    class CaptureRequest:
+        def __init__(self, timeout, on_level, max_duration):
+            self.timeout = float(timeout)
+            self.on_level = on_level
+            self.max_duration = max_duration
+            self.raw = None
+            self.done = threading.Event()
+            self.cancelled = False
+
+    def request_capture(self, timeout: float, on_level=None, max_duration: float = None):
+        """Record ONE utterance on the already-open stream without a wake word and WITHOUT dispatching it
+        (onboarding / calibration). Returns a CaptureRequest (wait on .done, result in .raw) or None when
+        busy/unavailable. Thread-safe; the detector thread does the work."""
+        if not self.is_alive() or self.stop.is_set() or self._suspended.is_set():
+            return None
+        with self._capture_lock:
+            if self._capture_req is not None:
+                return None
+            req = WakeWordDetector.CaptureRequest(timeout, on_level, max_duration)
+            self._capture_req = req
+            return req
+
+    def cancel_capture(self, req):
+        with self._capture_lock:
+            req.cancelled = True
+            if self._capture_req is req:
+                self._capture_req = None
+
+    def _do_capture(self, stream, chunk_samples, sample_rate):
+        req = self._capture_req
+        if req is None:
+            return
+        try:
+            waited = 0.0
+            while Voice.is_speaking and waited < self.CAPTURE_SPEAKING_WAIT_S and not req.cancelled:
+                if self.stop.wait(0.05):
+                    break
+                waited += 0.05
+            if req.cancelled or self.stop.is_set():
+                return
+            self._level_cb = req.on_level
+            self._capture_active = True
+            req.raw = self.record_utterance_with_vad(
+                stream=stream, chunk_samples=chunk_samples, sample_rate=sample_rate,
+                timeout_no_speech=req.timeout,
+                max_duration=req.max_duration if req.max_duration else req.timeout,
+                trigger="capture",
+            )
+        finally:
+            self._level_cb = None
+            self._capture_active = False
+            with self._capture_lock:
+                if self._capture_req is req:
+                    self._capture_req = None
+            req.done.set()
 
     def mic_state(self):
         """("ok"|"reconnecting"|"stalled"|"flatline"|"down", reason)."""
@@ -1655,6 +1761,13 @@ class WakeWordDetector(threading.Thread):
                 rms = float(np.sqrt(np.mean(arr.astype(float) ** 2)))
                 Voice._latest_rms = rms
                 Voice._latest_time = time.time()
+                lvl_cb = self._level_cb
+                if lvl_cb is not None:
+                    try:
+                        lvl_cb(_level_01(rms))
+                    except Exception as lv_err:
+                        _vlog.warning("level callback failed (%r); disabling it", lv_err)
+                        self._level_cb = None
                 recorded_frames.append(data)
                 if self._diag_chunk(rms):
                     reason = "flatline"
@@ -1678,6 +1791,8 @@ class WakeWordDetector(threading.Thread):
                                                    device=self.device_index)
                     elif elapsed >= timeout_no_speech:
                         # 5 s silence with no speech
+                        if self._capture_active:
+                            return None     # onboarding capture: no overlay/media side effects
                         if self.on_no_speech:
                             try:
                                 self.on_no_speech()
@@ -1852,7 +1967,7 @@ class WakeWordDetector(threading.Thread):
                 jarvis_log.heartbeat("WakeWordDetector", listening="suspended")
                 self._resume_evt.wait(1.0)
                 continue
-            if self._listen_off() and not self._ptt_event.is_set():
+            if self._listen_off() and not self._ptt_event.is_set() and self._capture_req is None:
                 # Listen for Jarvis is OFF: no stream is open (mic-in-use indicator off), no reads, no
                 # wake model, no VAD, no STT. Idle until the setting flips or a push-to-talk arrives.
                 self._set_state("ok", "Listening off")
@@ -1912,6 +2027,15 @@ class WakeWordDetector(threading.Thread):
                     if self._reopen_at and time.monotonic() >= self._reopen_at:
                         self._reopen_at = 0.0
                         break   # finally: closes the stream; the outer loop re-enumerates and reopens
+                    if self._capture_req is not None:
+                        pre_roll.clear()
+                        self._quiet_run = 0
+                        self._skip_ring.clear()
+                        self._do_capture(stream, chunk_samples, sample_rate)
+                        if self._stream_fault:
+                            stream_error = True
+                            break
+                        continue
                     if self._ptt_event.is_set():
                         pre_roll.clear()
                         self._quiet_run = 0
@@ -2608,11 +2732,37 @@ class Voice(threading.Thread):
         import local_stt
         local_stt.get_local_transcriber(getattr(self.cfg, "local_stt_model", "base.en")).start_loading()
 
+    HOTWORDS_TTL_S = 30.0
+
+    def _hotwords(self):
+        """The user's own vocabulary (names, games, apps) as a faster-whisper `hotwords` string, or "".
+        Wake aliases are filtered out: any hotword containing "Jarvis" makes Whisper drop a leading
+        "Jarvis". Only used while learn_corrections is on."""
+        if not getattr(self.cfg, "learn_corrections", True):
+            return ""
+        now = time.monotonic()
+        cached = getattr(self, "_hotwords_cache", None)
+        if cached is not None and now - cached[0] < self.HOTWORDS_TTL_S:
+            return cached[1]
+        text = ""
+        p = _get_personal()
+        if p is not None:
+            try:
+                aliases = [str(a).lower() for a in getattr(self.cfg, "wake_aliases", ["jarvis"])] + ["jarvis"]
+                terms = [t for t in (p.vocabulary(limit=50) or [])
+                         if t and not any(a in str(t).lower() for a in aliases)]
+                text = ", ".join(terms)
+            except Exception as exc:
+                _vlog.warning("personal.vocabulary failed: %r", exc)
+        self._hotwords_cache = (now, text)
+        return text
+
     def _stt_local(self, lt, raw_bytes, uid, queue_ms):
         t0 = time.monotonic()
         jarvis_log.utterance_event(jarvis_log.STT_SENT, uid, engine="local", bytes=len(raw_bytes),
                                    dur_s=f"{len(raw_bytes) / 32000.0:.2f}")
-        text, conf = lt.transcribe(raw_bytes)
+        hw = self._hotwords()
+        text, conf = lt.transcribe(raw_bytes, hotwords=hw) if hw else lt.transcribe(raw_bytes)
         ms = int((time.monotonic() - t0) * 1000)
         print(f"[voice] Local Heard: \"{redact(text)}\"")
         jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="local", text=text, ok=bool(text),
@@ -2742,10 +2892,12 @@ class Voice(threading.Thread):
 
             queue_ms = max(0, int((time.time() - enqueued_at) * 1000)) if enqueued_at else 0
             done = False
+            engine, conf = None, None
             lt = self._local_stt_ready()
             if lt is not None:
                 try:
                     text, conf = self._stt_local(lt, raw_bytes, uid, queue_ms)
+                    engine = "local"
                     done = True
                     min_conf = float(getattr(self.cfg, "local_stt_min_confidence", 0.55))
                     if conf < min_conf and not passive and use_groq:
@@ -2754,7 +2906,7 @@ class Voice(threading.Thread):
                         gtext, groq_net_fail = self._stt_groq(recognizer, sr, audio, raw_bytes, uid, key,
                                                               google_fallback=False)
                         if gtext:
-                            text = gtext
+                            text, engine = gtext, "groq"
                 except Exception as exc:
                     _vlog.warning("local STT failed (%r); falling back", exc)
                     jarvis_log.utterance_event(jarvis_log.TRANSCRIPT, uid, engine="local", ok=False,
@@ -2764,18 +2916,149 @@ class Voice(threading.Thread):
             if not done:
                 if use_groq:
                     text, groq_net_fail = self._stt_groq(recognizer, sr, audio, raw_bytes, uid, key)
+                    engine = "groq"
                 else:
                     text = self._fallback_google(recognizer, audio, sr)
+                    engine = "google"
 
             # Every STT engine tried failed on the network: tell the user once per interval.
             if not text and self._google_net_err and (groq_net_fail or not use_groq):
                 self._notify_stt_offline(uid)
 
             if text:
+                text = self._apply_corrections(text)
+                self._utt_ctx = {"raw": raw_bytes, "engine": engine, "conf": conf,
+                                 "dur_s": len(raw_bytes) / 32000.0}
                 try:
                     self._process(text, is_command=is_command)
                 except TypeError:
                     self._process(text)
+                finally:
+                    self._utt_ctx = None
+
+    def _apply_corrections(self, text):
+        """personal.apply_corrections on the transcript (learned "no, I said X" fixes), if enabled."""
+        if not getattr(self.cfg, "learn_corrections", True):
+            return text
+        p = _get_personal()
+        if p is None:
+            return text
+        try:
+            return p.apply_corrections(text) or text
+        except Exception as exc:
+            _vlog.warning("personal.apply_corrections failed: %r", exc)
+            return text
+
+    def _save_clip(self, raw_bytes, transcript, meta):
+        """Save audio + transcript through personal.save_voice_clip when learn_voice_clips is on.
+        Runs on a short-lived thread so a disk write never delays the command."""
+        if not getattr(self.cfg, "learn_voice_clips", True) or not raw_bytes or not transcript:
+            return False
+        p = _get_personal()
+        if p is None:
+            return False
+
+        def _work():
+            try:
+                p.save_voice_clip(raw_bytes, 16000, transcript, meta)
+            except Exception as exc:
+                _vlog.warning("save_voice_clip failed: %r", exc)
+        threading.Thread(target=_work, name="VoiceClipSave", daemon=True).start()
+        return True
+
+    def _learn_from_command(self, command):
+        ctx = getattr(self, "_utt_ctx", None)
+        if not ctx:
+            return
+        conf = ctx.get("conf")
+        self._save_clip(ctx["raw"], command, {
+            "kind": "command", "engine": ctx.get("engine"),
+            "confidence": None if conf is None else round(float(conf), 3),
+            "duration": round(ctx.get("dur_s", 0.0), 2)})
+
+    # ------------------------------------------------------------------ onboarding / calibration API
+    CAPTURE_GRACE_S = 5.0
+
+    def _capture_raw(self, timeout, on_level):
+        """One no-wake-word utterance from the live mic stream (PCM16 bytes), or None. Blocking, bounded.
+        The detector thread records it on its own stream, so the main listen loop cannot collide."""
+        wd = self.wake_detector
+        if wd is None or self._suspended or wd.suspended:
+            return None
+        req = wd.request_capture(timeout, on_level=on_level)
+        if req is None:
+            _vlog.info("capture dropped: detector busy or unavailable")
+            return None
+        limit = float(timeout) + WakeWordDetector.CAPTURE_SPEAKING_WAIT_S + self.CAPTURE_GRACE_S
+        if not req.done.wait(limit):
+            wd.cancel_capture(req)
+            _vlog.warning("capture timed out after %.1fs", limit)
+            return None
+        return req.raw
+
+    def _transcribe_blocking(self, raw_bytes):
+        """(text, confidence|None, engine) for a PCM16 clip on the calling thread, same engine order as
+        the command path: local, then Groq, then Google. Text is "" when nothing was recognised."""
+        import speech_recognition as sr
+        audio = sr.AudioData(raw_bytes, sample_rate=16000, sample_width=2)
+        recognizer = sr.Recognizer()
+        lt = self._local_stt_ready()
+        if lt is not None:
+            try:
+                text, conf = self._stt_local(lt, raw_bytes, None, 0)
+                return text or "", conf, "local"
+            except Exception as exc:
+                _vlog.warning("local STT failed in capture (%r); falling back", exc)
+        key = get_api_key(self.cfg)
+        if getattr(self.cfg, "ai_enabled", False) and key and time.time() >= self.groq_cooldown_until:
+            text, _ = self._stt_groq(recognizer, sr, audio, raw_bytes, None, key)
+            return text or "", None, "groq"
+        return self._fallback_google(recognizer, audio, sr) or "", None, "google"
+
+    def capture_answer(self, timeout: float = 8.0, on_level=None) -> str:
+        """Record ONE utterance without a wake word and return its transcript ("" on silence/timeout/
+        error). It is NOT dispatched as a command. Blocking; call from a non-GUI thread.
+        on_level(float 0..1) is called from the audio thread once per 80 ms chunk."""
+        raw = self._capture_raw(timeout, on_level)
+        if not raw:
+            return ""
+        text, conf, engine = self._transcribe_blocking(raw)
+        text = self._apply_corrections(text) if text else ""
+        if text:
+            self._save_clip(raw, text, {"kind": "answer", "engine": engine,
+                                        "confidence": None if conf is None else round(float(conf), 3),
+                                        "duration": round(len(raw) / 32000.0, 2)})
+        return text
+
+    def calibrate_from_sample(self, expected_text: str, timeout: float = 12.0, on_level=None) -> dict:
+        """The user reads `expected_text`. Measures speech level, noise floor and SNR, retunes the mic
+        energy floor (cfg.mic_energy_threshold, persisted) when the sample was usable, saves the clip as
+        a calibration sample (if learn_voice_clips) and returns
+        {"ok", "transcript", "level_db", "snr_db", ...}. Blocking; call from a non-GUI thread."""
+        out = {"ok": False, "transcript": "", "level_db": -120.0, "snr_db": 0.0}
+        raw = self._capture_raw(timeout, on_level)
+        if not raw:
+            return out
+        m = analyze_levels(raw)
+        text, conf, engine = self._transcribe_blocking(raw)
+        out.update(transcript=text, level_db=m["level_db"], snr_db=m["snr_db"], noise_db=m["noise_db"])
+        out["ok"] = bool(text) and m["snr_db"] >= 6.0
+        if out["ok"]:
+            # Gate: above ~2x the room noise but never above 40% of the user's speech level.
+            floor = int(min(max(m["noise_rms"] * 2.0, 100.0), max(100.0, m["speech_rms"] * 0.4)))
+            out["energy_threshold"] = floor
+            self._apply_energy_floor(floor)
+        self._save_clip(raw, text, {"kind": "calibration", "expected": expected_text, "engine": engine,
+                                    "level_db": m["level_db"], "snr_db": m["snr_db"]})
+        return out
+
+    def _apply_energy_floor(self, floor: int):
+        try:
+            self.cfg.mic_energy_threshold = int(floor)
+            import config
+            config.save_config(self.cfg)
+        except Exception as exc:
+            _vlog.warning("could not persist calibrated energy floor: %r", exc)
 
     def _rearm_followup(self):
         """Keep the follow-up window open. Called only after a command produced a (non-None) reply."""
@@ -2858,6 +3141,8 @@ class Voice(threading.Thread):
             self.ctx.say("Yes, sir?")
             jarvis_log.utterance_event(jarvis_log.RESULT, step="wake_ack", ok=True)
             return
+
+        self._learn_from_command(command)
 
         # Continuously adapt voice profile on confirmed commands
         if Voice._last_raw_audio:
