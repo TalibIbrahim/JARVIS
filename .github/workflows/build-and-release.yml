@@ -5,26 +5,17 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version tag (e.g. v1.0.0)'
-        required: false
-        default: 'v1.0.0'
-      release_title:
-        description: 'Release Title'
-        required: false
-        default: 'J.A.R.V.I.S. v1.0.0 — Windows Release'
 
 permissions:
   contents: write
 
 jobs:
   build-and-release:
-    name: Build & Publish Windows Executable
+    name: Build installer and publish release
     runs-on: windows-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python 3.12
@@ -33,38 +24,49 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install Dependencies
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path version.py -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$v") {
+            Write-Error "Tag ${{ github.ref_name }} does not match version.py ($v)"; exit 1
+          }
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          pip install -r requirements.txt pyinstaller pytest
 
-      - name: Run Gesture Test Suite
+      - name: Run core tests
+        run: python -m pytest -q tests/test_gestures.py tests/test_config_migration_v5.py tests/test_personal.py tests/test_win_input.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build app and installer
+        run: python build_exe.py --installer
+
+      - name: Checksum and portable zip
+        shell: pwsh
         run: |
-          python tests/test_gestures.py
+          $v = "${{ steps.ver.outputs.version }}"
+          $setup = "dist/installer/JARVIS-Setup-$v.exe"
+          if (-not (Test-Path $setup)) { Write-Error "Installer not found: $setup"; exit 1 }
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  JARVIS-Setup-$v.exe" | Out-File -Encoding ascii "$setup.sha256"
+          Compress-Archive -Path "dist/JARVIS/*" -DestinationPath "dist/installer/JARVIS-$v-portable.zip" -Force
 
-      - name: Build Standalone Windows Executable
-        run: |
-          python build_exe.py
-
-      - name: Package Release ZIP
-        shell: powershell
-        run: |
-          $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.version || 'v1.0.0' }}" }
-          $zipName = "JARVIS-${ver}-Windows-x64.zip"
-          Compress-Archive -Path "dist/JARVIS.exe" -DestinationPath "dist/$zipName" -Force
-          Write-Host "Created release archive: dist/$zipName"
-
-      - name: Publish to GitHub Releases
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (inputs.version || 'v1.0.0') }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || (inputs.release_title || 'J.A.R.V.I.S. v1.0.0 — Windows Release') }}
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: J.A.R.V.I.S. v${{ steps.ver.outputs.version }}
           files: |
-            dist/JARVIS.exe
-            dist/*.zip
-          draft: false
-          prerelease: false
+            dist/installer/JARVIS-Setup-${{ steps.ver.outputs.version }}.exe
+            dist/installer/JARVIS-Setup-${{ steps.ver.outputs.version }}.exe.sha256
+            dist/installer/JARVIS-${{ steps.ver.outputs.version }}-portable.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
