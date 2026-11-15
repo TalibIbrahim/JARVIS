@@ -17,9 +17,9 @@ import sys
 import os
 from typing import Optional
 
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, QPointF
 from PySide6.QtGui import (
-    QPainter, QColor, QBrush, QFont, QPixmap, QIcon, QAction
+    QPainter, QColor, QBrush, QFont, QPixmap, QIcon, QAction, QPen
 )
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 
@@ -58,6 +58,40 @@ def _make_fallback_icon(dark: bool) -> QIcon:
     return QIcon(pix)
 
 
+def _make_hidden_icon(base: Optional[QIcon], dark: bool) -> QIcon:
+    """Dimmed copy of the tray icon with a diagonal slash (Hide Jarvis is on).
+    Derived at runtime from assets/jarvis_tray.png (falls back to the normal icon)."""
+    src = None
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "jarvis_tray.png")
+    if os.path.exists(path):
+        pm = QPixmap(path)
+        if not pm.isNull():
+            src = pm
+    if src is None and base is not None and not base.isNull():
+        src = base.pixmap(64, 64)
+    if src is None or src.isNull():
+        src = _make_fallback_icon(dark).pixmap(64, 64)
+    size = 64
+    src = src.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(size, size)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setOpacity(0.45)
+    p.drawPixmap((size - src.width()) // 2, (size - src.height()) // 2, src)
+    p.setOpacity(1.0)
+    # slash: a soft dark under-stroke keeps the line readable on light and dark taskbars
+    pen_c = QColor(255, 255, 255, 190) if dark else QColor(20, 20, 24, 200)
+    under = QColor(0, 0, 0, 90) if dark else QColor(255, 255, 255, 120)
+    a, b = QPointF(size * 0.16, size * 0.84), QPointF(size * 0.84, size * 0.16)
+    p.setPen(QPen(under, size * 0.12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(a, b)
+    p.setPen(QPen(pen_c, size * 0.07, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(a, b)
+    p.end()
+    return QIcon(out)
+
+
 class JarvisTray(QSystemTrayIcon):
     """System tray icon with Windows 11-style context menu."""
 
@@ -69,9 +103,12 @@ class JarvisTray(QSystemTrayIcon):
         # Icon
         icon = _get_app_icon()
         if icon and not icon.isNull():
-            self.setIcon(icon)
+            self._icon_normal = icon
         else:
-            self.setIcon(_make_fallback_icon(T.is_dark()))
+            self._icon_normal = _make_fallback_icon(T.is_dark())
+        self._icon_hidden: Optional[QIcon] = None
+        self._hidden = False
+        self.setIcon(self._icon_normal)
 
         self.setToolTip("J.A.R.V.I.S. — Standby")
         self._build_menu()
@@ -129,6 +166,13 @@ class JarvisTray(QSystemTrayIcon):
         act_preview = QAction("Toggle Vision Preview", menu)
         act_preview.triggered.connect(self._toggle_preview)
         menu.addAction(act_preview)
+
+        self._act_hide = QAction("Hide Jarvis  (Ctrl+Alt+H)", menu)
+        self._act_hide.setCheckable(True)
+        self._act_hide.setChecked(self._hidden_now())
+        self._act_hide.triggered.connect(self._toggle_hidden)
+        menu.addAction(self._act_hide)
+        menu.aboutToShow.connect(self._sync_hidden)
 
         act_dwell = QAction("Toggle Dwell Click", menu)
         act_dwell.triggered.connect(self._toggle_dwell)
@@ -190,6 +234,51 @@ class JarvisTray(QSystemTrayIcon):
         if hasattr(isl, "set_gesture_mode"):
             isl.set_gesture_mode(new_state)
         self._act_gesture.setChecked(new_state)
+
+    def _hidden_now(self) -> bool:
+        ctx = getattr(self.mgr, "ctx", None)
+        fn = getattr(ctx, "is_hidden", None)
+        if callable(fn):
+            try:
+                return fn() is True
+            except Exception:
+                pass
+        return bool(getattr(getattr(self.mgr, "cfg", None), "island_hidden", False))
+
+    def _toggle_hidden(self, checked: bool = False) -> None:
+        """Hide / show Jarvis through ctx.set_hidden (the same path as Ctrl+Alt+H)."""
+        new_state = not self._hidden_now()
+        ctx = getattr(self.mgr, "ctx", None)
+        fn = getattr(ctx, "set_hidden", None)
+        try:
+            if callable(fn):
+                fn(new_state)
+            else:
+                cfg = getattr(self.mgr, "cfg", None)
+                if cfg is None:
+                    return
+                cfg.island_hidden = new_state
+        except Exception as exc:
+            print(f"[tray] hide toggle failed: {exc}")
+            return
+        self.set_hidden_state(new_state)
+
+    def _sync_hidden(self) -> None:
+        self.set_hidden_state(self._hidden_now())
+
+    def set_hidden_state(self, hidden: bool) -> None:
+        """Reflect the hidden state: checkmark in the menu and the dimmed + slashed tray icon."""
+        hidden = bool(hidden)
+        self._act_hide.setChecked(hidden)
+        if hidden == self._hidden:
+            return
+        self._hidden = hidden
+        if hidden:
+            if self._icon_hidden is None:
+                self._icon_hidden = _make_hidden_icon(self._icon_normal, T.is_dark())
+            self.setIcon(self._icon_hidden)
+        else:
+            self.setIcon(self._icon_normal)
 
     def _toggle_preview(self) -> None:
         if self.mgr.cfg:

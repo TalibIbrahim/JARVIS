@@ -706,6 +706,7 @@ class IslandColors:
     dow              = _c("#60666A")       # calendar weekday header
     digit            = _c("#E6E9EA")       # calendar in-month digit
     white            = _c("#FFFFFF")
+    ink              = _c("#FFFFFF")       # text on the lyrics pill (flips on the light surface)
     # Media
     badge_fill       = _c("#0F1018")
     media_neutral    = _c("#C8CCD0")       # tint used when there is no album art
@@ -722,6 +723,71 @@ class IslandColors:
     # Media buttons (never tinted)
     btn_side_fill    = _white(0.037)
     btn_play_fill    = _white(0.083)
+
+
+# Island surface styles (cfg.island_surface). "gradient" is the shipped look; the others are options.
+ISLAND_SURFACES = ("gradient", "near_black", "black", "white")
+# (top, bottom) per style. gradient == IslandColors.surface_top / surface_bottom (unchanged).
+ISLAND_SURFACE_STOPS = {
+    "gradient":   (_c("#11191B"), _c("#0C0C0C")),
+    "near_black": (_c("#0C0C0C"), _c("#0C0C0C")),
+    "black":      (_c("#000000"), _c("#000000")),
+    "white":      (_c("#ECEEF2"), _c("#B2B6BF")),     # light graphite, matches the app icon tile
+}
+
+
+def normalize_island_surface(value) -> str:
+    v = str(getattr(value, "value", value) or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if v in ("nearblack", "near_black_flat"):
+        v = "near_black"
+    if v in ("light", "silver", "graphite"):
+        v = "white"
+    return v if v in ISLAND_SURFACES else "gradient"
+
+
+# Dark-on-light foreground palette used on the "white" surface. Same keys as IslandColors; accents keep their hue
+# (slightly deepened so they hold contrast on the light tile). Applied live by set_island_ink().
+_ISLAND_LIGHT_INK = {
+    "hairline":    _c("#000000", 36),
+    "tile_fill":   _c("#000000", 18),
+    "divider":     _c("#000000", 36),
+    "track":       _c("#000000", 40),
+    "accent":      _c("#1F96C4"),
+    "amber":       _c("#B97A12"),
+    "red":         _c("#C43E38"),
+    "green":       _c("#238F3E"),
+    "value":       _c("#101316"),
+    "label":       _c("#4B5158"),
+    "secondary":   _c("#40464C"),
+    "dim":         _c("#5A6068"),
+    "dow":         _c("#555B62"),
+    "digit":       _c("#1B1F23"),
+    "ink":         _c("#101316"),
+    "dot_inactive": _c("#000000", 64),
+    "dot_active":  _c("#000000", 210),
+}
+_ISLAND_INK_STATE = {"light": False}
+_ISLAND_DARK_INK: dict = {}
+
+
+def set_island_ink(light: bool) -> bool:
+    """Swap IslandColors foregrounds between the dark-surface palette (default) and the light-surface palette.
+    Returns True when the palette changed. Dark restores the exact original values."""
+    light = bool(light)
+    if not _ISLAND_DARK_INK:
+        for k in _ISLAND_LIGHT_INK:
+            _ISLAND_DARK_INK[k] = getattr(IslandColors, k)
+    if _ISLAND_INK_STATE["light"] == light:
+        return False
+    src = _ISLAND_LIGHT_INK if light else _ISLAND_DARK_INK
+    for k, v in src.items():
+        setattr(IslandColors, k, v)
+    _ISLAND_INK_STATE["light"] = light
+    return True
+
+
+def island_ink_is_light() -> bool:
+    return bool(_ISLAND_INK_STATE["light"])
 
 
 class IslandTint:

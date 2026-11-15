@@ -188,7 +188,7 @@ class TestFullUIFunctional(unittest.TestCase):
     def test_05_settings_window_tabs_and_controls(self):
         """Verify SettingsWindow builds all tabs and handles navigation without error."""
         dlg = SettingsWindow(self.cfg, self.ctx)
-        self.assertEqual(dlg.sidebar.count(), 8)
+        self.assertEqual(dlg.sidebar.count(), len(_CATEGORIES))
         self.assertIn("Commands", _CATEGORIES)
 
         # Test selecting each tab by ID and integer
@@ -208,7 +208,7 @@ class TestFullUIFunctional(unittest.TestCase):
         # Clear search
         sidebar._on_search("")
         all_visible = [r for r in sidebar._rows if r["visible"]]
-        self.assertEqual(len(all_visible), 8)
+        self.assertEqual(len(all_visible), len(_CATEGORIES))
 
         # Test paintEvent execution
         pix = dlg.grab()

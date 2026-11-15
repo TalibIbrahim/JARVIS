@@ -153,6 +153,8 @@ class SettingsBridge(QObject):
     updater_event    = Signal(str, dict)
     mic_level_updated = Signal(float)
     diagnostics_result = Signal(list)
+    voice_dl_progress  = Signal(float)
+    voice_dl_done      = Signal(bool)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -168,6 +170,7 @@ _TILE_COLORS = {
     "AI":       "#FF9F0A",
     "Display":  "#FF453A",
     "Commands": "#0E7C9E",
+    "Privacy":  "#34C759",
     "About":    "#5E5CE6",
 }
 
@@ -178,6 +181,7 @@ _SIDEBAR_SECTIONS = [
     ("Voice",    ["Voice", "AI"]),
     ("Display",  ["Display"]),
     ("Commands", ["Commands"]),
+    ("Privacy",  ["Privacy"]),
     ("About",    ["About"]),
 ]
 _SIDEBAR_LABELS = {
@@ -188,6 +192,7 @@ _SIDEBAR_LABELS = {
     "AI":       "AI & Intelligence",
     "Display":  "Display",
     "Commands": "Commands",
+    "Privacy":  "Privacy & Learning",
     "About":    "About",
 }
 _SIDEBAR_ICONS = {
@@ -198,11 +203,12 @@ _SIDEBAR_ICONS = {
     "AI":       "A",
     "Display":  "D",
     "Commands": "C",
+    "Privacy":  "L",
     "About":    "I",
 }
 
 # Flat ordered list of category IDs (matches stack widget order)
-_CATEGORIES = ["General", "Gestures", "Pointer", "Voice", "AI", "Display", "Commands", "About"]
+_CATEGORIES = ["General", "Gestures", "Pointer", "Voice", "AI", "Display", "Commands", "Privacy", "About"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -342,7 +348,8 @@ class _SidebarWidget(QWidget):
     def _on_search(self, text: str) -> None:
         text_lower = text.lower().strip()
         keywords = {
-            "General": ["general", "camera", "update", "updates", "productivity", "routine", "routines", "note", "notes", "quick notes", "chime", "timer"]
+            "General": ["general", "camera", "update", "updates", "productivity", "routine", "routines", "note", "notes", "quick notes", "chime", "timer"],
+            "Privacy": ["privacy", "learning", "learn", "data", "delete", "profile", "corrections", "habits", "clips", "onboarding"],
         }
         for ri in self._rows:
             label = _SIDEBAR_LABELS.get(ri["id"], ri["id"]).lower()
@@ -439,6 +446,15 @@ def _draw_tile_icon(p: QPainter, cid: str, tx: float, ty: float, size: float) ->
         for i in (-4.2, 0.0, 4.2):
             p.drawPoint(QPointF(cx - 5.0, cy + i))
             p.drawLine(QPointF(cx - 2.4, cy + i), QPointF(cx + 6.0, cy + i))
+
+    elif cid == "Privacy":
+        p.drawRoundedRect(QRectF(cx - 4.5, cy - 1.0, 9.0, 6.5), 1.6, 1.6)
+        shackle = QPainterPath()
+        shackle.moveTo(cx - 2.6, cy - 1.0)
+        shackle.lineTo(cx - 2.6, cy - 3.0)
+        shackle.arcTo(QRectF(cx - 2.6, cy - 6.2, 5.2, 6.4), 180, -180)
+        shackle.lineTo(cx + 2.6, cy - 1.0)
+        p.strokePath(shackle, QPen(QColor("#FFFFFF"), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
 
     elif cid == "About":
         p.drawEllipse(QPointF(cx, cy), 5.8, 5.8)
@@ -1142,6 +1158,8 @@ class SettingsWindow(QDialog):
         self.bridge.updater_event.connect(self._on_updater_event_gui)
         self.bridge.mic_level_updated.connect(self._on_mic_level_updated)
         self.bridge.diagnostics_result.connect(self._on_diagnostics_result)
+        self.bridge.voice_dl_progress.connect(self._on_voice_dl_progress)
+        self.bridge.voice_dl_done.connect(self._on_voice_dl_done)
 
         self._dark = T.is_dark()
         self._backdrop_type: Optional[str] = None
@@ -1206,6 +1224,7 @@ class SettingsWindow(QDialog):
             "AI": self._build_ai_page,
             "Display": self._build_display_page,
             "Commands": self._build_commands_page,
+            "Privacy": self._build_privacy_page,
             "About": self._build_about_page,
         }
         for _cid in _CATEGORIES:
@@ -1433,6 +1452,8 @@ class SettingsWindow(QDialog):
             idx = _CATEGORIES.index(category_id)
             self._ensure_page(category_id)
             self._stack.setCurrentIndex(idx)
+            if category_id == "Privacy" and hasattr(self, "_priv_dyn"):
+                self._refresh_privacy()
             # Start/stop mic meter
             voice_idx = _CATEGORIES.index("Voice")
             if hasattr(self, "_mic_timer"):
@@ -2108,39 +2129,8 @@ class SettingsWindow(QDialog):
                      "Jarvis replies aloud with voice confirmations",
                      sw_speak)
 
-        # TTS engine
-        self.tts_combo = AppleComboBox()
-        tts_options = [
-            ("piper",  "Paul Bettany  (MCU J.A.R.V.I.S. Neural)"),
-            ("system", "System Default  (Windows SAPI5)"),
-        ]
-        cur_tts = getattr(self.cfg, "tts_engine", "piper")
-        sel_tts = 0
-        for i, (code, label) in enumerate(tts_options):
-            self.tts_combo.addItem(label, code)
-            if cur_tts == code:
-                sel_tts = i
-        self.tts_combo.setCurrentIndex(sel_tts)
-        self.tts_combo.currentIndexChanged.connect(
-            lambda i: self._save("tts_engine", self.tts_combo.itemData(i))
-        )
-
-        btn_tts_test = PrimaryButton("Test Voice")
-        btn_tts_test.setFixedWidth(90)
-        btn_tts_test.setFixedHeight(30)
-        btn_tts_test.clicked.connect(
-            lambda: self.ctx.say("At your service, sir.") if self.ctx else None
-        )
-
-        tts_row  = QWidget()
-        tts_hl   = QHBoxLayout(tts_row)
-        tts_hl.setContentsMargins(0, 0, 0, 0)
-        tts_hl.setSpacing(8)
-        tts_hl.addWidget(self.tts_combo, stretch=1)
-        tts_hl.addWidget(btn_tts_test)
-        card.add_row("Voice Persona",
-                     "AI voice model used for spoken responses",
-                     tts_row)
+        # Voice (built-in system voice or the downloadable J.A.R.V.I.S. voice)
+        self._build_voice_picker_rows(card)
 
         # Microphone selection
         mics = list_microphones()
@@ -2472,6 +2462,20 @@ class SettingsWindow(QDialog):
         island_card.add_row("Size Scale",
                             "Overall scale factor for Dynamic Island capsule and expanded cards",
                             self.island_size_control)
+
+        # Island surface (album colours still win while media plays)
+        cur_surface = str(getattr(self.cfg, "island_surface", "gradient"))
+        self.island_surface_control = SegmentedControl([
+            ("gradient",   "Default"),
+            ("near_black", "Almost black"),
+            ("black",      "Black"),
+            ("white",      "White"),
+        ], current=cur_surface)
+        self.surface_seg = self.island_surface_control
+        self.island_surface_control.valueChanged.connect(self._on_island_surface)
+        island_card.add_row("Island style",
+                            "Music and videos always use the album colors",
+                            self.island_surface_control)
 
         # 3. Compact Content (Time + Weather / Time Only / Off) + Now Playing takeover toggle
         self.compact_content_control = SegmentedControl([
@@ -3165,6 +3169,477 @@ class SettingsWindow(QDialog):
         self._add_page(page)
 
     # ── Event handlers ────────────────────────────────────────────────────
+
+    # ── Island style / voice picker / Privacy & Learning ──────────────────
+
+    def _on_island_surface(self, style: str) -> None:
+        fn = getattr(self.ctx, "set_island_surface", None) if self.ctx is not None else None
+        if callable(fn):
+            try:
+                fn(style)
+                try:
+                    self.cfg.island_surface = style
+                except Exception:
+                    pass
+                return
+            except Exception as exc:
+                print(f"[settings] set_island_surface failed: {exc}")
+        self._save("island_surface", style)
+
+    def _voice_models(self):
+        try:
+            import voice_models
+            return voice_models
+        except Exception:
+            return None
+
+    def _piper_voice_info(self) -> dict:
+        """The downloadable J.A.R.V.I.S. voice entry from voice_models, or {} when that module is missing."""
+        vm = self._voice_models()
+        if vm is None:
+            return {}
+        try:
+            voices = list(vm.available_voices())
+        except Exception:
+            return {}
+        for v in voices:
+            if str(v.get("engine", "")).lower() == "piper":
+                return dict(v)
+        for v in voices:
+            if str(v.get("engine", "")).lower() != "system":
+                return dict(v)
+        return {}
+
+    def _build_voice_picker_rows(self, card) -> None:
+        cur = "piper" if str(getattr(self.cfg, "tts_engine", "piper")).lower() == "piper" else "system"
+        self.tts_seg = SegmentedControl([
+            ("system", "System"),
+            ("piper",  "J.A.R.V.I.S."),
+        ], current=cur)
+        self.tts_seg.valueChanged.connect(self._on_tts_engine)
+
+        self.btn_voice_dl = PrimaryButton("Download")
+        self.btn_voice_dl.setFixedWidth(100)
+        self.btn_voice_dl.clicked.connect(self._on_voice_dl_clicked)
+        self.btn_voice_rm = PlainButton("Remove")
+        self.btn_voice_rm.setFixedWidth(84)
+        self.btn_voice_rm.clicked.connect(self._on_voice_remove)
+        self.voice_dl_bar = QProgressBar()
+        self.voice_dl_bar.setRange(0, 100)
+        self.voice_dl_bar.setFixedHeight(4)
+        self.voice_dl_bar.setTextVisible(False)
+        self.voice_dl_bar.setVisible(False)
+        self.lbl_voice_dl = QLabel("")
+        self.lbl_voice_dl.setFont(qfont(TYPE.footnote))
+        self.lbl_voice_dl.setWordWrap(True)
+        self.lbl_voice_dl.setStyleSheet(f"color: {glass.label_color('secondary_label', self._dark).name()};")
+        self._voice_dl_busy = False
+
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
+        hl = QHBoxLayout()
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(8)
+        hl.addWidget(self.tts_seg)
+        hl.addWidget(self.btn_voice_dl)
+        hl.addWidget(self.btn_voice_rm)
+        vl.addLayout(hl)
+        vl.addWidget(self.voice_dl_bar)
+        vl.addWidget(self.lbl_voice_dl)
+        card.add_row("Voice",
+                     "Built-in Windows voice, or the Paul Bettany voice",
+                     w)
+
+        btn_tts_test = PrimaryButton("Test Voice")
+        btn_tts_test.setFixedWidth(90)
+        btn_tts_test.setFixedHeight(30)
+        btn_tts_test.clicked.connect(
+            lambda: self.ctx.say("At your service, sir.") if self.ctx else None
+        )
+        card.add_row("Test Voice", "Hear the selected voice", btn_tts_test)
+        self._refresh_voice_picker()
+
+    def _refresh_voice_picker(self) -> None:
+        info = self._piper_voice_info()
+        has_models = bool(info)
+        installed = bool(info.get("installed", True)) if has_models else True
+        busy = bool(getattr(self, "_voice_dl_busy", False))
+        show_dl = has_models and not installed
+        self.btn_voice_dl.setVisible(show_dl and not busy)
+        self.btn_voice_rm.setVisible(has_models and installed and not busy)
+        if busy:
+            return
+        size = info.get("size_mb")
+        if show_dl:
+            tail = f" ({size} MB)" if size else ""
+            self.lbl_voice_dl.setText(f"Download{tail} to use J.A.R.V.I.S.")
+        elif has_models:
+            self.lbl_voice_dl.setText("Installed on this PC.")
+        else:
+            self.lbl_voice_dl.setText("")
+        self.lbl_voice_dl.setVisible(bool(self.lbl_voice_dl.text()))
+
+    def _on_tts_engine(self, engine: str) -> None:
+        self._save("tts_engine", engine)
+
+    def _on_voice_dl_clicked(self) -> None:
+        vm = self._voice_models()
+        info = self._piper_voice_info()
+        if vm is None or not info or getattr(self, "_voice_dl_busy", False):
+            return
+        vid = info.get("id")
+        self._voice_dl_busy = True
+        self.btn_voice_dl.setVisible(False)
+        self.btn_voice_rm.setVisible(False)
+        self.voice_dl_bar.setValue(0)
+        self.voice_dl_bar.setVisible(True)
+        self.lbl_voice_dl.setText("Downloading…")
+        self.lbl_voice_dl.setVisible(True)
+        bridge = self.bridge
+
+        def _cb(frac=0.0, *_a):
+            try:
+                f = float(frac)
+            except Exception:
+                return
+            bridge.voice_dl_progress.emit(f / 100.0 if f > 1.0 else f)
+
+        def _work():
+            ok = False
+            try:
+                ok = bool(vm.download(vid, _cb))
+            except Exception as exc:
+                print(f"[settings] voice download failed: {exc}")
+            bridge.voice_dl_done.emit(ok)
+
+        self._voice_dl_thread = threading.Thread(target=_work, name="voice-download", daemon=True)
+        self._voice_dl_thread.start()
+
+    def _on_voice_dl_progress(self, frac: float) -> None:
+        self.voice_dl_bar.setValue(int(max(0.0, min(1.0, frac)) * 100))
+
+    def _on_voice_dl_done(self, ok: bool) -> None:
+        self._voice_dl_busy = False
+        self.voice_dl_bar.setVisible(False)
+        self._refresh_voice_picker()
+        if not ok:
+            self.lbl_voice_dl.setText("Download failed. Try again.")
+            self.lbl_voice_dl.setVisible(True)
+            self.btn_voice_dl.setVisible(True)
+
+    def _on_voice_remove(self) -> None:
+        vm = self._voice_models()
+        info = self._piper_voice_info()
+        if vm is None or not info:
+            return
+        try:
+            vm.remove(info.get("id"))
+        except Exception as exc:
+            print(f"[settings] voice remove failed: {exc}")
+        if self.tts_seg.currentValue() == "piper":
+            self.tts_seg.setValue("system")           # emits -> saves tts_engine = system
+        self._refresh_voice_picker()
+
+    # ── Privacy & Learning page ───────────────────────────────────────────
+
+    _PROFILE_LABELS = {
+        "name":      ("Name", "What Jarvis calls you"),
+        "address_as":    ("Address me as", "sir, ma'am or name"),
+        "uses":          ("Uses this PC for", "Separate items with commas"),
+        "favorite_apps": ("Favorite apps", "Separate items with commas"),
+        "games":         ("Games", "Separate items with commas"),
+        "browser":       ("Browser", "Used for searches and links"),
+        "search_engine": ("Search engine", "Used for plain searches"),
+    }
+
+    def _personal(self):
+        return getattr(self.ctx, "personal", None) if self.ctx is not None else None
+
+    def _build_privacy_page(self) -> None:
+        page, layout = make_scroll_page("Privacy & Learning", "What Jarvis learns, and how to erase it")
+
+        card = GroupedCard()
+        self.priv_toggles = {}
+        for key, title, desc in (
+            ("learn_profile",     "Learn my profile",
+             "Remember your name, how to address you, and the apps and games you use"),
+            ("learn_corrections", "Learn from corrections",
+             "Remember when you fix a mistake and bias recognition toward your words"),
+            ("learn_voice_clips", "Keep voice clips",
+             "Short command clips and transcripts stay on this PC to adapt to your accent"),
+            ("learn_habits",      "Learn my habits",
+             "Remember what you ask and when, to offer suggestions"),
+        ):
+            sw = AppleSwitch(bool(getattr(self.cfg, key, True)))
+            sw.toggled.connect(lambda v, k=key: self._save(k, bool(v)))
+            card.add_row(title, desc, sw)
+            self.priv_toggles[key] = sw
+        card.set_footnote("Everything Jarvis learns stays on this PC. The one exception is a question it "
+                          "can't answer locally: that question is sent to Groq (cloud) to be answered.")
+        layout.addWidget(card)
+
+        self._priv_confirm_delete = False
+        self._priv_dyn = QWidget()
+        self._priv_dyn_layout = QVBoxLayout(self._priv_dyn)
+        self._priv_dyn_layout.setContentsMargins(0, 0, 0, 0)
+        self._priv_dyn_layout.setSpacing(SPACING.md + 2)
+        layout.addWidget(self._priv_dyn)
+
+        layout.addStretch()
+        self._add_page(page)
+        self.privacy_page = page
+        self._refresh_privacy()
+
+    def _priv_header(self, text: str) -> QLabel:
+        hdr = QLabel(text)
+        hdr.setFont(qfont(TYPE.caption_2))
+        hdr.setContentsMargins(SPACING.xs, SPACING.md, 0, 4)
+        hdr.setProperty("role", "section_header")
+        hdr.setStyleSheet(f"color: {T.color.tertiary_label.resolve(self._dark).name()}; "
+                          f"font-size: 10px; font-weight: 600; padding-left: 4px;")
+        return hdr
+
+    def _priv_btn(self, text: str, slot, destructive: bool = False, width: int = 84):
+        btn = (DestructiveButton if destructive else PlainButton)(text)
+        btn.setFixedWidth(width)
+        btn.clicked.connect(slot)
+        return btn
+
+    def _priv_note(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setFont(qfont(TYPE.body))
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(f"color: {glass.label_color('secondary_label', self._dark).name()};")
+        return lbl
+
+    @staticmethod
+    def _fmt_any(x) -> str:
+        if x is None:
+            return ""
+        if isinstance(x, str):
+            return x
+        if isinstance(x, dict):
+            return ", ".join(f"{k}: {v}" for k, v in x.items())
+        if isinstance(x, (list, tuple, set)):
+            return ", ".join(str(i) for i in x)
+        return str(x)
+
+    @staticmethod
+    def _fmt_clip_stats(st) -> str:
+        n, mb = 0, 0.0
+        try:
+            if isinstance(st, dict):
+                n = int(st.get("count", st.get("clips", st.get("n", 0))) or 0)
+                if st.get("mb") is not None:
+                    mb = float(st["mb"])
+                elif st.get("size_mb") is not None:
+                    mb = float(st["size_mb"])
+                elif st.get("bytes") is not None:
+                    mb = float(st["bytes"]) / (1024.0 * 1024.0)
+            elif isinstance(st, (list, tuple)) and len(st) >= 2:
+                n, mb = int(st[0]), float(st[1])
+        except Exception:
+            pass
+        return f"{n} clip{'s' if n != 1 else ''} · {mb:.1f} MB"
+
+    @staticmethod
+    def _norm_corrections(raw) -> list:
+        """-> [(heard, meant)] from a dict, a list of dicts/pairs, or a list of strings."""
+        out = []
+        if isinstance(raw, dict):
+            raw = list(raw.items())
+        for it in (raw or []):
+            if isinstance(it, dict):
+                heard = it.get("heard") or it.get("said") or it.get("wrong") or it.get("from") or ""
+                meant = (it.get("meant") or it.get("corrected") or it.get("correct")
+                         or it.get("to") or it.get("wanted") or "")
+                out.append((str(heard), str(meant)))
+            elif isinstance(it, (list, tuple)) and len(it) >= 2:
+                out.append((str(it[0]), str(it[1])))
+            else:
+                out.append((str(it), ""))
+        return out
+
+    def _clear_priv_dyn(self) -> None:
+        lay = self._priv_dyn_layout
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _refresh_privacy(self) -> None:
+        """Rebuild the data-backed cards from ctx.personal (profile, corrections, clips, habits, actions)."""
+        if not hasattr(self, "_priv_dyn_layout"):
+            return
+        self._clear_priv_dyn()
+        pers = self._personal()
+        lay = self._priv_dyn_layout
+        self.priv_profile_edits = {}
+        self.priv_correction_buttons = []
+        self.btn_priv_clips = self.btn_priv_habits = None
+        self.btn_priv_redo = self.btn_priv_delete = self.btn_priv_delete_confirm = self.btn_priv_delete_cancel = None
+
+        # What Jarvis knows
+        lay.addWidget(self._priv_header("WHAT JARVIS KNOWS"))
+        know = GroupedCard()
+        profile = {}
+        try:
+            profile = dict(pers.get_profile() or {}) if pers is not None else {}
+        except Exception as exc:
+            print(f"[settings] get_profile failed: {exc}")
+        shown = 0
+        for key, val in profile.items():
+            if str(key).startswith("_") or isinstance(val, dict) or val in (None, "", []):
+                continue
+            title, desc = self._PROFILE_LABELS.get(key, (str(key).replace("_", " ").capitalize(), ""))
+            edit = QLineEdit(self._fmt_any(val))
+            edit.setMinimumWidth(220)
+            edit.editingFinished.connect(lambda k=key, e=edit, orig=val: self._on_profile_edit(k, e, orig))
+            know.add_row(title, desc, edit)
+            self.priv_profile_edits[key] = edit
+            shown += 1
+        if not shown:
+            know.add_widget(self._priv_note("Nothing yet. Jarvis fills this in as you use it, or when you redo onboarding."),
+                            divider=False)
+        lay.addWidget(know)
+
+        # Corrections
+        lay.addWidget(self._priv_header("CORRECTIONS"))
+        corr = GroupedCard()
+        items = []
+        try:
+            items = self._norm_corrections(pers.list_corrections()) if pers is not None else []
+        except Exception as exc:
+            print(f"[settings] list_corrections failed: {exc}")
+        for heard, meant in items[:50]:
+            btn = self._priv_btn("Remove", lambda h=heard: self._on_remove_correction(h), destructive=True)
+            title = f"“{heard}”" + (f"  →  {meant}" if meant else "")
+            corr.add_row(title, "", btn)
+            self.priv_correction_buttons.append(btn)
+        if not items:
+            corr.add_widget(self._priv_note("No corrections saved yet."), divider=False)
+        lay.addWidget(corr)
+
+        # Voice clips + habits
+        lay.addWidget(self._priv_header("VOICE CLIPS AND HABITS"))
+        data = GroupedCard()
+        clips_txt = "0 clips · 0.0 MB"
+        try:
+            if pers is not None:
+                clips_txt = self._fmt_clip_stats(pers.clip_stats())
+        except Exception as exc:
+            print(f"[settings] clip_stats failed: {exc}")
+        self.btn_priv_clips = self._priv_btn("Delete", self._on_delete_clips, destructive=True)
+        data.add_row("Voice clips", clips_txt, self.btn_priv_clips)
+        habits_txt = "Nothing learned yet"
+        try:
+            if pers is not None:
+                habits_txt = self._fmt_any(pers.habits_summary()) or habits_txt
+        except Exception as exc:
+            print(f"[settings] habits_summary failed: {exc}")
+        self.btn_priv_habits = self._priv_btn("Clear", self._on_clear_habits, destructive=True)
+        data.add_row("Habits", habits_txt, self.btn_priv_habits)
+        lay.addWidget(data)
+
+        # Actions
+        lay.addWidget(self._priv_header("RESET"))
+        act = GroupedCard()
+        self.btn_priv_redo = self._priv_btn("Start", self._on_redo_onboarding, width=84)
+        act.add_row("Redo onboarding", "Go through the introduction and questions again", self.btn_priv_redo)
+        if not self._priv_confirm_delete:
+            self.btn_priv_delete = self._priv_btn("Delete…", self._on_delete_all_ask, destructive=True)
+            act.add_row("Delete everything",
+                        "Erase your profile, corrections, voice clips and habits from this PC",
+                        self.btn_priv_delete)
+        else:
+            summary = ""
+            try:
+                if pers is not None:
+                    summary = self._fmt_any(pers.data_summary())
+            except Exception:
+                pass
+            self.btn_priv_delete_cancel = self._priv_btn("Cancel", self._on_delete_all_cancel)
+            self.btn_priv_delete_confirm = self._priv_btn("Delete all", self._on_delete_all_confirm,
+                                                          destructive=True, width=92)
+            btns = QWidget()
+            bl = QHBoxLayout(btns)
+            bl.setContentsMargins(0, 0, 0, 0)
+            bl.setSpacing(8)
+            bl.addWidget(self.btn_priv_delete_cancel)
+            bl.addWidget(self.btn_priv_delete_confirm)
+            tail = f" ({summary})" if summary else ""
+            act.add_row("Delete everything?",
+                        f"This permanently erases everything Jarvis has learned about you{tail}. It can't be undone.",
+                        btns)
+        lay.addWidget(act)
+
+    def _on_profile_edit(self, key: str, edit, orig) -> None:
+        pers = self._personal()
+        if pers is None:
+            return
+        text = edit.text().strip()
+        val = [p.strip() for p in text.split(",") if p.strip()] if isinstance(orig, (list, tuple)) else text
+        try:
+            pers.update_profile(**{key: val})
+        except Exception as exc:
+            print(f"[settings] update_profile failed: {exc}")
+
+    def _on_remove_correction(self, heard: str) -> None:
+        pers = self._personal()
+        try:
+            if pers is not None:
+                pers.remove_correction(heard)
+        except Exception as exc:
+            print(f"[settings] remove_correction failed: {exc}")
+        self._refresh_privacy()
+
+    def _on_delete_clips(self) -> None:
+        pers = self._personal()
+        try:
+            if pers is not None:
+                pers.delete_voice_clips()
+        except Exception as exc:
+            print(f"[settings] delete_voice_clips failed: {exc}")
+        self._refresh_privacy()
+
+    def _on_clear_habits(self) -> None:
+        pers = self._personal()
+        try:
+            if pers is not None:
+                pers.clear_habits()
+        except Exception as exc:
+            print(f"[settings] clear_habits failed: {exc}")
+        self._refresh_privacy()
+
+    def _on_redo_onboarding(self) -> None:
+        fn = getattr(self.ctx, "start_onboarding", None) if self.ctx is not None else None
+        if callable(fn):
+            try:
+                fn()
+            except Exception as exc:
+                print(f"[settings] start_onboarding failed: {exc}")
+
+    def _on_delete_all_ask(self) -> None:
+        self._priv_confirm_delete = True
+        self._refresh_privacy()
+
+    def _on_delete_all_cancel(self) -> None:
+        self._priv_confirm_delete = False
+        self._refresh_privacy()
+
+    def _on_delete_all_confirm(self) -> None:
+        pers = self._personal()
+        try:
+            if pers is not None:
+                pers.delete_all()
+        except Exception as exc:
+            print(f"[settings] delete_all failed: {exc}")
+        self._priv_confirm_delete = False
+        self._refresh_privacy()
 
     def _on_lyrics_toggled(self, on: bool) -> None:
         self._save("island_lyrics_enabled", bool(on))
