@@ -74,7 +74,35 @@ def find_iscc():
     return None
 
 
+WAKE_MODELS = ("hey_jarvis_v0.1.onnx", "melspectrogram.onnx", "embedding_model.onnx", "silero_vad.onnx")
+
+
+def ensure_wake_models():
+    """openWakeWord downloads its models on first use, so a fresh environment (CI) has none to bundle."""
+    import openwakeword
+    from openwakeword.utils import download_models
+    models_dir = os.path.join(os.path.dirname(openwakeword.__file__), "resources", "models")
+    if not all(os.path.isfile(os.path.join(models_dir, m)) for m in WAKE_MODELS):
+        print("[build] Downloading openWakeWord models ...")
+        download_models(["hey_jarvis_v0.1"])
+    missing = [m for m in WAKE_MODELS if not os.path.isfile(os.path.join(models_dir, m))]
+    if missing:
+        print(f"[build] FAILED: openWakeWord models missing after download: {missing}")
+        sys.exit(1)
+
+
+def verify_bundle():
+    """The wake word cannot work without its model files; refuse to ship a build that lacks them."""
+    models_dir = os.path.join(DIST_DIR, "_internal", "openwakeword", "resources", "models")
+    missing = [m for m in WAKE_MODELS if not os.path.isfile(os.path.join(models_dir, m))]
+    if missing:
+        print(f"[build] FAILED: bundle is missing wake-word models {missing} in {models_dir}")
+        sys.exit(1)
+    print(f"[build] Wake-word models bundled: {', '.join(WAKE_MODELS)}")
+
+
 def build_exe(clean=False):
+    ensure_wake_models()
     print("[build] Packaging J.A.R.V.I.S. (one-folder) from jarvis.spec ...")
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm"]
     if clean:
@@ -86,6 +114,7 @@ def build_exe(clean=False):
     if res.returncode != 0:
         print(f"\n[build] FAILED with return code {res.returncode}")
         sys.exit(res.returncode)
+    verify_bundle()
     print(f"\n[build] SUCCESS in {time.perf_counter() - t0:.0f}s: {DIST_EXE}")
     print(f"[build] Folder size: {_dir_size_mb(DIST_DIR):.0f} MB  (ship the whole dist/JARVIS folder, or the installer)")
 
