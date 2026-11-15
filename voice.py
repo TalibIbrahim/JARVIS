@@ -786,6 +786,7 @@ def test_microphone_recognition(device_index=None, duration=3.5, level_cb=None):
 _SHARED_PIPER_VOICE = None
 _SHARED_PIPER_LOCK = threading.RLock()
 _SHARED_PIPER_PATH = None
+_SHARED_PIPER_SYN = None      # synthesis overrides for the loaded voice (None -> PIPER_SYN_PARAMS)
 _AUDIO_PHRASE_CACHE = {}
 _CACHED_OUTPUT_SR = None
 
@@ -837,9 +838,17 @@ def split_into_sentences(text: str) -> list[str]:
     return parts if parts else [text]
 
 
-# Piper settings picked by listening tests ("piper_fixed A"): lower noise scales remove the choppy,
-# warbling delivery of the defaults; a slightly longer length_scale is a touch calmer.
+# Piper settings picked by listening tests on the J.A.R.V.I.S. voice ("piper_fixed A"): lower noise scales
+# remove the choppy, warbling delivery of its defaults; a slightly longer length_scale is a touch calmer.
+# Other registry voices synthesize with their own .json inference defaults, which rhasspy tuned per voice.
 PIPER_SYN_PARAMS = {"noise_scale": 0.333, "noise_w_scale": 0.333, "length_scale": 1.05}
+TUNED_SYN_VOICES = ("jarvis",)
+
+
+def syn_params_for(voice_id) -> dict:
+    """Synthesis overrides for a registry voice: the tuned set for J.A.R.V.I.S. (and custom model files),
+    {} for every other voice so Piper falls back to that model's own inference defaults."""
+    return dict(PIPER_SYN_PARAMS) if voice_id is None or voice_id in TUNED_SYN_VOICES else {}
 REPLY_PAUSE_S = 0.18        # silence between sentences of one reply
 REPLY_FADE_IN_S = 0.005     # fade only at the very start ...
 REPLY_FADE_OUT_S = 0.012    # ... and the very end of a reply
@@ -848,7 +857,7 @@ REPLY_FADE_OUT_S = 0.012    # ... and the very end of a reply
 def _piper_syn_config():
     try:
         from piper import SynthesisConfig
-        return SynthesisConfig(**PIPER_SYN_PARAMS)
+        return SynthesisConfig(**(PIPER_SYN_PARAMS if _SHARED_PIPER_SYN is None else _SHARED_PIPER_SYN))
     except Exception as exc:
         _vlog.warning("piper SynthesisConfig unavailable (%r); synthesizing with library defaults", exc)
         return None
@@ -970,23 +979,27 @@ def _load_piper_limited(model_path, config_path):
     return PiperVoice(config=config, session=session, download_dir=Path.cwd())
 
 
-def get_shared_piper(model_path: str, config_path: str):
+def get_shared_piper(model_path: str, config_path: str, syn_params=None):
     """
-    Returns the warm, process-wide PiperVoice instance.
-    Loaded once and held in memory across all Speaker instances.
+    Returns the warm, process-wide PiperVoice instance for `model_path`.
+    One voice is held in memory across all Speaker instances, keyed by its model path: asking for a
+    different path (the user picked another voice) loads that one, swaps it in and re-renders the phrase
+    cache with it. `syn_params` are that voice's synthesis overrides (None -> PIPER_SYN_PARAMS).
     """
-    global _SHARED_PIPER_VOICE, _SHARED_PIPER_PATH
+    global _SHARED_PIPER_VOICE, _SHARED_PIPER_PATH, _SHARED_PIPER_SYN
     with _SHARED_PIPER_LOCK:
         if _SHARED_PIPER_VOICE is not None and (_SHARED_PIPER_PATH == model_path or _SHARED_PIPER_PATH is None):
             return _SHARED_PIPER_VOICE
 
         if os.path.exists(model_path) and os.path.exists(config_path):
             try:
-                print(f"[voice] Loading Paul Bettany J.A.R.V.I.S. neural voice ({os.path.basename(model_path)})...")
+                print(f"[voice] Loading Piper voice ({os.path.basename(model_path)})...")
                 voice = _load_piper_limited(model_path, config_path)
                 _SHARED_PIPER_VOICE = voice
                 _SHARED_PIPER_PATH = model_path
-                print("[voice] Paul Bettany voice model loaded.")
+                _SHARED_PIPER_SYN = None if syn_params is None else dict(syn_params)
+                _AUDIO_PHRASE_CACHE.clear()          # pre-rendered phrases belong to the previous voice
+                print("[voice] Piper voice loaded.")
                 _warm_piper_cache(voice)
                 return voice
             except Exception as e:
@@ -1072,7 +1085,7 @@ class Speaker(threading.Thread):
     """
     Synthesizes and plays spoken feedback for J.A.R.V.I.S.
     Supports:
-    - 'piper': Offline neural TTS with Paul Bettany voice clone (MCU J.A.R.V.I.S.) via sounddevice.
+    - 'piper': Offline neural TTS with the cfg.tts_voice registry voice (optional download) via sounddevice.
     - 'system': System-native SAPI5 fallback via pyttsx3.
     """
 
@@ -1086,10 +1099,19 @@ class Speaker(threading.Thread):
         self.is_speaking = False
 
     def reload_config(self, cfg=None):
-        """Live updates speech settings without restart."""
+        """Live updates speech settings without restart. A newly picked Piper voice is loaded (and its
+        phrase cache rendered) in the background so the next reply does not wait for it."""
         if cfg:
             self.cfg = cfg
         self.enabled = getattr(self.cfg, "speak", True)
+        if str(getattr(self.cfg, "tts_engine", "system")).lower() != "piper":
+            return
+        try:
+            model_path = self._get_piper_paths()[0]
+        except Exception:
+            return
+        if model_path and model_path != getattr(self, "_loaded_model_path", None):
+            threading.Thread(target=self._init_piper, name="piper-prewarm", daemon=True).start()
 
     def say(self, text, urgent=False):
         """Queue `text` for speech. `urgent` (timers/alarms/reminders) bypasses the quiet rule."""
@@ -1133,8 +1155,9 @@ class Speaker(threading.Thread):
 
     DEFAULT_MODEL_REL = "models/voice/jarvis-medium.onnx"
 
-    def _get_piper_paths(self):
-        """(model, config) of the selected Piper voice, or (None, None) when it is not installed.
+    def _selected_piper(self):
+        """(model, config, voice id) of the selected Piper voice, or (None, None, id) when it is not
+        installed. The voice id is None for an explicit custom tts_model_path.
         Never downloads: voices are installed from Settings via voice_models.download()."""
         import voice_models
         rel_model = getattr(self.cfg, "tts_model_path", self.DEFAULT_MODEL_REL) if self.cfg else self.DEFAULT_MODEL_REL
@@ -1142,15 +1165,20 @@ class Speaker(threading.Thread):
             custom = rel_model if os.path.isabs(rel_model) else os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), rel_model)
             if os.path.exists(custom) and os.path.exists(custom + ".json"):
-                return custom, custom + ".json"
-        voice_id = getattr(self.cfg, "tts_voice", "jarvis") if self.cfg else "jarvis"
+                return custom, custom + ".json", None
+        voice_id = (getattr(self.cfg, "tts_voice", "jarvis") if self.cfg else "jarvis") or "jarvis"
         paths = voice_models.get_paths(voice_id)
         if paths and paths.get("engine") == "piper":
-            return paths["model"], paths["config"]
-        return None, None
+            return paths["model"], paths["config"], voice_id
+        return None, None, voice_id
+
+    def _get_piper_paths(self):
+        """(model, config) of the selected Piper voice, or (None, None) when it is not installed."""
+        model_path, config_path, _vid = self._selected_piper()
+        return model_path, config_path
 
     def _init_piper(self):
-        model_path, config_path = self._get_piper_paths()
+        model_path, config_path, voice_id = self._selected_piper()
         if model_path is None:
             if not getattr(self, "_piper_missing_logged", False):
                 self._piper_missing_logged = True
@@ -1159,7 +1187,7 @@ class Speaker(threading.Thread):
             self._piper_voice = None
             return None
         self._piper_missing_logged = False
-        voice = get_shared_piper(model_path, config_path)
+        voice = get_shared_piper(model_path, config_path, syn_params_for(voice_id))
         self._piper_voice = voice
         self._loaded_model_path = model_path
         return voice
@@ -1210,7 +1238,7 @@ class Speaker(threading.Thread):
 
     def _run_body(self):
         # Pre-warm Piper model in background so spoken responses are instantaneous
-        engine_type = getattr(self.cfg, "tts_engine", "piper") if self.cfg else "piper"
+        engine_type = getattr(self.cfg, "tts_engine", "system") if self.cfg else "system"
         if engine_type == "piper":
             try:
                 self._init_piper()
@@ -1227,7 +1255,7 @@ class Speaker(threading.Thread):
                 return
             t_say = time.monotonic()
             try:
-                engine_type = getattr(self.cfg, "tts_engine", "piper") if self.cfg else "piper"
+                engine_type = getattr(self.cfg, "tts_engine", "system") if self.cfg else "system"
                 if engine_type == "piper":
                     self._say_piper(text)
                 else:

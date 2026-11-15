@@ -3193,30 +3193,43 @@ class SettingsWindow(QDialog):
         except Exception:
             return None
 
-    def _piper_voice_info(self) -> dict:
-        """The downloadable J.A.R.V.I.S. voice entry from voice_models, or {} when that module is missing."""
+    _SYSTEM_VOICE_NOTE = "Built-in Windows voice"
+
+    def _voice_choices(self) -> list:
+        """Downloadable voices from voice_models (Piper engine), in registry order; [] when unavailable."""
         vm = self._voice_models()
         if vm is None:
-            return {}
+            return []
         try:
             voices = list(vm.available_voices())
         except Exception:
-            return {}
-        for v in voices:
-            if str(v.get("engine", "")).lower() == "piper":
-                return dict(v)
-        for v in voices:
-            if str(v.get("engine", "")).lower() != "system":
-                return dict(v)
+            return []
+        return [dict(v) for v in voices if str(v.get("engine", "")).lower() == "piper" and v.get("id")]
+
+    def _voice_info(self, vid) -> dict:
+        for v in self._voice_choices():
+            if v.get("id") == vid:
+                return v
         return {}
 
+    def _selected_voice_id(self) -> str:
+        vid = self.tts_combo.currentData() if hasattr(self, "tts_combo") else None
+        return vid or "system"
+
     def _build_voice_picker_rows(self, card) -> None:
-        cur = "piper" if str(getattr(self.cfg, "tts_engine", "piper")).lower() == "piper" else "system"
-        self.tts_seg = SegmentedControl([
-            ("system", "System"),
-            ("piper",  "J.A.R.V.I.S."),
-        ], current=cur)
-        self.tts_seg.valueChanged.connect(self._on_tts_engine)
+        choices = self._voice_choices()
+        engine = str(getattr(self.cfg, "tts_engine", "system")).lower()
+        cur_voice = str(getattr(self.cfg, "tts_voice", "jarvis") or "jarvis")
+        cur = cur_voice if engine == "piper" and any(v["id"] == cur_voice for v in choices) else "system"
+
+        self.tts_combo = AppleComboBox()
+        self.tts_combo.setMinimumWidth(220)
+        self.tts_combo.addItem("System", "system")
+        for v in choices:
+            self.tts_combo.addItem(str(v.get("name") or v["id"]), v["id"])
+        self.tts_combo.setCurrentIndex(max(0, self.tts_combo.findData(cur)))
+        self.tts_combo.currentIndexChanged.connect(
+            lambda i: self._on_voice_selected(self.tts_combo.itemData(i)))
 
         self.btn_voice_dl = PrimaryButton("Download")
         self.btn_voice_dl.setFixedWidth(100)
@@ -3242,15 +3255,17 @@ class SettingsWindow(QDialog):
         hl = QHBoxLayout()
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(8)
-        hl.addWidget(self.tts_seg)
+        hl.addWidget(self.tts_combo)
         hl.addWidget(self.btn_voice_dl)
         hl.addWidget(self.btn_voice_rm)
         vl.addLayout(hl)
         vl.addWidget(self.voice_dl_bar)
         vl.addWidget(self.lbl_voice_dl)
-        card.add_row("Voice",
-                     "Built-in Windows voice, or the Paul Bettany voice",
-                     w)
+        card.add_row("Voice", self._voice_note(cur), w)
+        # The row's subtitle follows the selected voice ("Instant", "Richer, ~1 s delay", ...).
+        row = w.parentWidget()
+        labels = row.findChildren(QLabel, options=Qt.FindChildOption.FindDirectChildrenOnly) if row else []
+        self.lbl_voice_note = labels[1] if len(labels) > 1 else None
 
         btn_tts_test = PrimaryButton("Test Voice")
         btn_tts_test.setFixedWidth(90)
@@ -3261,36 +3276,60 @@ class SettingsWindow(QDialog):
         card.add_row("Test Voice", "Hear the selected voice", btn_tts_test)
         self._refresh_voice_picker()
 
+    def _voice_note(self, vid) -> str:
+        if vid == "system":
+            return self._SYSTEM_VOICE_NOTE
+        return str(self._voice_info(vid).get("note") or "")
+
     def _refresh_voice_picker(self) -> None:
-        info = self._piper_voice_info()
-        has_models = bool(info)
-        installed = bool(info.get("installed", True)) if has_models else True
+        vid = self._selected_voice_id()
+        if getattr(self, "lbl_voice_note", None) is not None:
+            self.lbl_voice_note.setText(self._voice_note(vid))
+        info = self._voice_info(vid) if vid != "system" else {}
+        has_model = bool(info)
+        installed = bool(info.get("installed", False)) if has_model else False
         busy = bool(getattr(self, "_voice_dl_busy", False))
-        show_dl = has_models and not installed
+        self.tts_combo.setEnabled(not busy)
+        show_dl = has_model and not installed
         self.btn_voice_dl.setVisible(show_dl and not busy)
-        self.btn_voice_rm.setVisible(has_models and installed and not busy)
+        self.btn_voice_rm.setVisible(has_model and installed and not busy)
         if busy:
             return
         size = info.get("size_mb")
         if show_dl:
             tail = f" ({size} MB)" if size else ""
-            self.lbl_voice_dl.setText(f"Download{tail} to use J.A.R.V.I.S.")
-        elif has_models:
+            self.lbl_voice_dl.setText(f"Download{tail} to use this voice.")
+        elif has_model:
             self.lbl_voice_dl.setText("Installed on this PC.")
         else:
             self.lbl_voice_dl.setText("")
         self.lbl_voice_dl.setVisible(bool(self.lbl_voice_dl.text()))
 
-    def _on_tts_engine(self, engine: str) -> None:
-        self._save("tts_engine", engine)
+    def _use_voice(self, vid) -> None:
+        """Persist a voice choice: System -> tts_engine "system"; an installed voice -> piper + its id."""
+        if vid == "system":
+            self._save("tts_engine", "system")
+            return
+        self._save("tts_voice", vid)
+        self._save("tts_engine", "piper")
+
+    def _on_voice_selected(self, vid) -> None:
+        vid = vid or "system"
+        if vid == "system" or self._voice_info(vid).get("installed"):
+            self._use_voice(vid)
+        # A voice that is not downloaded yet only shows its Download button; nothing is fetched or
+        # saved until the user clicks it.
+        self._refresh_voice_picker()
 
     def _on_voice_dl_clicked(self) -> None:
         vm = self._voice_models()
-        info = self._piper_voice_info()
+        vid = self._selected_voice_id()
+        info = self._voice_info(vid) if vid != "system" else {}
         if vm is None or not info or getattr(self, "_voice_dl_busy", False):
             return
-        vid = info.get("id")
         self._voice_dl_busy = True
+        self._voice_dl_id = vid
+        self.tts_combo.setEnabled(False)
         self.btn_voice_dl.setVisible(False)
         self.btn_voice_rm.setVisible(False)
         self.voice_dl_bar.setValue(0)
@@ -3299,9 +3338,10 @@ class SettingsWindow(QDialog):
         self.lbl_voice_dl.setVisible(True)
         bridge = self.bridge
 
-        def _cb(frac=0.0, *_a):
+        def _cb(done=0.0, total=None, *_a):
+            # voice_models.download reports (done_bytes, total_bytes); a bare fraction is accepted too.
             try:
-                f = float(frac)
+                f = float(done) / float(total) if total else float(done)
             except Exception:
                 return
             bridge.voice_dl_progress.emit(f / 100.0 if f > 1.0 else f)
@@ -3323,6 +3363,9 @@ class SettingsWindow(QDialog):
     def _on_voice_dl_done(self, ok: bool) -> None:
         self._voice_dl_busy = False
         self.voice_dl_bar.setVisible(False)
+        vid = getattr(self, "_voice_dl_id", None)
+        if ok and vid and vid == self._selected_voice_id():
+            self._use_voice(vid)                      # the voice the user downloaded becomes active
         self._refresh_voice_picker()
         if not ok:
             self.lbl_voice_dl.setText("Download failed. Try again.")
@@ -3331,15 +3374,17 @@ class SettingsWindow(QDialog):
 
     def _on_voice_remove(self) -> None:
         vm = self._voice_models()
-        info = self._piper_voice_info()
-        if vm is None or not info:
+        vid = self._selected_voice_id()
+        if vm is None or vid == "system" or not self._voice_info(vid):
             return
         try:
-            vm.remove(info.get("id"))
+            vm.remove(vid)
         except Exception as exc:
             print(f"[settings] voice remove failed: {exc}")
-        if self.tts_seg.currentValue() == "piper":
-            self.tts_seg.setValue("system")           # emits -> saves tts_engine = system
+        active = (str(getattr(self.cfg, "tts_engine", "")).lower() == "piper"
+                  and getattr(self.cfg, "tts_voice", None) == vid)
+        if active and not self._voice_info(vid).get("installed"):
+            self._save("tts_engine", "system")        # nothing left to speak with: back to System
         self._refresh_voice_picker()
 
     # ── Privacy & Learning page ───────────────────────────────────────────

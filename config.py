@@ -95,7 +95,7 @@ class Config:
     # --- voice ---
     voice_enabled: bool = True
     speak: bool = True                  # spoken replies
-    tts_engine: str = "piper"           # "piper" (Paul Bettany MCU) or "system" (pyttsx3 SAPI5)
+    tts_engine: str = "system"          # "system" (built-in Windows voice, pyttsx3 SAPI5) or "piper" (tts_voice)
     tts_voice: str = "jarvis"           # voice_models registry id used when tts_engine is "piper" (optional download)
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"

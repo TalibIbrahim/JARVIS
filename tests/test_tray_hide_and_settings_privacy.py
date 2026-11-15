@@ -174,47 +174,129 @@ def test_island_style_falls_back_to_save_without_ctx(app, saves):
 
 
 def _fake_voice_models(installed, downloads):
+    """installed: set of installed voice ids (mutated by download/remove)."""
     m = types.ModuleType("voice_models")
-    state = {"installed": installed}
+    state = set(installed)
+    notes = {"hfc_male": ("Male (fast)", "Instant", 60.3), "ryan": ("Ryan", "Richer, ~1 s delay", 115.2),
+             "jarvis": ("J.A.R.V.I.S. (Paul Bettany)", "Movie voice", 60.6)}
     m.available_voices = lambda: [
-        {"id": "system", "name": "System", "size_mb": 0, "installed": True, "engine": "system"},
-        {"id": "jarvis", "name": "J.A.R.V.I.S.", "size_mb": 63, "installed": state["installed"], "engine": "piper"},
-    ]
+        {"id": vid, "name": n, "note": note, "size_mb": mb, "installed": vid in state, "engine": "piper"}
+        for vid, (n, note, mb) in notes.items()]
 
     def _dl(vid, cb):
-        cb(0.5)
+        cb(50, 100)                                   # voice_models reports (done_bytes, total_bytes)
         downloads.append(vid)
-        state["installed"] = True
+        state.add(vid)
         return True
     m.download = _dl
-    m.remove = lambda vid: state.update(installed=False)
+    m.remove = lambda vid: state.discard(vid)
+    m.state = state
     return m
 
 
-def test_voice_picker_sets_tts_engine(dlg, saves):
-    d, ctx = dlg
-    d.tts_seg.setValue("system")
-    d.tts_seg.setValue("piper")
-    assert ("tts_engine", "system") in saves and ("tts_engine", "piper") in saves
+def _settings(cfg=None):
+    from ui.settings_window import SettingsWindow
+    with patch("ui.settings_window.list_cameras", return_value=[]):
+        d = SettingsWindow(cfg or Config(), _SCtx())
+        d.ensure_all_pages()
+    return d
+
+
+def _close(d):
+    d._theme_timer.stop()
+    d.close()
+
+
+def _pick(d, vid):
+    d.tts_combo.setCurrentIndex(d.tts_combo.findData(vid))
+
+
+def test_voice_row_lists_system_and_three_voices(app, saves, monkeypatch):
+    monkeypatch.setitem(sys.modules, "voice_models", _fake_voice_models(set(), []))
+    d = _settings()
+    try:
+        ids = [d.tts_combo.itemData(i) for i in range(d.tts_combo.count())]
+        names = [d.tts_combo.itemText(i) for i in range(d.tts_combo.count())]
+        assert ids == ["system", "hfc_male", "ryan", "jarvis"]
+        assert names == ["System", "Male (fast)", "Ryan", "J.A.R.V.I.S. (Paul Bettany)"]
+        assert d._selected_voice_id() == "system"                  # default config speaks with System
+        assert d.lbl_voice_note.text() == "Built-in Windows voice"
+        assert d.btn_voice_dl.isHidden() and d.btn_voice_rm.isHidden()
+        _pick(d, "ryan")
+        assert d.lbl_voice_note.text() == "Richer, ~1 s delay"
+        assert not d.btn_voice_dl.isHidden() and "115.2 MB" in d.lbl_voice_dl.text()
+        _pick(d, "hfc_male")
+        assert d.lbl_voice_note.text() == "Instant"
+    finally:
+        _close(d)
+
+
+def test_voice_picker_saves_engine_and_voice(app, saves, monkeypatch):
+    monkeypatch.setitem(sys.modules, "voice_models", _fake_voice_models({"jarvis", "ryan"}, []))
+    d = _settings()
+    try:
+        _pick(d, "ryan")
+        assert saves[-2:] == [("tts_voice", "ryan"), ("tts_engine", "piper")]
+        _pick(d, "jarvis")
+        assert saves[-2:] == [("tts_voice", "jarvis"), ("tts_engine", "piper")]
+        assert not d.btn_voice_rm.isHidden() and d.btn_voice_dl.isHidden()
+        _pick(d, "system")
+        assert saves[-1] == ("tts_engine", "system")
+        n = len(saves)
+        _pick(d, "hfc_male")                                       # not installed: nothing saved
+        assert len(saves) == n and not d.btn_voice_dl.isHidden()
+    finally:
+        _close(d)
+
+
+def test_voice_picker_shows_configured_voice(app, saves, monkeypatch):
+    monkeypatch.setitem(sys.modules, "voice_models", _fake_voice_models({"jarvis"}, []))
+    cfg = Config()
+    cfg.tts_engine, cfg.tts_voice = "piper", "jarvis"
+    d = _settings(cfg)
+    try:
+        assert d._selected_voice_id() == "jarvis" and d.lbl_voice_note.text() == "Movie voice"
+        assert saves == []
+    finally:
+        _close(d)
+
+
+def test_no_voice_download_without_click(app, saves, monkeypatch):
+    downloads = []
+    monkeypatch.setitem(sys.modules, "voice_models", _fake_voice_models(set(), downloads))
+    d = _settings()
+    try:
+        for vid in ("hfc_male", "ryan", "jarvis", "system"):
+            _pick(d, vid)
+        app.processEvents()
+        assert downloads == [] and getattr(d, "_voice_dl_thread", None) is None
+        assert ("tts_engine", "piper") not in saves
+    finally:
+        _close(d)
 
 
 def test_voice_download_runs_on_worker_and_updates_ui(app, saves, monkeypatch):
-    from ui.settings_window import SettingsWindow
     downloads = []
-    monkeypatch.setitem(sys.modules, "voice_models", _fake_voice_models(False, downloads))
-    with patch("ui.settings_window.list_cameras", return_value=[]):
-        d = SettingsWindow(Config(), _SCtx())
-        d.ensure_all_pages()
-        assert (not d.btn_voice_dl.isHidden()) and not (not d.btn_voice_rm.isHidden())
+    fake = _fake_voice_models(set(), downloads)
+    monkeypatch.setitem(sys.modules, "voice_models", fake)
+    d = _settings()
+    try:
+        progress = []
+        d.bridge.voice_dl_progress.connect(progress.append)
+        _pick(d, "hfc_male")
+        assert (not d.btn_voice_dl.isHidden()) and d.btn_voice_rm.isHidden()
         d._on_voice_dl_clicked()
+        assert not d.tts_combo.isEnabled()
         d._voice_dl_thread.join(5)
         app.processEvents()
-        assert downloads == ["jarvis"]
-        assert (not d.btn_voice_rm.isHidden()) and not (not d.btn_voice_dl.isHidden())
+        assert downloads == ["hfc_male"] and progress == [0.5]
+        assert saves[-2:] == [("tts_voice", "hfc_male"), ("tts_engine", "piper")]   # active once installed
+        assert (not d.btn_voice_rm.isHidden()) and d.btn_voice_dl.isHidden() and d.tts_combo.isEnabled()
         d._on_voice_remove()
-        assert (not d.btn_voice_dl.isHidden())
-        d._theme_timer.stop()
-        d.close()
+        assert "hfc_male" not in fake.state and saves[-1] == ("tts_engine", "system")
+        assert not d.btn_voice_dl.isHidden()
+    finally:
+        _close(d)
 
 
 def test_privacy_page_toggles_save(dlg, saves):

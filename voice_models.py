@@ -17,12 +17,39 @@ import jarvis_log
 _log = jarvis_log.get_logger("voice")
 
 _HF_JARVIS = "https://huggingface.co/jgkawell/jarvis/resolve/main/en/en_GB/jarvis/medium"
+_HF_PIPER = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US"
 
 # id -> entry. `files`: (local file name, url, expected size in bytes or None). `model` names the file
 # the engine loads; a Piper voice also needs its `.json` next to it. `legacy` lists pre-registry dirs.
+# `note` is the short line shown under the Voice row; `license` is the model's license (the two
+# rhasspy voices are trained on non-commercial datasets).
 REGISTRY = {
+    "hfc_male": {
+        "name": "Male (fast)",
+        "note": "Instant",
+        "license": "CC BY-NC-SA 4.0 (non-commercial)",
+        "engine": "piper",
+        "model": "en_US-hfc_male-medium.onnx",
+        "files": [
+            ("en_US-hfc_male-medium.onnx.json", _HF_PIPER + "/hfc_male/medium/en_US-hfc_male-medium.onnx.json", 5033),
+            ("en_US-hfc_male-medium.onnx", _HF_PIPER + "/hfc_male/medium/en_US-hfc_male-medium.onnx", 63201294),
+        ],
+    },
+    "ryan": {
+        "name": "Ryan",
+        "note": "Richer, ~1 s delay",
+        "license": "CC BY-NC-SA 4.0 (non-commercial)",
+        "engine": "piper",
+        "model": "en_US-ryan-high.onnx",
+        "files": [
+            ("en_US-ryan-high.onnx.json", _HF_PIPER + "/ryan/high/en_US-ryan-high.onnx.json", 4166),
+            ("en_US-ryan-high.onnx", _HF_PIPER + "/ryan/high/en_US-ryan-high.onnx", 120786792),
+        ],
+    },
     "jarvis": {
         "name": "J.A.R.V.I.S. (Paul Bettany)",
+        "note": "Movie voice",
+        "license": "MIT (jgkawell/jarvis)",
         "engine": "piper",
         "model": "jarvis-medium.onnx",
         "files": [
@@ -92,7 +119,8 @@ def available_voices():
     for vid, e in REGISTRY.items():
         total = sum(s or 0 for _f, _u, s in e["files"])
         out.append({"id": vid, "name": e["name"], "size_mb": round(total / (1024.0 * 1024.0), 1),
-                    "installed": is_installed(vid), "engine": e["engine"]})
+                    "installed": is_installed(vid), "engine": e["engine"],
+                    "note": e.get("note", ""), "license": e.get("license", "")})
     return out
 
 

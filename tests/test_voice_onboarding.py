@@ -341,7 +341,7 @@ def vm_env(monkeypatch, tmp_path):
 def test_registry_lists_jarvis_not_installed(vm_env):
     voices = voice_models.available_voices()
     j = next(v for v in voices if v["id"] == "jarvis")
-    assert set(j) == {"id", "name", "size_mb", "installed", "engine"}
+    assert set(j) == {"id", "name", "size_mb", "installed", "engine", "note", "license"}
     assert j["engine"] == "piper" and 55 < j["size_mb"] < 70 and j["installed"] is False
     assert voice_models.get_paths("jarvis") is None and voice_models.get_paths("nope") is None
 
@@ -431,3 +431,113 @@ def test_download_size_mismatch_fails(vm_env, monkeypatch):
     assert voice_models.download("bad") is False
     assert voice_models.get_paths("bad") is None
     assert voice_models.download("unknown-voice") is False
+
+
+# ------------------------------------------------------------------ optional voices: registry + per-voice Speaker
+def test_registry_has_three_optional_voices_with_official_urls():
+    import re
+    reg = voice_models.REGISTRY
+    assert list(reg) == ["hfc_male", "ryan", "jarvis"]
+    assert {k: reg[k]["name"] for k in reg} == {
+        "hfc_male": "Male (fast)", "ryan": "Ryan", "jarvis": "J.A.R.V.I.S. (Paul Bettany)"}
+    for vid in ("hfc_male", "ryan"):
+        e = reg[vid]
+        assert e["engine"] == "piper" and e["note"] and "CC BY-NC-SA 4.0" in e["license"]
+        names = [f for f, _u, _s in e["files"]]
+        assert names == [e["model"] + ".json", e["model"]]
+        for fname, url, size in e["files"]:
+            assert re.fullmatch(r"https://huggingface\.co/rhasspy/piper-voices/resolve/v1\.0\.0/"
+                                r"en/en_US/[a-z_]+/(medium|high)/" + re.escape(fname), url)
+            assert isinstance(size, int) and size > 0
+    assert reg["hfc_male"]["files"][1][1].endswith("/hfc_male/medium/en_US-hfc_male-medium.onnx")
+    assert reg["ryan"]["files"][1][1].endswith("/ryan/high/en_US-ryan-high.onnx")
+    assert 60e6 < reg["hfc_male"]["files"][1][2] < 66e6 and 115e6 < reg["ryan"]["files"][1][2] < 125e6
+    assert reg["jarvis"]["note"] and reg["jarvis"]["license"]
+
+
+def test_system_is_the_default_voice():
+    cfg = Config()
+    assert cfg.tts_engine == "system" and cfg.tts_voice == "jarvis"
+
+
+def _fake_paths(installed):
+    return lambda vid: ({"model": f"/v/{vid}.onnx", "config": f"/v/{vid}.onnx.json", "engine": "piper"}
+                        if vid in installed else None)
+
+
+@pytest.mark.parametrize("vid, tuned", [("jarvis", True), ("hfc_male", False), ("ryan", False)])
+def test_speaker_uses_selected_voice_and_its_synthesis_settings(monkeypatch, vid, tuned):
+    monkeypatch.setattr(voice_models, "get_paths", _fake_paths({"jarvis", "hfc_male", "ryan"}))
+    calls = []
+    monkeypatch.setattr(voice, "get_shared_piper", lambda m, c, syn=None: calls.append((m, c, syn)) or "V")
+    cfg = Config()
+    cfg.tts_engine, cfg.tts_voice = "piper", vid
+    sp = Speaker(enabled=True, cfg=cfg)
+    assert sp._init_piper() == "V"
+    m, c, syn = calls[0]
+    assert (m, c) == (f"/v/{vid}.onnx", f"/v/{vid}.onnx.json")
+    assert syn == (voice.PIPER_SYN_PARAMS if tuned else {})        # others: the model's own .json defaults
+
+
+def test_speaker_falls_back_to_system_when_selected_voice_missing(monkeypatch):
+    monkeypatch.setattr(voice_models, "get_paths", _fake_paths({"jarvis"}))
+    monkeypatch.setattr(voice_models, "download", MagicMock(side_effect=AssertionError("must not download")))
+    cfg = Config()
+    cfg.tts_engine, cfg.tts_voice = "piper", "ryan"
+    sp = Speaker(enabled=True, cfg=cfg)
+    sp._say_system = MagicMock()
+    sp._say_piper("hello there")
+    sp._say_system.assert_called_once_with("hello there")
+
+
+def test_default_config_speaks_with_system_voice(monkeypatch):
+    sp = Speaker(enabled=True, cfg=Config())
+    sp._say_system, sp._say_piper = MagicMock(), MagicMock()
+    sp.q.put("hi")
+    sp.q.put(None)
+    sp._run_body()
+    sp._say_system.assert_called_once_with("hi")
+    sp._say_piper.assert_not_called()
+
+
+def test_shared_piper_reloads_when_voice_path_changes(monkeypatch, tmp_path):
+    for n in ("a", "b"):
+        (tmp_path / f"{n}.onnx").write_bytes(b"x")
+        (tmp_path / f"{n}.onnx.json").write_text("{}")
+    loads = []
+    monkeypatch.setattr(voice, "_load_piper_limited", lambda m, c: loads.append(m) or SimpleNamespace(path=m))
+    monkeypatch.setattr(voice, "_warm_piper_cache", lambda v: voice._AUDIO_PHRASE_CACHE.update(k=v.path))
+    monkeypatch.setattr(voice, "_SHARED_PIPER_VOICE", None)
+    monkeypatch.setattr(voice, "_SHARED_PIPER_PATH", None)
+    monkeypatch.setattr(voice, "_SHARED_PIPER_SYN", None)
+    monkeypatch.setattr(voice, "_AUDIO_PHRASE_CACHE", {"stale": 1})
+    a, b = str(tmp_path / "a.onnx"), str(tmp_path / "b.onnx")
+    va = voice.get_shared_piper(a, a + ".json", dict(voice.PIPER_SYN_PARAMS))
+    assert voice.get_shared_piper(a, a + ".json") is va and loads == [a]
+    assert voice._piper_syn_config().length_scale == 1.05
+    vb = voice.get_shared_piper(b, b + ".json", {})
+    assert vb is not va and loads == [a, b]
+    assert voice._AUDIO_PHRASE_CACHE == {"k": b}                    # phrases re-rendered with the new voice
+    syn = voice._piper_syn_config()
+    assert (syn.noise_scale, syn.noise_w_scale, syn.length_scale) == (None, None, None)
+
+
+def test_reload_config_prewarms_newly_selected_voice(monkeypatch):
+    monkeypatch.setattr(voice_models, "get_paths", _fake_paths({"ryan"}))
+    started = []
+    monkeypatch.setattr(voice.threading, "Thread",
+                        lambda target, name, daemon: SimpleNamespace(start=lambda: started.append(name)))
+    cfg = Config()
+    sp = Speaker(enabled=True, cfg=cfg)
+    sp.reload_config(cfg)                                          # system engine: nothing to load
+    assert started == []
+    cfg.tts_engine, cfg.tts_voice = "piper", "ryan"
+    sp.reload_config(cfg)
+    assert started == ["piper-prewarm"]
+
+
+def test_onboarding_never_downloads_voices():
+    import inspect
+    from ui import onboarding_window
+    src = inspect.getsource(onboarding_window)
+    assert "voice_models" not in src and "download(" not in src
