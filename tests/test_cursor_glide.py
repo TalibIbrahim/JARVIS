@@ -37,7 +37,7 @@ def still(t):
 
 @pytest.fixture(autouse=True)
 def _no_real_input():
-    with um.patch.object(controller_mod, "pyautogui", um.MagicMock()):
+    with um.patch.object(controller_mod, "win_input", um.MagicMock()):
         yield
 
 
@@ -46,6 +46,7 @@ def _make(glide=True, mode="relative"):
     cfg.cursor_glide = glide
     cfg.tracking_mode = mode
     c = Controller(cfg)
+    c.set_active(True)      # the cursor loop starts parked
     c._move = um.MagicMock()
     c._handle_dwell_action = um.MagicMock()
     c.active = True

@@ -78,6 +78,7 @@ def test_replay_gesture_precision_various_lookback_windows(lookback_ms: float):
     """Verifies lookback buffer invariant holds across calibrated lookback windows."""
     cfg = Config(control_scheme="palm_fist", cursor_lookback_ms=lookback_ms)
     ctrl = Controller(cfg)
+    ctrl.set_active(True)      # the cursor loop starts parked
     ctrl._move = unittest.mock.MagicMock()
     ctrl._handle_dwell_action = unittest.mock.MagicMock()
 

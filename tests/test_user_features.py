@@ -199,8 +199,8 @@ class TestPhase5ReliabilityAndRecovery(unittest.TestCase):
         cfg = Config(tracking_mode="relative")
         ctrl = Controller(cfg)
 
-        with patch("controller.pyautogui.mouseUp") as mock_mouse_up, \
-             patch("controller.pyautogui.keyUp") as mock_key_up:
+        with patch("controller.win_input.mouse_up") as mock_mouse_up, \
+             patch("controller.win_input.key_up") as mock_key_up:
 
             # 1. Simulate active dragging
             ctrl.button_down = True
@@ -209,8 +209,8 @@ class TestPhase5ReliabilityAndRecovery(unittest.TestCase):
 
             # 2. Trigger unconditional failsafe release
             ctrl.failsafe_release()
-            mock_mouse_up.assert_called_with(_pause=False)
-            mock_key_up.assert_called_with("ctrl", _pause=False)
+            mock_mouse_up.assert_called_with()
+            mock_key_up.assert_called_with("ctrl")
             self.assertFalse(ctrl.button_down)
             self.assertFalse(ctrl.ctrl_down)
             self.assertFalse(ctrl.dragging)
@@ -228,8 +228,8 @@ class TestPhase5ReliabilityAndRecovery(unittest.TestCase):
                 act = Action("move", x=0.6, y=0.6)
                 ctrl.handle(act)
                 # Must have triggered failsafe release and NOT jumped cursor
-                mock_mouse_up.assert_called_with(_pause=False)
-                mock_key_up.assert_called_with("ctrl", _pause=False)
+                mock_mouse_up.assert_called_with()
+                mock_key_up.assert_called_with("ctrl")
                 self.assertEqual(ctrl.target_x, 500.0)
                 self.assertEqual(ctrl.target_y, 500.0)
 
@@ -237,15 +237,15 @@ class TestPhase5ReliabilityAndRecovery(unittest.TestCase):
             mock_mouse_up.reset_mock()
             mock_key_up.reset_mock()
             ctrl.handle(Action("lost"))
-            mock_mouse_up.assert_called_with(_pause=False)
-            mock_key_up.assert_called_with("ctrl", _pause=False)
+            mock_mouse_up.assert_called_with()
+            mock_key_up.assert_called_with("ctrl")
 
             # 5. Test on_sleep and on_resume hooks
             mock_mouse_up.reset_mock()
             mock_key_up.reset_mock()
             ctrl.on_sleep()
-            mock_mouse_up.assert_called_with(_pause=False)
-            mock_key_up.assert_called_with("ctrl", _pause=False)
+            mock_mouse_up.assert_called_with()
+            mock_key_up.assert_called_with("ctrl")
 
         ctrl.shutdown()
 

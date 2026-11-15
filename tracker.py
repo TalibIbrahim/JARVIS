@@ -4,8 +4,7 @@ import sys
 import threading
 import time
 
-import cv2
-import numpy as np
+import importlib
 
 import jarvis_log
 from gestures import Hand, Action
@@ -16,6 +15,36 @@ except ImportError:  # older config without runtime-override tracking
     mark_runtime_override = None
 
 _tlog = jarvis_log.get_logger("tracker")
+
+
+class _LazyModule:
+    """Imports the real module on first attribute access (cv2/numpy cost ~100 MB-class startup RSS and
+    hundreds of ms; they are only needed once a camera session or snapshot runs). Attribute reads AND
+    writes are forwarded to the real module so tests can still monkeypatch e.g. ``tracker.cv2.VideoCapture``."""
+
+    def __init__(self, name):
+        object.__setattr__(self, "_lm_name", name)
+        object.__setattr__(self, "_lm_mod", None)
+
+    def _lm_load(self):
+        mod = object.__getattribute__(self, "_lm_mod")
+        if mod is None:
+            mod = importlib.import_module(object.__getattribute__(self, "_lm_name"))
+            object.__setattr__(self, "_lm_mod", mod)
+        return mod
+
+    def __getattr__(self, attr):
+        return getattr(self._lm_load(), attr)
+
+    def __setattr__(self, attr, value):
+        setattr(self._lm_load(), attr, value)
+
+    def __delattr__(self, attr):
+        delattr(self._lm_load(), attr)
+
+
+cv2 = _LazyModule("cv2")
+np = _LazyModule("numpy")
 
 
 def _fallback_camera_index(cfg, idx):
@@ -494,8 +523,15 @@ class Tracker(threading.Thread):
             self._want.set()
         self._cam_lock = threading.Lock()   # serializes real-grabber open/close vs one-shot snapshots
         self._auto_off = False
+        self._reopen = threading.Event()
 
     # ---- camera on-demand ----
+    def reopen_camera(self):
+        """Thread-safe. If the camera is wanted, close and reopen the session (device change / resume).
+        No-op when the camera is off; safe to call repeatedly (requests coalesce)."""
+        if self._want.is_set() and getattr(self.cfg, "threaded_capture", True):
+            self._reopen.set()
+
     def set_camera_wanted(self, on: bool):
         """Thread-safe. on=True opens camera + MediaPipe; on=False releases both (thread stays alive)."""
         if on:
@@ -645,7 +681,19 @@ class Tracker(threading.Thread):
                 return
 
     def _session(self, use_threaded):
-        """One camera-on period: open camera + MediaPipe, track until stop or camera turned off."""
+        """One camera-on period. The Controller's 120 Hz cursor loop (and its 1 ms system timer) runs
+        only for the duration of this session."""
+        ctl_set_active = getattr(self.controller, "set_active", None)
+        if callable(ctl_set_active):
+            ctl_set_active(True)
+        try:
+            self._session_body(use_threaded)
+        finally:
+            if callable(ctl_set_active):
+                ctl_set_active(False)    # also releases mouse button / ctrl (failsafe)
+
+    def _session_body(self, use_threaded):
+        """Open camera + MediaPipe, track until stop, camera turned off, or a reopen request."""
         global _ACTIVE_GRABBER_IDX
         cfg = self.cfg
         self._flip_buf = None
@@ -741,6 +789,10 @@ class Tracker(threading.Thread):
                     active=bool(getattr(self.engine, "active", False)), hands=n_hands)
             if use_threaded:
                 if self.stop.is_set() or not self._want.is_set():
+                    break
+                if self._reopen.is_set():
+                    self._reopen.clear()
+                    _tlog.info("camera reopen requested: closing session (will reopen)")
                     break
                 _idle_to = float(getattr(self.cfg, "gesture_idle_timeout_s", 0.0) or 0.0)
                 if getattr(self.engine, "dragging", False):

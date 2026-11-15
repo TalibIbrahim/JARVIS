@@ -42,8 +42,48 @@ from chime import (
 
 import jarvis_log
 from jarvis_log import redact
+import fullscreen_detector
 
 _vlog = jarvis_log.get_logger("voice")
+
+# ---------------------------------------------------------------------------------------------------
+# QUIET RULE (games / presentations / Focus Assist). fullscreen_detector.is_quiet() is True for
+# QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE and QUNS_QUIET_TIME. While quiet:
+#   * the wake chime / wake earcon is OFF (including the push-to-talk chime);
+#   * spoken (TTS) replies are OFF, EXCEPT
+#       - replies within EXPLICIT_COMMAND_WINDOW_S (10 s) of a command the user explicitly issued
+#         ("Jarvis ..." / follow-up / push-to-talk) -- see note_explicit_command();
+#       - urgent speech: timers, alarms and reminders (say(..., urgent=True) or a scheduler phrase).
+#   * proactive / unsolicited speech (gesture mode announcements, briefings, tips, ...) is OFF.
+# Text is still posted to the island; only audio is suppressed. The island hiding behavior is unchanged.
+# ---------------------------------------------------------------------------------------------------
+EXPLICIT_COMMAND_WINDOW_S = 10.0
+_URGENT_SPEECH_RE = re.compile(r"^\s*sir,\s+(your\s+(timer|alarm)\s+for\s|reminder:)", re.IGNORECASE)
+_last_explicit_command_t = -1e9
+
+
+def _quiet() -> bool:
+    return fullscreen_detector.is_quiet()
+
+
+def note_explicit_command(now=None):
+    """Called when the user explicitly addressed JARVIS (accepted command / push-to-talk)."""
+    global _last_explicit_command_t
+    _last_explicit_command_t = time.monotonic() if now is None else now
+
+
+def speech_allowed(text, urgent=False, now=None) -> bool:
+    """True if `text` may be spoken now under the quiet rule above."""
+    if not _quiet():
+        return True
+    if urgent or (text and _URGENT_SPEECH_RE.match(text)):
+        return True
+    t = time.monotonic() if now is None else now
+    return (t - _last_explicit_command_t) <= EXPLICIT_COMMAND_WINDOW_S
+
+
+def _wake_chime_allowed() -> bool:
+    return not _quiet()
 
 _PORTAUDIO_LOCK = jarvis_log.InstrumentedRLock("portaudio", warn_wait_ms=50, warn_hold_ms=250)
 
@@ -830,16 +870,26 @@ def _synthesize_sentence_audio(voice, text_sentence: str, target_sr: int = None)
         target_sr = _get_output_sample_rate(default=raw_sr)
 
     if raw_sr != target_sr:
-        try:
-            import scipy.signal as signal
-            audio = signal.resample_poly(audio, up=target_sr, down=raw_sr).astype(np.float32)
-        except Exception:
-            old_indices = np.linspace(0, len(audio) - 1, len(audio))
-            new_len = int(len(audio) * target_sr / raw_sr)
-            new_indices = np.linspace(0, len(audio) - 1, new_len)
-            audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
+        audio = _resample_fft(audio, raw_sr, target_sr)
 
     return audio, target_sr
+
+
+def _resample_fft(audio, src_sr, dst_sr):
+    """Band-limited (Fourier) resample of a whole clip with numpy only (scipy.signal costs ~75 MB RSS and
+    ~2 s of import at startup). Equivalent to scipy.signal.resample for finite TTS clips, which start and
+    end in silence so the periodic-extension edge effect is inaudible."""
+    n_in = len(audio)
+    n_out = int(round(n_in * float(dst_sr) / float(src_sr)))
+    if n_in == 0 or n_out == 0 or n_out == n_in:
+        return audio.astype(np.float32)
+    spec = np.fft.rfft(audio.astype(np.float64))
+    n_keep = min(len(spec), n_out // 2 + 1)
+    out_spec = np.zeros(n_out // 2 + 1, dtype=np.complex128)
+    out_spec[:n_keep] = spec[:n_keep]
+    if n_out < n_in and n_out % 2 == 0:
+        out_spec[n_keep - 1] *= 0.5     # fold the Nyquist bin when downsampling to an even length
+    return (np.fft.irfft(out_spec, n_out) * (n_out / float(n_in))).astype(np.float32)
 
 
 def _warm_piper_cache(voice):
@@ -963,9 +1013,13 @@ class Speaker(threading.Thread):
             self.cfg = cfg
         self.enabled = getattr(self.cfg, "speak", True)
 
-    def say(self, text):
+    def say(self, text, urgent=False):
+        """Queue `text` for speech. `urgent` (timers/alarms/reminders) bypasses the quiet rule."""
         is_enabled = getattr(self.cfg, "speak", self.enabled) if self.cfg else self.enabled
         if is_enabled and text:
+            if not speech_allowed(text, urgent=urgent):
+                _vlog.info("Speaker: speech suppressed (quiet: game/presentation/focus), %d chars", len(text))
+                return
             self.q.put(text)
 
     def _init_system_engine(self):
@@ -1217,6 +1271,12 @@ class WakeWordDetector(threading.Thread):
         self.wake_predicts = 0
         self.wake_skipped = 0
         self._mic_state = ("down", "not started")
+        # Suspend (PC locked/asleep) and device re-enumeration (hot-plug / resume), see set_suspended().
+        self._suspended = threading.Event()
+        self._resume_evt = threading.Event()
+        self._resume_evt.set()
+        self._reopen_at = 0.0           # monotonic time at/after which to close+reopen (0 = none); debounced
+        self._reset_pa_pending = False  # re-enumerate PortAudio devices before the next open
         self._init_model()
 
     STALL_TIMEOUT_S = 2.0     # no data for this long => stream stall
@@ -1241,6 +1301,30 @@ class WakeWordDetector(threading.Thread):
 
     PTT_TIMEOUT_NO_SPEECH_S = 5.0
     LISTEN_OFF_POLL_S = 0.25
+    REOPEN_SETTLE_S = 0.75    # trailing-edge debounce: repeated reopen requests inside this window coalesce
+
+    def set_suspended(self, on: bool):
+        """True: the loop closes the mic stream and does no wake/VAD/STT work until resumed.
+        False: resume; PortAudio is re-enumerated before the stream is reopened. Thread-safe."""
+        if on:
+            self._resume_evt.clear()
+            self._suspended.set()
+            self.listening_until = 0.0
+        else:
+            if self._suspended.is_set():
+                self._reset_pa_pending = True
+            self._suspended.clear()
+            self._resume_evt.set()
+
+    @property
+    def suspended(self) -> bool:
+        return self._suspended.is_set()
+
+    def request_reopen(self):
+        """Debounced (trailing edge): re-enumerate devices and reopen the input stream shortly after the
+        last call. Safe to call repeatedly from any thread."""
+        self._reset_pa_pending = True
+        self._reopen_at = time.monotonic() + self.REOPEN_SETTLE_S
 
     def _listen_off(self):
         """Live 'Listen for Jarvis' setting (cfg is reloaded in place, so poll every pass)."""
@@ -1757,10 +1841,22 @@ class WakeWordDetector(threading.Thread):
         chunk_samples = 1280  # 80 ms chunks
 
         while not self.stop.is_set():
+            if self._suspended.is_set():
+                # PC locked / asleep: no stream open (mic indicator off), no reads, no wake model, no VAD.
+                self._set_state("ok", "Suspended")
+                self._reopen_at = 0.0     # resume re-enumerates anyway
+                self._flat_since = None
+                self._flat_flagged = False
+                self.listening_until = 0.0
+                self._ptt_event.clear()
+                jarvis_log.heartbeat("WakeWordDetector", listening="suspended")
+                self._resume_evt.wait(1.0)
+                continue
             if self._listen_off() and not self._ptt_event.is_set():
                 # Listen for Jarvis is OFF: no stream is open (mic-in-use indicator off), no reads, no
                 # wake model, no VAD, no STT. Idle until the setting flips or a push-to-talk arrives.
                 self._set_state("ok", "Listening off")
+                self._reopen_at = 0.0     # no stream to reopen; _reset_pa_pending still applies on next open
                 self._flat_since = None
                 self._flat_flagged = False
                 self.listening_until = 0.0
@@ -1768,6 +1864,12 @@ class WakeWordDetector(threading.Thread):
                 self._ptt_event.wait(self.LISTEN_OFF_POLL_S)
                 continue
 
+            if self._reset_pa_pending:
+                # Device change / resume: no stream of ours is open here, so re-enumeration is safe.
+                self._reset_pa_pending = False
+                reset_shared_pyaudio()
+                if (getattr(self.cfg, "mic_device_index", None) if self.cfg else None) is None:
+                    self.device_index = None      # re-pick the best 16 kHz mic from the fresh device list
             # Re-fetch every pass: reconnect_stream() resets the shared PyAudio instance.
             p = get_shared_pyaudio()
             cfg_idx = getattr(self.cfg, "mic_device_index", None) if self.cfg else None
@@ -1805,6 +1907,11 @@ class WakeWordDetector(threading.Thread):
                     if new_cfg_idx is not None and new_cfg_idx != self.device_index:
                         break
 
+                    if self._suspended.is_set():
+                        break   # finally: closes the stream; the outer loop then parks
+                    if self._reopen_at and time.monotonic() >= self._reopen_at:
+                        self._reopen_at = 0.0
+                        break   # finally: closes the stream; the outer loop re-enumerates and reopens
                     if self._ptt_event.is_set():
                         pre_roll.clear()
                         self._quiet_run = 0
@@ -1908,7 +2015,7 @@ class WakeWordDetector(threading.Thread):
                                     self.on_wake()
                                 except Exception as cb_err:
                                     print(f"[voice] on_wake error: {cb_err}")
-                            elif getattr(self.cfg, "chime_enabled", True):
+                            elif getattr(self.cfg, "chime_enabled", True) and _wake_chime_allowed():
                                 play_chime(non_blocking=True)
 
                             # 2. Enter follow-up window & record with VAD
@@ -2075,6 +2182,7 @@ class Voice(threading.Thread):
         self.sensitivity = getattr(cfg, "wake_sensitivity", "balanced") if cfg else "balanced"
         self.followup_window = float(getattr(cfg, "wake_followup_window", getattr(cfg, "command_window", 6.0))) if cfg else 6.0
         self.wake_detector = None
+        self._suspended = False
         self._ducked = False
         self._restore_pending = False
 
@@ -2173,19 +2281,37 @@ class Voice(threading.Thread):
                 self.ctx.overlay.post("listening", until=self.listening_until)
             except Exception:
                 pass
-        if getattr(self.cfg, "chime_enabled", True):
-            play_chime(non_blocking=True)
-        if hasattr(self.ctx, "chirp"):
-            try:
-                self.ctx.chirp("wake")
-            except Exception:
-                pass
+        if _wake_chime_allowed():
+            if getattr(self.cfg, "chime_enabled", True):
+                play_chime(non_blocking=True)
+            if hasattr(self.ctx, "chirp"):
+                try:
+                    self.ctx.chirp("wake")
+                except Exception:
+                    pass
+
+    def set_suspended(self, on: bool):
+        """PC locked / asleep: close the mic stream and stop wake/VAD processing; resume reopens it
+        (re-enumerating devices). Thread-safe; safe to call before the detector exists."""
+        self._suspended = bool(on)
+        if on:
+            self.listening_until = 0.0
+        wd = self.wake_detector
+        if wd is not None:
+            wd.set_suspended(self._suspended)
+
+    def reopen_devices(self):
+        """Re-enumerate audio devices and reopen the input stream (device change / resume). Debounced and
+        safe to call repeatedly; while suspended it only schedules re-enumeration for resume."""
+        wd = self.wake_detector
+        if wd is not None:
+            wd.request_reopen()
 
     def request_listen(self, source: str = "") -> bool:
         """Push-to-talk (e.g. the call-me gesture). Thread-safe. Returns False if dropped (no detector,
         already listening, or JARVIS speaking). At most one request is held; extras are dropped."""
         wd = self.wake_detector
-        if wd is None or Voice.is_speaking:
+        if wd is None or Voice.is_speaking or self._suspended:
             return False
         return wd.request_listen(source)
 
@@ -2199,7 +2325,8 @@ class Voice(threading.Thread):
                 self.ctx.overlay.post("listening", until=until)
             except Exception:
                 pass
-        if getattr(self.cfg, "chime_enabled", True):
+        note_explicit_command()
+        if getattr(self.cfg, "chime_enabled", True) and _wake_chime_allowed():
             play_chime(non_blocking=True)
 
     def _on_push_to_talk_done(self, source):
@@ -2360,6 +2487,8 @@ class Voice(threading.Thread):
             followup_window=self.followup_window,
             device_index=dev_idx,
         )
+        if self._suspended:
+            self.wake_detector.set_suspended(True)
         self.wake_detector.start()
 
         while not self.stop.is_set():
@@ -2704,6 +2833,7 @@ class Voice(threading.Thread):
                         pass
                 return
 
+        note_explicit_command()     # accepted wake/command: spoken replies stay on for 10 s even when quiet
         if matched_alias is not None:
             self._duck_media("alias_wake" if command else "alias_only")
 
@@ -2717,13 +2847,14 @@ class Voice(threading.Thread):
                 self.ctx.overlay.post("listening", until=self.listening_until)
             except Exception:
                 pass
-            if getattr(self.cfg, "chime_enabled", True):
-                play_chime(non_blocking=True)
-            if hasattr(self.ctx, "chirp"):
-                try:
-                    self.ctx.chirp("wake")
-                except Exception:
-                    pass
+            if _wake_chime_allowed():
+                if getattr(self.cfg, "chime_enabled", True):
+                    play_chime(non_blocking=True)
+                if hasattr(self.ctx, "chirp"):
+                    try:
+                        self.ctx.chirp("wake")
+                    except Exception:
+                        pass
             self.ctx.say("Yes, sir?")
             jarvis_log.utterance_event(jarvis_log.RESULT, step="wake_ack", ok=True)
             return

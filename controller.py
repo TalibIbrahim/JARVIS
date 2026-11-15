@@ -17,15 +17,10 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import pyautogui
-
 import jarvis_log
+import win_input
 from filters import OneEuro, DeadzoneFilter, OneEuroPoint
 from dwell import DwellClicker
-
-pyautogui.PAUSE = 0
-pyautogui.FAILSAFE = False      # hand control would otherwise trip the corner failsafe
-pyautogui.MINIMUM_DURATION = 0
 
 
 class _HighResTimer:
@@ -153,12 +148,12 @@ class Controller:
             # Per-monitor / DPI aware system metrics
             self.vx = self._user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
             self.vy = self._user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
-            self.vw = self._user32.GetSystemMetrics(78) or pyautogui.size()[0]
-            self.vh = self._user32.GetSystemMetrics(79) or pyautogui.size()[1]
-            self.sw = self._user32.GetSystemMetrics(0) or pyautogui.size()[0]
-            self.sh = self._user32.GetSystemMetrics(1) or pyautogui.size()[1]
+            self.vw = self._user32.GetSystemMetrics(78) or win_input.size()[0]
+            self.vh = self._user32.GetSystemMetrics(79) or win_input.size()[1]
+            self.sw = self._user32.GetSystemMetrics(0) or win_input.size()[0]
+            self.sh = self._user32.GetSystemMetrics(1) or win_input.size()[1]
         else:
-            self.sw, self.sh = pyautogui.size()
+            self.sw, self.sh = 1920, 1080   # non-Windows: input is a no-op platform here
             self.vx, self.vy, self.vw, self.vh = 0, 0, self.sw, self.sh
 
         # Smoothing & Deadzone filters
@@ -168,7 +163,7 @@ class Controller:
         self.landmark_filter = OneEuroPoint(cfg.smooth_min_cutoff, cfg.smooth_beta)
 
         try:
-            cur_pos = pyautogui.position()
+            cur_pos = win_input.position()
             self.cur_x = float(cur_pos[0])
             self.cur_y = float(cur_pos[1])
         except Exception:
@@ -206,14 +201,48 @@ class Controller:
         self.dwell = DwellClicker(cfg)
         self.island_buttons = {}
 
-        # Decoupled 120+ Hz cursor update thread
+        # Decoupled 120+ Hz cursor update thread. It starts parked: it only runs (with the 1 ms system
+        # timer and HIGHEST thread priority) between set_active(True) and set_active(False), so an idle
+        # app (gestures/camera off) costs no wakeups.
         self._stop_thread = threading.Event()
+        self._run_evt = threading.Event()       # set while the loop should tick
+        self._parked_evt = threading.Event()    # set while the loop thread is parked (timer released)
+        self._parked_evt.set()
         self._thread = threading.Thread(target=self._cursor_loop, name="CursorLoop", daemon=True)
         self._thread.start()
         try:
             atexit.register(self.failsafe_release)
         except Exception:
             pass
+
+    def set_active(self, on: bool):
+        """Run (True) or park (False) the cursor loop. Tracker calls this when a camera session starts/ends.
+
+        True: re-syncs the loop's position to the real cursor (so it never snaps to a stale target), then
+        wakes the loop, which takes timeBeginPeriod(1) + THREAD_PRIORITY_HIGHEST.
+        False: parks the loop (which releases timeEndPeriod(1) and normal priority) and runs the
+        failsafe release (mouseUp + keyUp ctrl). Safe to call repeatedly from any thread."""
+        if on:
+            if self._run_evt.is_set() or self._stop_thread.is_set():
+                return
+            try:
+                px, py = win_input.position()
+                self.cur_x = self.target_x = float(px)
+                self.cur_y = self.target_y = float(py)
+            except Exception:
+                pass
+            self._parked_evt.clear()
+            self._run_evt.set()
+        else:
+            was = self._run_evt.is_set()
+            self._run_evt.clear()
+            if was and threading.current_thread() is not self._thread:
+                self._parked_evt.wait(1.0)   # loop has released the timer / priority
+            self.failsafe_release()
+
+    @property
+    def loop_running(self) -> bool:
+        return self._run_evt.is_set()
 
     def reload_config(self, cfg=None):
         """Live updates smoothing and deadzone parameters without restart."""
@@ -237,7 +266,7 @@ class Controller:
         if self._win:
             self._user32.SetCursorPos(int(x), int(y))          # fast native cursor positioning
         else:
-            pyautogui.moveTo(int(x), int(y), _pause=False)
+            win_input.move_to(x, y)
 
     def _reset_filters(self):
         self.fx.reset()
@@ -251,7 +280,7 @@ class Controller:
 
     def _release_ctrl(self):
         try:
-            pyautogui.keyUp("ctrl", _pause=False)
+            win_input.key_up("ctrl")
         except Exception:
             pass
         self.ctrl_down = False
@@ -259,7 +288,7 @@ class Controller:
     def failsafe_release(self):
         """Unconditional failsafe release of mouse buttons and modifier keys."""
         try:
-            pyautogui.mouseUp(_pause=False)
+            win_input.mouse_up()
         except Exception:
             pass
         self.button_down = False
@@ -268,7 +297,7 @@ class Controller:
         self.scroll_mode_active = False
 
         try:
-            pyautogui.keyUp("ctrl", _pause=False)
+            win_input.key_up("ctrl")
         except Exception:
             pass
         self.ctrl_down = False
@@ -292,35 +321,75 @@ class Controller:
         except Exception:
             pass
 
+    @staticmethod
+    def _acquire_boost():
+        """timeBeginPeriod(1) + THREAD_PRIORITY_HIGHEST for the calling (cursor) thread. Returns flags for release."""
+        timer_ok = prio_ok = False
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            timer_ok = True
+        except Exception:
+            pass
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentThread.restype = ctypes.c_void_p
+            k32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            k32.SetThreadPriority.restype = ctypes.c_bool
+            k32.SetThreadPriority(k32.GetCurrentThread(), 2)    # THREAD_PRIORITY_HIGHEST
+            prio_ok = True
+        except Exception:
+            pass
+        return timer_ok, prio_ok
+
+    @staticmethod
+    def _release_boost(prio_ok, timer_ok):
+        if prio_ok:
+            try:
+                k32 = ctypes.windll.kernel32
+                k32.GetCurrentThread.restype = ctypes.c_void_p
+                k32.SetThreadPriority(k32.GetCurrentThread(), 0)  # THREAD_PRIORITY_NORMAL
+            except Exception:
+                pass
+        if timer_ok:
+            try:
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
+
     def _cursor_loop(self):
-        """Dedicated high-frequency loop (120+ Hz) for smooth, decoupled cursor interpolation."""
+        """Dedicated high-frequency loop (120+ Hz). Parks on an Event while inactive."""
+        jarvis_log.thread_started("CursorLoop")
+        try:
+            while not self._stop_thread.is_set():
+                if not self._run_evt.is_set():
+                    self._parked_evt.set()
+                    self._run_evt.wait()      # blocks (no wakeups) until set_active(True) / shutdown()
+                    continue
+                self._cursor_loop_active()
+        except BaseException as e:
+            jarvis_log.thread_exited("CursorLoop", e)
+            raise
+        else:
+            jarvis_log.thread_exited("CursorLoop")
+
+    def _cursor_loop_active(self):
+        """One active period: runs until set_active(False) or shutdown. timeBeginPeriod/timeEndPeriod and
+        thread priority are strictly paired within this call."""
         rate = max(float(getattr(self.cfg, "cursor_rate_hz", 120)), 60.0)
         dt_target = 1.0 / (rate + 1.0)
         alpha = 1.0 - math.exp(-38.0 * dt_target)
 
+        timer_ok = prio_ok = False
         if self._win:
-            try:
-                ctypes.windll.winmm.timeBeginPeriod(1)
-            except Exception:
-                pass
-            try:
-                k32 = ctypes.windll.kernel32
-                k32.GetCurrentThread.restype = ctypes.c_void_p
-                k32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
-                k32.SetThreadPriority.restype = ctypes.c_bool
-                # THREAD_PRIORITY_HIGHEST = 2
-                k32.SetThreadPriority(k32.GetCurrentThread(), 2)
-            except Exception:
-                pass
+            timer_ok, prio_ok = self._acquire_boost()
 
         hr_timer = _HighResTimer.create() if self._win else None
-        jarvis_log.thread_started("CursorLoop")
         next_tick = time.perf_counter() + dt_target
         hb_t0 = time.perf_counter()
         hb_next = hb_t0 + 1.0
         hb_ticks = 0
         try:
-            while not self._stop_thread.is_set():
+            while not self._stop_thread.is_set() and self._run_evt.is_set():
                 # Smoothly interpolate towards target position
                 # Critically damped exponential approach
                 now_g = time.perf_counter()
@@ -393,36 +462,29 @@ class Controller:
                         self.target_y = self.cur_y
                         self.failsafe_release()
                     next_tick = now_after + dt_target
-        except BaseException as e:
-            jarvis_log.thread_exited("CursorLoop", e)
-            raise
-        else:
-            jarvis_log.thread_exited("CursorLoop")
         finally:
             if hr_timer is not None:
                 hr_timer.close()
             if self._win:
-                try:
-                    ctypes.windll.winmm.timeEndPeriod(1)
-                except Exception:
-                    pass
+                self._release_boost(prio_ok, timer_ok)
+            self._parked_evt.set()
 
     def _handle_dwell_action(self, act):
         if act == "click":
             btn = self.get_island_button_at(self.cur_x, self.cur_y)
             if btn:
                 self.trigger_island_button(btn)
-            pyautogui.click(_pause=False)
+            win_input.click()
         elif act == "double_click":
-            pyautogui.doubleClick(_pause=False)
+            win_input.double_click()
         elif act == "right_click":
-            pyautogui.rightClick(_pause=False)
+            win_input.right_click()
         elif act == "drag":
             if self.button_down:
-                pyautogui.mouseUp(_pause=False)
+                win_input.mouse_up()
                 self.button_down = False
             else:
-                pyautogui.mouseDown(_pause=False)
+                win_input.mouse_down()
                 self.button_down = True
         elif act == "scroll":
             self.scroll_mode_active = not self.scroll_mode_active
@@ -774,7 +836,7 @@ class Controller:
                 # In scroll mode, vertical motion scrolls instead of moves
                 if self.scroll_mode_active and abs(px_dy) > 4.0:
                     notch = 1 if px_dy < 0 else -1
-                    pyautogui.scroll(120 * notch, _pause=False)
+                    win_input.scroll(120 * notch)
                     self._glide_stop(now)
                     return
 
@@ -814,9 +876,9 @@ class Controller:
                 self.trigger_island_button(btn)
 
             if a.double:
-                pyautogui.doubleClick(_pause=False)
+                win_input.double_click()
             else:
-                pyautogui.click(_pause=False)
+                win_input.click()
 
             self.pinching = False
 
@@ -832,33 +894,33 @@ class Controller:
             self.island_page_step(a.n)
 
         elif k == "right_click":
-            pyautogui.rightClick(_pause=False)
+            win_input.right_click()
             self.pinching = False
 
         elif k == "drag_start":
             self._glide_stop(now, 0.15)
             self.pinching = True
             self.dragging = True
-            pyautogui.mouseDown(_pause=False)
+            win_input.mouse_down()
             self.button_down = True
 
         elif k == "drag_end":
             self.pinching = False
             self.dragging = False
-            pyautogui.mouseUp(_pause=False)
+            win_input.mouse_up()
             self.button_down = False
 
         elif k == "scroll":
-            pyautogui.scroll(120 * a.n, _pause=False)
+            win_input.scroll(120 * a.n)
 
         elif k == "zoom":
             if not self.ctrl_down:
                 try:
-                    pyautogui.keyDown("ctrl", _pause=False)
+                    win_input.key_down("ctrl")
                     self.ctrl_down = True
                 except Exception:
                     pass
-            pyautogui.scroll(120 * a.n, _pause=False)
+            win_input.scroll(120 * a.n)
 
         elif k == "activate":
             self.active = True
@@ -873,4 +935,8 @@ class Controller:
 
     def shutdown(self):
         self._stop_thread.set()
+        self._run_evt.set()     # wake a parked loop so it sees the stop flag (it exits before any timer boost)
+        if threading.current_thread() is not self._thread and self._thread.is_alive():
+            self._thread.join(1.0)
+        self._run_evt.clear()
         self.failsafe_release()

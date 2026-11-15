@@ -118,6 +118,14 @@ class SideEffectGuard:
             if not n.startswith("_") and isinstance(o, types.FunctionType):
                 patch_attr(pyautogui, n, self.rec("pyautogui." + n))
 
+        # win_input (SendInput wrapper used by controller): recorders too; reads return a fixed point/size
+        import win_input
+        for n in dir(win_input):
+            o = getattr(win_input, n, None)
+            if not n.startswith("_") and isinstance(o, types.FunctionType) and o.__module__ == "win_input":
+                ret = (lambda: (0, 0)) if n == "position" else ((lambda: (1920, 1080)) if n == "size" else None)
+                patch_attr(win_input, n, self.rec("win_input." + n, ret=ret))
+
         # system_control: every public function + the adapter factory
         import system_control
         for n, o in list(vars(system_control).items()):

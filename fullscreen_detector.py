@@ -21,6 +21,7 @@ Pure Python behind interfaces: 100% unit-testable with mocks; strictly NO Qt imp
 from __future__ import annotations
 
 import sys
+import time
 from typing import Callable, Optional
 
 # QUERY_USER_NOTIFICATION_STATE enum constants
@@ -71,6 +72,27 @@ class FullscreenDetector:
         """
         st = self.get_state()
         return st in (QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN)
+
+
+# States in which JARVIS should stay quiet (no wake chime, no unsolicited speech; see voice.py QUIET RULE).
+QUIET_STATES = (QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME)
+_QUIET_CACHE_S = 1.0
+_quiet_cache = (-1e9, False)
+
+
+def is_quiet(query_fn: Optional[Callable[[], int]] = None, now: Optional[float] = None) -> bool:
+    """True while a game / fullscreen app / presentation / Focus Assist (Do Not Disturb) is active.
+    Cheap: the shell is queried at most once per second (cached). Passing `query_fn` bypasses the cache."""
+    global _quiet_cache
+    if query_fn is not None:
+        return FullscreenDetector(query_fn).get_state() in QUIET_STATES
+    t = time.monotonic() if now is None else now
+    ts, val = _quiet_cache
+    if 0.0 <= t - ts < _QUIET_CACHE_S:
+        return val
+    val = get_fullscreen_detector().get_state() in QUIET_STATES
+    _quiet_cache = (t, val)
+    return val
 
 
 # Global singleton detector

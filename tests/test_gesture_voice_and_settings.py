@@ -810,7 +810,7 @@ class TestDynamicIslandGestureHooks(unittest.TestCase):
             for (bx, by), btn_name in buttons_tested:
                 ctrl.cur_x, ctrl.cur_y = float(bx), float(by)
                 mock_overlay.post.reset_mock()
-                with patch("pyautogui.click") as mock_click:
+                with patch("controller.win_input.click") as mock_click:
                     ctrl._handle_dwell_action("click")
                     mock_click.assert_called_once()
                     mock_overlay.post.assert_any_call("island_button_click", button=btn_name)
@@ -835,7 +835,7 @@ class TestDynamicIslandGestureHooks(unittest.TestCase):
             ctrl.target_x, ctrl.target_y = 290.0, 290.0
             ctrl.history.append(t0, 290.0, 290.0)
 
-            with patch("pyautogui.click") as mock_click, patch.object(ctrl, "_move") as mock_move:
+            with patch("controller.win_input.click") as mock_click, patch.object(ctrl, "_move") as mock_move:
                 ctrl.handle(Action("click"))
                 # Precision invariant verification: exactly 0 px pre-click drift
                 self.assertEqual(ctrl.cur_x, 230.0)

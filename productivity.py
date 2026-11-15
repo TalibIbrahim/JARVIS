@@ -23,10 +23,15 @@ import sys
 import threading
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
-try:
-    import pyautogui
-except ImportError:
-    pyautogui = None
+class _LazyPyAutoGUI:
+    """pyautogui pulls in cv2/numpy/Pillow (+11 MB, ~200 ms); import it on first real use."""
+
+    def __getattr__(self, name):
+        import pyautogui as _pag
+        return getattr(_pag, name)
+
+
+pyautogui = _LazyPyAutoGUI()
 
 
 # =====================================================================

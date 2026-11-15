@@ -86,6 +86,7 @@ def run_soak(
     engine = GestureEngine(cfg)
     engine.set_overlay(mock_overlay)
     controller = Controller(cfg, overlay=mock_overlay)
+    controller.set_active(True)   # cursor loop starts parked
     engine.controller = controller
 
     dec_engine = get_decision_engine()

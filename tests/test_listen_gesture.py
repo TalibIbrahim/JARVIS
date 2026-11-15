@@ -80,12 +80,12 @@ def _tracker_dispatch_loop():
     import inspect
     import textwrap
     import tracker
-    tree = ast.parse(textwrap.dedent(inspect.getsource(tracker.Tracker._session)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(tracker.Tracker._session_body)))
     for node in ast.walk(tree):
         if (isinstance(node, ast.For) and isinstance(node.iter, ast.Call)
                 and ast.unparse(node.iter.func) == "self.engine.update"):
             return compile(ast.Module(body=[node], type_ignores=[]), "tracker_loop", "exec")
-    raise AssertionError("dispatch loop not found in Tracker._session")
+    raise AssertionError("dispatch loop not found in Tracker._session_body")
 
 
 def _run_loop(actions, voice):

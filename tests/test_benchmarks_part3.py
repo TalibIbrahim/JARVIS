@@ -89,7 +89,7 @@ def test_gesture_controller_cursor_tick_p99_under_8ms():
 
     def measure():
         cfg = Config(control_scheme="palm_fist")
-        with mock.patch.object(controller_mod, "pyautogui", mock.MagicMock()), \
+        with mock.patch.object(controller_mod, "win_input", mock.MagicMock()), \
                 mock.patch("system_control.get_foreground_window_title", lambda: "win", create=True), \
                 mock.patch("system_control.volume_up", lambda steps=1: 55, create=True), \
                 mock.patch("system_control.volume_down", lambda steps=1: 45, create=True):

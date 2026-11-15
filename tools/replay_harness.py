@@ -534,6 +534,7 @@ def evaluate_gesture_precision_invariant(
     cfg.cursor_lookback_ms = lookback_ms
 
     ctrl = Controller(cfg)
+    ctrl.set_active(True)   # the cursor loop starts parked
     ctrl._move = unittest.mock.MagicMock()
     ctrl._handle_dwell_action = unittest.mock.MagicMock()
 
@@ -645,6 +646,7 @@ def evaluate_cursor_engine_frequency(
     cfg = Config()
     cfg.cursor_rate_hz = target_hz
     ctrl = Controller(cfg)
+    ctrl.set_active(True)   # the cursor loop starts parked
 
     # Let thread warm up
     time.sleep(0.1)
