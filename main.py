@@ -50,6 +50,12 @@ class Context:
         self._assist_lock = threading.Lock()
         self._assist = {"listening_until": 0.0, "thinking_until": 0.0, "speaking_until": 0.0,
                         "last_command": "", "last_result": ""}
+        # Efficiency governor (eco_qos) and system pause (lock/sleep) bookkeeping.
+        self.eco = None
+        self.background = False
+        self._sys_lock = threading.Lock()
+        self._sys_pause_reasons = set()
+        self._gesture_before_pause = False
 
     # ---- visible island page (GUI thread calls this) ----
     def set_visible_page(self, page):
@@ -91,6 +97,7 @@ class Context:
         puts the engine in standby. Safe to call from any thread."""
         on = bool(on)
         _jlog.get_logger("main").info("gesture mode %s", "on" if on else "off")
+        self._eco_busy("camera", on)
         tr = self.tracker
         if tr is not None and hasattr(tr, "set_camera_wanted"):
             tr.set_camera_wanted(on)
@@ -114,9 +121,90 @@ class Context:
     def gesture_mode_auto_off(self):
         """Called by the Tracker when the idle timeout turned the camera off: quiet notice, no speech."""
         _jlog.get_logger("main").info("gesture mode off (idle timeout)")
+        self._eco_busy("camera", False)
         self.engine.request(False)
         self.overlay.post("gesture_mode", on=False, auto=True)
         self.overlay.post("say", text="Camera off (idle).", speak=False)
+
+    # ---- efficiency governor feed ----
+    def _eco_busy(self, reason, busy):
+        eco = self.eco
+        if eco is not None:
+            eco.set_busy(reason, busy)
+
+    def _eco_activity(self):
+        eco = self.eco
+        if eco is not None:
+            eco.activity()
+
+    # ---- lock / sleep / device events (called from the win_events thread; non-blocking) ----
+    def system_pause(self, reason):
+        """Lock or suspend: pause voice, camera and cursor control, remembering gesture mode."""
+        log = _jlog.get_logger("main")
+        with self._sys_lock:
+            first = not self._sys_pause_reasons
+            self._sys_pause_reasons.add(reason)
+            if not first:
+                return
+            was_on = self.gesture_mode_on()
+            self._gesture_before_pause = was_on
+        log.info("system pause (%s); gesture mode was %s", reason, "on" if was_on else "off")
+        voice = self.voice
+        fn = getattr(voice, "set_suspended", None)
+        if fn is not None:
+            fn(True)
+        tr = self.tracker
+        if tr is not None and hasattr(tr, "set_camera_wanted"):
+            tr.set_camera_wanted(False)
+        self.engine.request(False)
+        fn = getattr(self.controller, "set_active", None)
+        if fn is not None:
+            fn(False)
+        self._eco_busy("camera", False)
+
+    def system_resume(self, reason, reopen_devices=False):
+        """Unlock or resume: undo system_pause once every pause reason is cleared."""
+        log = _jlog.get_logger("main")
+        with self._sys_lock:
+            self._sys_pause_reasons.discard(reason)
+            if self._sys_pause_reasons:
+                return
+            restore = self._gesture_before_pause
+            self._gesture_before_pause = False
+        log.info("system resume (%s); restoring gesture mode=%s", reason, restore)
+        voice = self.voice
+        fn = getattr(voice, "set_suspended", None)
+        if fn is not None:
+            fn(False)
+        if reopen_devices:
+            self.reopen_voice_devices()
+        fn = getattr(self.controller, "set_active", None)
+        if fn is not None:
+            fn(True)
+        if restore:
+            tr = self.tracker
+            if tr is not None and hasattr(tr, "set_camera_wanted"):
+                tr.set_camera_wanted(True)
+            self.engine.request(True)
+            self.overlay.post("gesture_mode", on=True, auto=True)
+            self._eco_busy("camera", True)
+        self._eco_activity()
+
+    def reopen_voice_devices(self):
+        fn = getattr(self.voice, "reopen_devices", None)
+        if fn is not None:
+            fn()
+
+    def devices_changed(self):
+        with self._sys_lock:
+            if self._sys_pause_reasons:
+                return      # resume will reopen devices
+        _jlog.get_logger("main").info("audio/camera devices changed; reopening")
+        self.reopen_voice_devices()
+        if self.gesture_mode_on():
+            fn = getattr(self.tracker, "reopen_camera", None)
+            if fn is not None:
+                fn()
 
     def is_tracking_paused(self):
         pending = getattr(self.engine, "_req", None)
@@ -137,6 +225,10 @@ class Context:
         ov.post = _post
 
     def _note_event(self, kind, d):
+        if kind in ("listening", "wake_detected", "live_speech", "prompt", "action_executed") or (
+                kind == "thinking" and d.get("active", True)) or (
+                kind == "say" and d.get("speak", True)):
+            self._eco_activity()
         now = time.monotonic()
         with self._assist_lock:
             a = self._assist
@@ -647,6 +739,8 @@ def main():
     _enable_dpi_awareness()
     parser = argparse.ArgumentParser(description="J.A.R.V.I.S. gesture control")
     parser.add_argument("--preview", action="store_true", help="show the camera HUD window")
+    parser.add_argument("--background", action="store_true",
+                        help="started at login: no welcome speech or popups; island as normal")
     parser.add_argument("--no-voice", action="store_true", help="disable voice commands")
     parser.add_argument("--camera", type=int, default=None, help="camera index (default 0)")
     parser.add_argument("--diagnose", action="store_true", help="run diagnostic jitter, latency, and precision measurement")
@@ -730,6 +824,7 @@ def main():
     ctx = Context(engine, overlay, None, stop, cfg=cfg)   # speaker/controller/tracker/voice are None until workers start
     overlay.ctx = ctx
     ctx.observe_overlay(overlay)
+    ctx.background = bool(args.background)
 
     from thread_supervisor import ThreadSupervisor, explain_graceful_degradation
     supervisor = ThreadSupervisor(stop_event=stop)
@@ -985,21 +1080,29 @@ def main():
             else:
                 engine.request(True)
 
-        # Global hotkeys: Ctrl+Alt+J toggles wake/standby, Ctrl+Alt+Q quits.
-        try:
-            from pynput import keyboard
-            hotkeys = keyboard.GlobalHotKeys({
-                "<ctrl>+<alt>+j": _hotkey_gesture_toggle,
-                "<ctrl>+<alt>+q": stop.set,
-            })
-            hotkeys.daemon = True
-            hotkeys.start()
-        except Exception as exc:
-            print(f"[hotkeys] unavailable: {exc}")
+        # Efficiency mode: governor is fed by overlay events (voice/commands) and gesture mode.
+        from eco_qos import EfficiencyGovernor
+        ctx.eco = EfficiencyGovernor(idle_after=10.0)
+        ctx.eco.set_busy("camera", ctx.gesture_mode_on())
+
+        # Native Windows events: hotkeys (no keyboard hook), lock/sleep, device changes.
+        from win_events import WinEvents
+        win_events = WinEvents(
+            on_toggle=_hotkey_gesture_toggle,
+            on_quit=stop.set,
+            on_suspend=lambda: ctx.system_pause("suspend"),
+            on_resume=lambda: ctx.system_resume("suspend", reopen_devices=True),
+            on_lock=lambda: ctx.system_pause("lock"),
+            on_unlock=lambda: ctx.system_resume("lock"),
+            on_devices_changed=ctx.devices_changed,
+        )
+        ctx.win_events = win_events
+        win_events.start()
 
         hour = datetime.datetime.now().hour
         part = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
-        ctx.say(f"{part}, sir. Jarvis is standing by. Raise your palm to wake me.")
+        if not ctx.background:
+            ctx.say(f"{part}, sir. Jarvis is standing by. Raise your palm to wake me.")
 
     _start_workers_after_first_frame(_start_workers)
     warm_first_use_imports(stop)
@@ -1011,6 +1114,13 @@ def main():
         pass
     finally:
         stop.set()
+        for _name in ("win_events", "eco"):
+            _obj = getattr(ctx, _name, None)
+            try:
+                if _obj is not None:
+                    _obj.stop()
+            except Exception:
+                _jlog.get_logger("main").exception("%s stop failed", _name)
         supervisor.stop(timeout=2)
         try:
             if hardware_feed is not None:
