@@ -725,11 +725,26 @@ def _answer_load_locked() -> None:
         pass
 
 
+def _answer_key(question: str) -> str:
+    """Normalized question, namespaced by the profile signature (name + address) so an answer that says
+    'sir' is never served to a user addressed differently. Empty signature (default) leaves the key unchanged."""
+    key = normalize_question(question)
+    try:
+        import personal
+        sig = personal.profile_signature()
+    except Exception:
+        __import__("jarvis_log").get_logger("ai").exception("profile signature unavailable; not caching")
+        return ""
+    return f"{sig}|{key}" if sig else key
+
+
 def answer_cache_get(question: str) -> Optional[str]:
     """Cached answer for a cacheable question, or None (also None for anything context-dependent)."""
     if not is_cacheable_question(question):
         return None
-    key = normalize_question(question)
+    key = _answer_key(question)
+    if not key:
+        return None
     with _ANSWER_LOCK:
         _answer_load_locked()
         hit = _ANSWER_CACHE.get(key)
@@ -749,7 +764,9 @@ def answer_cache_put(question: str, answer: str) -> bool:
     answer = str(answer or "").strip()
     if not answer or not is_cacheable_question(question):
         return False
-    key = normalize_question(question)
+    key = _answer_key(question)
+    if not key:
+        return False
     ttl = ANSWER_TTL_FACTUAL if _RE_Q_FACTUAL.match(key) else ANSWER_TTL_DEFAULT
     with _ANSWER_LOCK:
         _answer_load_locked()
@@ -1413,6 +1430,13 @@ def build_system_prompt(ctx: Any = None) -> str:
         except Exception:
             pass
 
+    _address, _profile_ctx = "sir", ""
+    try:
+        import personal
+        _address, _profile_ctx = personal.address_word(), personal.profile_prompt()
+    except Exception:
+        __import__("jarvis_log").get_logger("ai").exception("profile context unavailable for the system prompt")
+
     prompt = (
         "You are J.A.R.V.I.S., Tony Stark's sophisticated, highly intelligent desktop AI assistant from Iron Man.\n"
         f"Current system state: local time is {now_str}, hand tracking is {state_desc}, "
@@ -1421,7 +1445,7 @@ def build_system_prompt(ctx: Any = None) -> str:
         f"hardware power is {power_info}, physical memory is {mem_info}.\n\n"
         "Instructions:\n"
         "1. Persona: Speak like Paul Bettany's J.A.R.V.I.S.: impeccably polite, dry British wit, dignified, fiercely loyal, and brilliant.\n"
-        "2. Address the user respectfully as 'sir'. Do NOT call the user 'Mr. Stark' or 'Tony'.\n"
+        f"2. Address the user respectfully as '{_address}'. Do NOT call the user 'Mr. Stark' or 'Tony'.\n"
         "3. Keep your spoken reply to 1-2 spoken sentences maximum so voice synthesis sounds snappy.\n"
         "4. When answering questions (science, coding, engineering, trivia, general life), give sharp, witty, accurate answers with subtle Stark Industries elegance.\n"
         "5. You must respond ONLY with a valid JSON object matching this exact schema:\n"
@@ -1482,6 +1506,8 @@ def build_system_prompt(ctx: Any = None) -> str:
         "   - 'restart_system' (args: {'confirmed': true | false})\n"
         "7. Never output markdown fences (do not output ```json). Output raw JSON only."
     )
+    if _profile_ctx:
+        prompt += "\nWhat you know about the user (use naturally, never recite it): " + _profile_ctx
     return prompt
 
 
@@ -1828,10 +1854,10 @@ def _execute_whitelisted_action_impl(action: str, args: Dict[str, Any], ctx: Any
             return False, f"Site '{site_req}' not in whitelist"
 
         elif action == "search":
-            import webbrowser
             query = str(args.get("query", "")).strip()
             if query:
-                webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(query))
+                from commands import open_web_url, web_search_url
+                open_web_url(web_search_url(query))
                 return True, f"Searched for {query}"
             return False, "Empty search query"
 

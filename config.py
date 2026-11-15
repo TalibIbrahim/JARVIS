@@ -96,6 +96,7 @@ class Config:
     voice_enabled: bool = True
     speak: bool = True                  # spoken replies
     tts_engine: str = "piper"           # "piper" (Paul Bettany MCU) or "system" (pyttsx3 SAPI5)
+    tts_voice: str = "jarvis"           # voice_models registry id used when tts_engine is "piper" (optional download)
     tts_model_path: str = "models/voice/jarvis-medium.onnx" # local Piper voice model
     wake_word: str = "jarvis"
     config_version: int = 5            # bumped by one-time migrations in load_config (2: prune risky wake aliases; 3: island key unification; 4: glass; 5: camera/voice responsiveness)
@@ -171,6 +172,8 @@ class Config:
     # canonical keys (Phase 3 unification; old keys above kept as deprecated aliases)
     island_clock_format: str = "auto"              # "auto", "12h", "24h"
     island_idle_display: str = "time_weather"      # "off", "time", "time_weather"
+    island_surface: str = "gradient"   # "gradient" (default), "near_black", "black", "white"; media album-art tint always wins
+    island_hidden: bool = False         # Hide Jarvis: island only appears while listening/answering (Ctrl+Alt+H)
     island_show_now_playing: bool = True           # media takes over the compact pill while playing
     island_show_weather: bool = True               # weather in the compact pill
     island_weather_city: str = "New York"          # city name or "auto"
@@ -184,6 +187,13 @@ class Config:
 
     # --- updates ---
     auto_update_check: bool = True      # automatically check for GitHub releases on startup
+
+    # --- personalization (all stored locally under %LOCALAPPDATA%\JARVIS\profile) ---
+    onboarding_done: bool = False       # first-run intro + questions completed (or skipped)
+    learn_profile: bool = True          # remember name, preferences, apps and games
+    learn_corrections: bool = True      # remember "no, I said X" fixes and bias recognition toward your words
+    learn_voice_clips: bool = True      # keep short command clips + transcripts for accent adaptation
+    learn_habits: bool = True           # remember what you ask and when, for suggestions
 
     # --- ai / groq intelligence ---
     ai_enabled: bool = False
@@ -605,6 +615,9 @@ def load_config(path=None):
             cfg.glass_transparency = clamped
             migrated = True
 
+    if cfg.island_surface not in ("gradient", "near_black", "black", "white"):
+        cfg.island_surface = "gradient"
+        migrated = True
     if cfg.island_idle_display not in ("off", "time", "time_weather"):
         import jarvis_log
         jarvis_log.get_logger("config").info("island_idle_display %r -> time_weather", cfg.island_idle_display)

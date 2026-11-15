@@ -11,6 +11,7 @@ import webbrowser
 from typing import Any, Dict, List, Optional, Tuple
 
 import jarvis_log as _jl
+import personal
 from ai import (
     get_api_key,
     GroqClient,
@@ -579,6 +580,17 @@ def _camera_frame(ctx):
     return None
 
 
+def _log_habit(ctx, action: str, text: str = "") -> None:
+    """Feed the local habits log (no-op unless learn_habits is on). Never raises into the command path."""
+    utt = text or getattr(ctx, "_current_utterance", "")
+    if not isinstance(utt, str) or not utt:
+        utt = action.replace("_", " ")
+    try:
+        personal.log_command(utt, action)
+    except Exception:
+        _jl.get_logger("commands").exception("habit logging failed")
+
+
 def _post_action(ctx, action: str, success: bool = True, args: Optional[dict] = None, text: str = ""):
     """Notifies overlay that a command or action has completed to trigger RESULT card."""
     _caller = sys._getframe(1).f_code.co_name  # stage logging: which tier resolved this action
@@ -587,6 +599,8 @@ def _post_action(ctx, action: str, success: bool = True, args: Optional[dict] = 
     elif _caller == "_run_single_command":
         _jl.utterance_event(_jl.DECISION, tier="regex", intent=action)
     _jl.utterance_event(_jl.RESULT, action=action, ok=success)
+    if success and action and action != "none":
+        _log_habit(ctx, action, text)
     if ctx and hasattr(ctx, "overlay") and ctx.overlay:
         try:
             ctx.overlay.post("action_executed", action=action, success=success)
@@ -726,6 +740,8 @@ def handle_island_voice_command(text: str, ctx: Any = None) -> Optional[str]:
 
     # 7. Show jarvis / jarvis page
     if clean_t in ("show jarvis", "jarvis page", "jarvis card") or _any(clean_t, "show jarvis", "jarvis page", "jarvis card"):
+        if clean_t.startswith("show jarvis") and getattr(ctx, "is_hidden", None) and ctx.is_hidden() is True:
+            _set_hidden(ctx, False)
         _post("island_show_page", page="jarvis")
         _post_action(ctx, "island_show_page", True, args={"page": "jarvis"}, text=text)
         return "Displaying Jarvis assistant card, sir."
@@ -745,9 +761,197 @@ def handle_island_voice_command(text: str, ctx: Any = None) -> Optional[str]:
     return None
 
 
+# --- personal intents (learning from the user) ------------------------------------------
+_PREV_UTTERANCE = {"text": "", "at": 0.0}
+_CORRECTION_WINDOW_S = 120.0
+_RE_WAKE_LEAD = re.compile(r"^(?:(?:hey|ok|okay)\s+)?jarvis\b[\s,.:;!?-]*", re.I)
+_RE_CORRECTION = re.compile(
+    r"^(?:(?:no|nope|nah|wrong|not that|that'?s wrong|that is wrong|that'?s not right|that is not right|"
+    r"that'?s not what i said)\b[\s,.:;!?-]*)?"
+    r"(?:i said|i meant|i mean|i was saying|what i said was|it'?s|it is)\s+(.+)$", re.I)
+_RE_CALL_ME = re.compile(r"^(?:please\s+)?(?:call me|my name is|my name'?s)\s+(.+)$", re.I)
+_RE_REMEMBER = re.compile(
+    r"^(?:please\s+)?(?:remember|note|keep in mind)(?:\s+that)?\s+(?:i|my)\s+"
+    r"(like|love|enjoy|use|play|prefer|favou?rite browser is|browser is|search engine is|favou?rite search engine is)\s+(.+)$",
+    re.I)
+_RE_HIDE = re.compile(r"^(?:please\s+)?(?:hide|conceal)\s+(?:yourself|jarvis)$", re.I)
+_RE_SHOW = re.compile(r"^(?:please\s+)?(?:show\s+yourself|come\s+back|unhide(?:\s+yourself|\s+jarvis)?|un-hide)$", re.I)
+_BROWSERS = {"chrome": "chrome", "google chrome": "chrome", "edge": "edge", "microsoft edge": "edge",
+             "firefox": "firefox", "brave": "brave", "opera": "opera"}
+_SEARCH_ENGINES = {"google": "google", "bing": "bing", "duckduckgo": "duckduckgo", "duck duck go": "duckduckgo"}
+
+
+def _remember_utterance(text: str) -> None:
+    _PREV_UTTERANCE["text"], _PREV_UTTERANCE["at"] = str(text or ""), time.time()
+
+
+def correction_pairs(prev: str, meant: str, max_words: int = 3) -> List[Tuple[str, str]]:
+    """Diff the previous utterance against what the user says they meant; returns [(heard, meant), ...] for
+    each replaced span (at most max_words words on either side). Pure."""
+    import difflib
+    a = re.findall(r"[\w']+", str(prev or "").lower())
+    b = re.findall(r"[\w']+", str(meant or "").lower())
+    if not a or not b:
+        return []
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    if sm.ratio() < 0.3:
+        return []
+    pairs = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "replace" or (j2 - j1) > max_words:
+            continue
+        if (i2 - i1) > (j2 - j1):
+            # The user restated only part of the phrase: keep the heard words that best match what they said.
+            n = j2 - j1
+            def _score(k):
+                return sum(difflib.SequenceMatcher(None, a[k + x], b[j1 + x]).ratio() for x in range(n))
+            k = max(range(i1, i2 - n + 1), key=_score)
+            i1, i2 = k, k + n
+        if (i2 - i1) <= max_words:
+            pairs.append((" ".join(a[i1:i2]), " ".join(b[j1:j2])))
+    return pairs
+
+
+def _apply_pairs(prev: str, pairs) -> str:
+    out = prev
+    for heard, meant in pairs:
+        out = re.sub(r"(?<!\w)" + re.escape(heard).replace(r"\ ", r"\s+") + r"(?!\w)",
+                     lambda _m, _x=meant: _x, out, flags=re.I)
+    return out
+
+
+def _set_hidden(ctx, on: bool) -> None:
+    if hasattr(ctx, "set_hidden"):
+        ctx.set_hidden(on)
+    elif ctx is not None and getattr(ctx, "overlay", None) is not None:
+        ctx.overlay.post("hidden", on=on)
+
+
+def _handle_correction(meant: str, ctx) -> str:
+    prev, at = _PREV_UTTERANCE["text"], _PREV_UTTERANCE["at"]
+    meant = meant.strip(" ,.!?")
+    if not prev or time.time() - at > _CORRECTION_WINDOW_S or not meant:
+        _post_action(ctx, "correction", False, text=meant)
+        return "I don't have anything to correct, sir."
+    pairs = correction_pairs(prev, meant)
+    _PREV_UTTERANCE["text"] = ""          # a correction never chains into another correction
+    learned = sum(1 for heard, fixed in pairs if personal.add_correction(heard, fixed))
+    _post_action(ctx, "correction", True, args={"pairs": len(pairs)}, text=meant)
+    redo = _apply_pairs(prev, pairs) if pairs else meant
+    reply = run_command(redo, ctx)
+    if reply:
+        return reply
+    return "Noted, sir." if learned else "Understood, sir."
+
+
+def _handle_call_me(name: str, ctx) -> str:
+    name = " ".join(name.strip(" ,.!?").split())
+    low = name.lower()
+    if low in ("sir", "ma'am", "madam", "maam"):
+        said = "sir" if low == "sir" else "ma'am"
+        fields = {"address_as": said}
+    elif low in ("by my name", "by name"):
+        fields, said = {"address_as": "name"}, "by name"
+    elif 0 < len(name) <= 30 and len(name.split()) <= 3:
+        said = name.title() if name.islower() else name
+        fields = {"name": said}
+    else:
+        _post_action(ctx, "set_name", False, text=name)
+        return "I didn't catch the name, sir."
+    ok = personal.update_profile(**fields)
+    _post_action(ctx, "set_name", ok, text=name)
+    if not ok:
+        return "Learning your profile is switched off in Settings, sir."
+    return f"Very well, I'll call you {said}."
+
+
+def _handle_remember(verb: str, what: str, ctx) -> str:
+    verb, what = verb.lower(), what.strip(" ,.!?")
+    if not what or len(what) > 60:
+        _post_action(ctx, "remember", False, text=what)
+        return "I didn't catch that, sir."
+    if "browser" in verb:
+        b = _BROWSERS.get(what.lower())
+        ok = bool(b) and personal.update_profile(browser=b)
+    elif "search engine" in verb:
+        e = _SEARCH_ENGINES.get(what.lower())
+        ok = bool(e) and personal.update_profile(search_engine=e)
+    elif verb == "play":
+        ok = personal.add_to_profile("games", what)
+    elif verb == "use":
+        ok = personal.add_to_profile("favorite_apps", what)
+    else:
+        ok = personal.add_to_profile("uses", what)
+    _post_action(ctx, "remember", bool(ok), text=what)
+    if not ok:
+        return "I couldn't save that, sir. Learning may be off in Settings."
+    return f"Noted, sir. I'll remember {what}."
+
+
+def handle_personal_intent(text: str, ctx) -> Optional[str]:
+    """Corrections, profile statements and hide/show. Returns the reply, or None if the text is none of those."""
+    t = _RE_WAKE_LEAD.sub("", " ".join(str(text or "").split()), count=1).strip(" ,.!?")
+    if not t or len(t) > 200:
+        return None
+    if _RE_HIDE.match(t):
+        _set_hidden(ctx, True)
+        _post_action(ctx, "hide", True, text=t)
+        return "Hiding, sir. Say show yourself to bring me back."
+    if _RE_SHOW.match(t):
+        _set_hidden(ctx, False)
+        _post_action(ctx, "show", True, text=t)
+        return "Back on screen, sir."
+    m = _RE_CALL_ME.match(t)
+    if m:
+        return _handle_call_me(m.group(1), ctx)
+    m = _RE_REMEMBER.match(t)
+    if m:
+        return _handle_remember(m.group(1), m.group(2), ctx)
+    m = _RE_CORRECTION.match(t)
+    if m:
+        # Bare "it's X" / "it is X" is ordinary speech; only treat it as a correction with an explicit "no".
+        if re.match(r"^(?:it'?s|it is)\b", t, re.I):
+            return None
+        return _handle_correction(m.group(1), ctx)
+    return None
+
+
+def web_search_url(query: str) -> str:
+    """Search URL on the user's preferred engine (profile), Google by default."""
+    q = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", str(query)).split())
+    engine = ""
+    try:
+        engine = personal.get_profile().get("search_engine", "") if personal.flag("profile") else ""
+    except Exception:
+        _jl.get_logger("commands").exception("profile read failed")
+    tmpl = SITE_SEARCH_URL.get(engine) or SITE_SEARCH_URL["google"]
+    return tmpl.format(q=urllib.parse.quote_plus(q))
+
+
+_BROWSER_EXE = {"chrome": "chrome", "edge": "msedge", "firefox": "firefox", "brave": "brave", "opera": "opera"}
+
+
+def open_web_url(url: str) -> None:
+    """Open a URL in the user's favorite browser (profile) or the system default."""
+    exe = ""
+    if personal.flag("profile"):
+        exe = _BROWSER_EXE.get(personal.get_profile().get("browser", ""), "")
+    if exe and sys.platform == "win32":
+        subprocess.Popen(["cmd.exe", "/c", "start", "", exe, url])
+        return
+    webbrowser.open(url)
+
+
 def run_command(text, ctx):
+
     """Returns the reply Jarvis should speak, or None if nothing matched."""
     text = cap_utterance(text)
+    # Personal intents: corrections ("no, I said ..."), "call me ...", "remember that I ...", hide/show.
+    personal_reply = handle_personal_intent(text, ctx)
+    if personal_reply is not None:
+        return personal_reply
+    _remember_utterance(text)
+    text = personal.apply_corrections(text)
     # 0. Check chained / compound commands (e.g. 'volume up and maximize window')
     try:
         import chained_commands
@@ -1257,7 +1461,7 @@ def _run_single_command(text, ctx):
     m = re.match(r"(?:search(?: for)?|google|look up)\s+(.+)", clean_t)
     if m:
         _q = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", m.group(1)).split())
-        webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(_q))
+        open_web_url(web_search_url(_q))
         _post_action(ctx, "search", True, args={"query": m.group(1).strip()}, text=text)
         return f"Searching for {m.group(1).strip()}."
 

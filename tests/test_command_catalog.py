@@ -170,6 +170,7 @@ def test_voice_example_routes_to_declared_action(env, spec, example):
     e.CALLS.clear()
     e.groq_used.clear()
     e.commands._PENDING_CONFIRMATION = None
+    e.commands._PREV_UTTERANCE.update(text="", at=0.0)
     e.context_resolver.reset_context()
     e.productivity.set_dictation_mode(False)
     e.sch.reset_mock()

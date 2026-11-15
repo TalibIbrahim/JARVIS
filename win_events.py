@@ -1,7 +1,7 @@
 """Native Windows event sink: hotkeys, power, session lock and device changes.
 
 A hidden message-only window runs on its own daemon thread with a GetMessage loop.
-  - RegisterHotKey (Ctrl+Alt+J / Ctrl+Alt+Q, MOD_NOREPEAT): no global keyboard hook.
+  - RegisterHotKey (Ctrl+Alt+J / Q / H / Space, MOD_NOREPEAT): no global keyboard hook.
   - WM_POWERBROADCAST: suspend / resume.
   - WTSRegisterSessionNotification + WM_WTSSESSION_CHANGE: lock / unlock.
   - RegisterDeviceNotification (audio + camera interface classes) + WM_DEVICECHANGE: debounced
@@ -44,9 +44,20 @@ MOD_CONTROL = 0x0002
 MOD_NOREPEAT = 0x4000
 VK_J = 0x4A
 VK_Q = 0x51
+VK_H = 0x48
+VK_SPACE = 0x20
 
 HOTKEY_TOGGLE = 1
 HOTKEY_QUIT = 2
+HOTKEY_HIDE = 3
+HOTKEY_ASK = 4
+# (id, virtual key, label, WinEvents callback attribute)
+HOTKEYS = (
+    (HOTKEY_TOGGLE, VK_J, "Ctrl+Alt+J", "on_toggle"),
+    (HOTKEY_QUIT, VK_Q, "Ctrl+Alt+Q", "on_quit"),
+    (HOTKEY_HIDE, VK_H, "Ctrl+Alt+H", "on_hide"),
+    (HOTKEY_ASK, VK_SPACE, "Ctrl+Alt+Space", "on_ask"),
+)
 
 HWND_MESSAGE = -3
 
@@ -90,9 +101,12 @@ class WinEvents:
     """Message-only window + hotkeys. Construct, then start(); stop() is idempotent."""
 
     def __init__(self, on_toggle=None, on_quit=None, on_suspend=None, on_resume=None,
-                 on_lock=None, on_unlock=None, on_devices_changed=None, debounce=1.0):
+                 on_lock=None, on_unlock=None, on_devices_changed=None, debounce=1.0,
+                 on_hide=None, on_ask=None):
         self.on_toggle = on_toggle
         self.on_quit = on_quit
+        self.on_hide = on_hide
+        self.on_ask = on_ask
         self.on_suspend = on_suspend
         self.on_resume = on_resume
         self.on_lock = on_lock
@@ -125,10 +139,10 @@ class WinEvents:
     def handle_message(self, msg, wparam, lparam):
         """Map a window message to callbacks. Returns the LRESULT to hand back, or None for default handling."""
         if msg == WM_HOTKEY:
-            if wparam == HOTKEY_TOGGLE:
-                self._fire(self.on_toggle, "on_toggle")
-            elif wparam == HOTKEY_QUIT:
-                self._fire(self.on_quit, "on_quit")
+            for hid, _vk, _label, attr in HOTKEYS:
+                if wparam == hid:
+                    self._fire(getattr(self, attr), attr)
+                    break
             return 0
         if msg == WM_POWERBROADCAST:
             if wparam == PBT_APMSUSPEND:
@@ -298,7 +312,7 @@ class WinEvents:
 
     def _register_all(self, u32, hwnd):
         mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT
-        for hid, vk, label in ((HOTKEY_TOGGLE, VK_J, "Ctrl+Alt+J"), (HOTKEY_QUIT, VK_Q, "Ctrl+Alt+Q")):
+        for hid, vk, label, _attr in HOTKEYS:
             if u32.RegisterHotKey(hwnd, hid, mods, vk):
                 self._registered_hotkeys.append(hid)
             else:

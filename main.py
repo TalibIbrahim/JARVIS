@@ -53,9 +53,87 @@ class Context:
         # Efficiency governor (eco_qos) and system pause (lock/sleep) bookkeeping.
         self.eco = None
         self.background = False
+        import personal
+        self.personal = personal            # local profile/learning store (UI calls data_summary etc.)
+        self._submit_lock = threading.Lock()   # one typed/spoken-as-text command at a time
         self._sys_lock = threading.Lock()
         self._sys_pause_reasons = set()
         self._gesture_before_pause = False
+
+    # ---- text input, one-shot listen, hide/show, pages (UI entry points; thread-safe, non-blocking) ----
+    def submit_text(self, text):
+        """Run the command pipeline as if spoken: no STT, no wake word. Returns False for empty text.
+        Replies flow through the normal overlay events (prompt, thinking, say)."""
+        text = " ".join(str(text or "").split())
+        if not text:
+            return False
+        threading.Thread(target=self._run_submitted_text, args=(text,), name="SubmitText", daemon=True).start()
+        return True
+
+    def _run_submitted_text(self, text):
+        log = _jlog.get_logger("main")
+        with self._submit_lock:
+            self._eco_activity()
+            self.overlay.post("prompt", text=text, raw=text)
+            self.overlay.post("thinking", active=True, timeout=8.0)
+            try:
+                from commands import run_command
+                reply = run_command(text, self)
+                if reply:
+                    self.say(reply)
+            except Exception:
+                log.exception("submitted text command failed")
+                self.overlay.post("error", text="That command failed.")
+            finally:
+                self.overlay.post("thinking", active=False)
+
+    def listen_now(self):
+        """Immediate one-shot listen without the wake word. False if voice is unavailable or busy."""
+        v = self.voice
+        if v is None or not hasattr(v, "request_listen"):
+            _jlog.get_logger("main").info("listen_now: voice not available")
+            return False
+        return bool(v.request_listen("listen_now"))
+
+    def set_hidden(self, on):
+        """Hide Jarvis (island appears only while listening/answering). Persisted in cfg.island_hidden."""
+        on = bool(on)
+        if self.cfg is not None:
+            self.cfg.island_hidden = on
+            try:
+                import config as _config
+                _config.save_config(self.cfg)
+            except Exception:
+                _jlog.get_logger("main").exception("could not persist island_hidden")
+        _jlog.get_logger("main").info("island hidden=%s", on)
+        self.overlay.post("hidden", on=on)
+
+    def is_hidden(self):
+        return bool(getattr(self.cfg, "island_hidden", False))
+
+    def open_ask_page(self):
+        self.overlay.post("ask_page", focus=True)
+
+    def start_onboarding(self):
+        self.overlay.post("onboarding")
+
+    ISLAND_SURFACES = ("gradient", "near_black", "black", "white")
+
+    def set_island_surface(self, style):
+        """Validate, persist cfg.island_surface and tell the UI. Returns False for an unknown style."""
+        style = str(style or "").strip().lower()
+        if style not in self.ISLAND_SURFACES:
+            _jlog.get_logger("main").warning("ignored invalid island surface %r", style)
+            return False
+        if self.cfg is not None:
+            self.cfg.island_surface = style
+            try:
+                import config as _config
+                _config.save_config(self.cfg)
+            except Exception:
+                _jlog.get_logger("main").exception("could not persist island_surface")
+        self.overlay.post("island_surface", style=style)
+        return True
 
     # ---- visible island page (GUI thread calls this) ----
     def set_visible_page(self, page):
@@ -287,6 +365,7 @@ class Context:
             self.speaker.reload_config(self.cfg)
         if hasattr(self.voice, "reload_config"):
             self.voice.reload_config(self.cfg)
+        self.personal.configure(self.cfg)
         lf = getattr(self, "lyrics_feed", None)
         if lf is not None:
             lf.refresh()
@@ -626,6 +705,24 @@ def post_cached_weather(ctx, overlay):
     return True
 
 
+FIRST_RUN_ONBOARDING_DELAY_S = 1.5
+
+
+def schedule_first_run_onboarding(ctx, delay=FIRST_RUN_ONBOARDING_DELAY_S):
+    """Show onboarding once, shortly after the island first paints (not for --background starts).
+    Returns the waiter thread, or None when it is not needed."""
+    if getattr(ctx.cfg, "onboarding_done", False) or ctx.background:
+        return None
+
+    def _go():
+        if not ctx.stop.wait(delay):
+            ctx.start_onboarding()
+
+    t = threading.Thread(target=_go, name="OnboardingStart", daemon=True)
+    t.start()
+    return t
+
+
 def _start_workers_after_first_frame(fn):
     """Run fn on a background thread once the Qt loop has started (island painted); no Qt -> start immediately."""
     t = threading.Thread(target=fn, name="WorkerStartup", daemon=True)
@@ -804,6 +901,8 @@ def main():
     from overlay import Overlay
 
     cfg = load_config()
+    import personal
+    personal.configure(cfg)
     _jlog.set_debug_transcripts(getattr(cfg, "debug_log_transcripts", False))
     # CLI flags are runtime-only: mark them so a later whole-file save_config(cfg) never persists them.
     if args.preview:
@@ -1068,6 +1167,9 @@ def main():
             interval=1.0,
         )
 
+        def _hotkey_toggle_hidden():
+            ctx.set_hidden(not ctx.is_hidden())
+
         def _hotkey_gesture_toggle():
             if not ctx.gesture_mode_on():
                 ctx.set_gesture_mode(True)
@@ -1090,6 +1192,8 @@ def main():
         win_events = WinEvents(
             on_toggle=_hotkey_gesture_toggle,
             on_quit=stop.set,
+            on_hide=_hotkey_toggle_hidden,
+            on_ask=ctx.open_ask_page,
             on_suspend=lambda: ctx.system_pause("suspend"),
             on_resume=lambda: ctx.system_resume("suspend", reopen_devices=True),
             on_lock=lambda: ctx.system_pause("lock"),
@@ -1102,7 +1206,8 @@ def main():
         hour = datetime.datetime.now().hour
         part = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
         if not ctx.background:
-            ctx.say(f"{part}, sir. Jarvis is standing by. Raise your palm to wake me.")
+            ctx.say(f"{part}, {personal.address_word()}. Jarvis is standing by. Raise your palm to wake me.")
+        schedule_first_run_onboarding(ctx)
 
     _start_workers_after_first_frame(_start_workers)
     warm_first_use_imports(stop)

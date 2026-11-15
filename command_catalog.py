@@ -139,6 +139,9 @@ _CATALOG: List[CommandSpec] = [
        "Start the camera and hand-gesture control.", "gesture_mode"),
     _v("Island", "Gesture mode off", ("gesture mode off", "turn off the camera", "stop gesture control"),
        "Stop gesture control and release the camera.", "gesture_mode"),
+    _v("Island", "Hide Jarvis", ("hide yourself", "hide jarvis"),
+       "Hide the Island until you speak (Ctrl+Alt+H toggles).", "hide"),
+    _v("Island", "Show Jarvis", ("show yourself", "unhide"), "Bring the Island back.", "show"),
     _v("Island", "Pin the Island", ("pin the island", "unpin the island"),
        "Keep the Island open or release it.", "island_set_pin"),
 
@@ -170,6 +173,12 @@ _CATALOG: List[CommandSpec] = [
     _v("Assistant", "World time", ("what time is it in Tokyo",), "Time in another city.", "world_time"),
     _v("Assistant", "Wikipedia", ("wiki Nikola Tesla",), "Read a short Wikipedia summary.", "wiki"),
     _v("Assistant", "Small talk", ("hello", "who are you"), "Greetings and status.", "chatter"),
+    _v("Assistant", "Call me", ("call me Talib", "call me sir"),
+       "Tell Jarvis your name or how to address you.", "set_name"),
+    _v("Assistant", "Remember", ("remember that I play Elden Ring", "remember that I use Chrome"),
+       "Teach Jarvis your games, apps and interests (stored on this PC only).", "remember"),
+    _v("Assistant", "Correct a mistake", ("no, I said Elden Ring",),
+       "Fix a misheard word; Jarvis redoes the command and learns the correction.", "correction"),
 
     # ---------------------------------------------------------- AI & Vision
     _v("AI & Vision", "Ask anything", ("tell me a joke", "why is the sky blue"),
