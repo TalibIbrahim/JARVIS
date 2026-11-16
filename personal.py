@@ -537,6 +537,7 @@ def delete_voice_clips() -> int:
     with _lock:
         n = len(_load_clip_index())
         shutil.rmtree(_clips_dir(), ignore_errors=True)
+        shutil.rmtree(_path("wake"), ignore_errors=True)   # wake_trainer examples + personal wake verifier
         _clip_index = []
     return n
 

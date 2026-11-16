@@ -515,3 +515,17 @@ def test_overlay_onboarding_missing_window_is_logged_not_raised(overlay, capsys)
         overlay.post("onboarding")
         overlay._drain(time.time())
     assert "onboarding window unavailable" in capsys.readouterr().out
+
+
+def test_type_or_talk_page_present_at_startup(app):
+    """The page list comes from config when the island is built, not only after a Settings reload."""
+    isl = AppleDynamicIsland(DummyOverlayMgr(Config()))
+    assert isl.card_pages[-1] == "ask"
+    assert isl.card_pages[-2] == "jarvis"
+
+
+def test_type_or_talk_page_off_at_startup(app):
+    cfg = Config()
+    cfg.island_ask_page = False
+    isl = AppleDynamicIsland(DummyOverlayMgr(cfg))
+    assert "ask" not in isl.card_pages

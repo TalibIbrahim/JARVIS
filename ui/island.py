@@ -137,9 +137,11 @@ class AppleDynamicIsland(
 
         # Expanded card paging & pin open
         self.pin_open: bool = False
-        self.card_pages: list[str] = ["media", "time", "weather", "hardware", "jarvis"]
+        self.card_pages: list[str] = ["media", "time", "weather", "hardware", "jarvis", "ask"]
 
         cfg = getattr(self.mgr, "cfg", None) or getattr(self, "cfg", None)
+        if cfg:
+            self._apply_card_pages(cfg)   # at startup too, not only after a Settings change
         style_val = getattr(cfg, "island_shape_style", getattr(self.mgr, "shape_style", "pill")) if (cfg or self.mgr) else "pill"
         if hasattr(style_val, "value"):
             style_val = style_val.value
@@ -382,6 +384,23 @@ class AppleDynamicIsland(
             self._center_top()
             self.update()
 
+    def _apply_card_pages(self, cfg) -> None:
+        """card_pages from cfg.island_pages + island_pages_enabled, with Type or Talk appended last."""
+        pages = getattr(cfg, "island_pages", ["media", "calendar", "weather", "hardware", "jarvis"])
+        enabled_map = getattr(cfg, "island_pages_enabled", {})
+        active_pages = []
+        for p in pages:
+            canon = "time" if p == "calendar" else p
+            if enabled_map.get(p, True) and enabled_map.get(canon, True):
+                if canon not in active_pages:
+                    active_pages.append(canon)
+        # Type or Talk is the last page (cfg.island_ask_page, default on; island_pages_enabled["ask"] can turn it off)
+        if (bool(getattr(cfg, "island_ask_page", True)) and enabled_map.get("ask", True)
+                and "ask" not in active_pages and active_pages):
+            active_pages.append("ask")
+        if active_pages:
+            self.card_pages = active_pages
+
     def reload_config(self) -> None:
         """Live apply settings without restart."""
         self._dirty = True                      # repaint even if the paint gating would skip
@@ -409,20 +428,7 @@ class AppleDynamicIsland(
             self.pin_open = bool(getattr(cfg, "island_pin_open", self.pin_open))
             self._ly_cfg = (bool(getattr(cfg, "island_lyrics_enabled", False)),
                             bool(getattr(cfg, "island_lyrics_in_pill", True)))
-            pages = getattr(cfg, "island_pages", ["media", "calendar", "weather", "hardware", "jarvis"])
-            enabled_map = getattr(cfg, "island_pages_enabled", {})
-            active_pages = []
-            for p in pages:
-                canon = "time" if p == "calendar" else p
-                if enabled_map.get(p, True) and enabled_map.get(canon, True):
-                    if canon not in active_pages:
-                        active_pages.append(canon)
-            # Type or Talk is the last page (cfg.island_ask_page, default on; island_pages_enabled["ask"] can turn it off)
-            if (bool(getattr(cfg, "island_ask_page", True)) and enabled_map.get("ask", True)
-                    and "ask" not in active_pages and active_pages):
-                active_pages.append("ask")
-            if active_pages:
-                self.card_pages = active_pages
+            self._apply_card_pages(cfg)
 
             self.set_surface_style(getattr(cfg, "island_surface", "gradient"))
             want_hidden = bool(getattr(cfg, "island_hidden", False))

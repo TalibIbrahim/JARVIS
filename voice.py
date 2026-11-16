@@ -201,6 +201,8 @@ _WHISPER_NOISE_NORMALIZED = frozenset(_normalize_noise_text(p) for p in WHISPER_
 
 # A recording is dispatched only if it holds at least this many speech chunks (3 x 80 ms = 240 ms).
 MIN_SPEECH_CHUNKS = 3
+# Optional greeting before a wake alias at the start of a command ("Hey Jarvis, ...", "OK Jarvis ...").
+_WAKE_PREFIX_RE = r"(?:(?:hey|hi|ok|okay)[\s,]+)?"
 
 
 def _get_personal():
@@ -1569,9 +1571,20 @@ class WakeWordDetector(threading.Thread):
         on_speech_end=None,
         on_push_to_talk=None,
         on_push_to_talk_done=None,
+        on_partial_audio=None,
     ):
         super().__init__(name="WakeWordDetector", daemon=True)
         self.on_speech_end = on_speech_end
+        # callable(pcm16 bytes so far) during a command recording, then callable(None) when it ends
+        self.on_partial_audio = on_partial_audio
+        self._mid_wake_tail = None   # set when the wake word fires inside a passive recording
+        # Personal wake verifier (wake_trainer): learned from the user's voice, reloaded when retrained.
+        # on_wake_sample(pcm16 of the ~2 s up to the wake) is called after a wake that led to a command.
+        import wake_trainer
+        self._verifier = wake_trainer.VerifierHandle()
+        self._verify_floor = wake_trainer.VERIFY_FLOOR
+        self._wake_ring = collections.deque(maxlen=int(wake_trainer.CLIP_S * 16000 / 1280) + 1)
+        self.on_wake_sample = None
         self.on_push_to_talk = on_push_to_talk
         self.on_push_to_talk_done = on_push_to_talk_done
         self._ptt_event = threading.Event()   # set by request_listen(); consumed on this thread only
@@ -1682,6 +1695,14 @@ class WakeWordDetector(threading.Thread):
     PTT_TIMEOUT_NO_SPEECH_S = 5.0
     LISTEN_OFF_POLL_S = 0.25
     REOPEN_SETTLE_S = 0.75    # trailing-edge debounce: repeated reopen requests inside this window coalesce
+    # Command endpointing. After "Hey Jarvis" people pause before the command: until the command itself has
+    # COMMAND_GRACE_CHUNKS speech chunks, silence must last WAKE_PAUSE_GRACE_S to end the recording. Once the
+    # command is under way the user's pause setting applies, but never shorter than COMMAND_MIN_ENDPOINT_S.
+    WAKE_PAUSE_GRACE_S = 1.2
+    COMMAND_GRACE_CHUNKS = 5
+    COMMAND_MIN_ENDPOINT_S = 0.8
+    PARTIAL_INTERVAL_S = 0.6  # live transcript: audio-so-far handed to on_partial_audio this often
+    MID_WAKE_TAIL_CHUNKS = 2  # chunks kept from a passive recording when the wake word fires inside it
 
     def set_suspended(self, on: bool):
         """True: the loop closes the mic stream and does no wake/VAD/STT work until resumed.
@@ -1995,6 +2016,30 @@ class WakeWordDetector(threading.Thread):
         self.wake_predicts += 1
         return self.model.predict(arr).get("hey_jarvis", 0.0)
 
+    def _wake_score(self, arr, rms, aec_arr):
+        """"Hey Jarvis" score for this chunk (main + AEC path, personal verifier applied), also tracked for
+        diagnostics."""
+        self._wake_ring.append(arr.tobytes())
+        score = self._wake_predict(arr, self._is_quiet(rms, aec_arr))
+        if score >= self._verify_floor:
+            v = self._verifier.get()
+            if v is not None:
+                try:
+                    pre = self.model.preprocessor
+                    score = v.prob(pre.get_features(self.model.model_inputs["hey_jarvis"]))
+                except Exception as v_err:
+                    _vlog.warning("personal wake verifier failed (%r); using the stock score", v_err)
+        if aec_arr is not None and self._aec_model is not None:
+            # Dual path: the AEC path only ever adds a chance to hear the wake word.
+            score = max(score, self._aec_model.predict(aec_arr).get("hey_jarvis", 0.0))
+        self._recent_scores.append(float(score))
+        if score > self._st_max_score:
+            self._st_max_score = float(score)
+        return score
+
+    def _wake_watch_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "wake_word_enabled", True)) and self.model is not None
+
     def _init_model(self):
         try:
             _import_openwakeword_lean()
@@ -2051,12 +2096,22 @@ class WakeWordDetector(threading.Thread):
         If 5 s silence with no speech -> trigger no-speech callback, return None.
         A recording with fewer than MIN_SPEECH_CHUNKS speech chunks is dropped (insufficient_speech).
         pre_speech_chunks: speech chunks already counted by the caller (the chunk that triggered capture).
+        Passive ("vad") recordings keep feeding the wake model; if "Hey Jarvis" fires the recording is
+        abandoned (returns None) and self._mid_wake_tail holds its last chunks for the wake capture.
+        Command recordings (wake / follow-up / push-to-talk) stream audio-so-far to on_partial_audio.
         """
         self.is_recording = True
-        # The model hears nothing while recording: its next chunks are not contiguous with these.
-        self._quiet_run = 0
-        self._skip_ring.clear()
-        self._recent_scores.clear()
+        watch_wake = trigger == "vad" and not self._capture_active and self._wake_watch_enabled()
+        if not watch_wake:
+            # The model hears nothing while recording: its next chunks are not contiguous with these.
+            self._quiet_run = 0
+            self._skip_ring.clear()
+            self._recent_scores.clear()
+        self._mid_wake_tail = None
+        is_command_rec = trigger in ("wake", "followup", "push_to_talk")
+        adaptive_endpoint = silence_endpoint is None and is_command_rec
+        partial_cb = self.on_partial_audio if is_command_rec else None
+        last_partial_t = 0.0
         if silence_endpoint is None:
             silence_endpoint = self.endpoint_silence_s()
         if max_duration is None:
@@ -2114,11 +2169,19 @@ class WakeWordDetector(threading.Thread):
 
                 now = time.time()
                 elapsed = now - start_time
-                chunk_has_speech = self._vad_dual(arr, rms, self._aec_chunk(arr))
+                aec_arr = self._aec_chunk(arr)
+                chunk_has_speech = self._vad_dual(arr, rms, aec_arr)
                 total_chunks += 1
                 rms_list.append(rms)
                 if chunk_has_speech:
                     speech_chunks += 1
+
+                if watch_wake and self.guard.evaluate(self._wake_score(arr, rms, aec_arr),
+                                                      is_speaking=Voice.is_speaking, now=now):
+                    _vlog.info("wake: openwakeword score=%.2f (inside speech)", self._recent_scores[-1])
+                    self._mid_wake_tail = recorded_frames[-self.MID_WAKE_TAIL_CHUNKS:]
+                    reason = "wake"
+                    break
 
                 if not speech_detected:
                     if chunk_has_speech:
@@ -2139,16 +2202,29 @@ class WakeWordDetector(threading.Thread):
                         self.listening_until = 0.0
                         return None
                 else:
+                    endpoint = silence_endpoint
+                    if adaptive_endpoint:
+                        if trigger == "wake" and speech_chunks - pre_speech_chunks < self.COMMAND_GRACE_CHUNKS:
+                            endpoint = max(endpoint, self.WAKE_PAUSE_GRACE_S)
+                        else:
+                            endpoint = max(endpoint, self.COMMAND_MIN_ENDPOINT_S)
                     if chunk_has_speech:
                         consecutive_silence = 0.0
                     else:
                         consecutive_silence += chunk_duration
-                        if consecutive_silence >= silence_endpoint:
+                        if consecutive_silence >= endpoint:
                             reason = "silence"
                             break
                     if elapsed >= max_duration:
                         reason = "max_duration"
                         break
+                    if partial_cb is not None and now - last_partial_t >= self.PARTIAL_INTERVAL_S:
+                        last_partial_t = now
+                        try:
+                            partial_cb(b"".join(recorded_frames))
+                        except Exception as p_err:
+                            _vlog.warning("partial audio callback failed (%r); disabling it", p_err)
+                            partial_cb = None
 
             if speech_detected:
                 try:
@@ -2158,6 +2234,8 @@ class WakeWordDetector(threading.Thread):
                         rms_p50=int(sorted(rms_list)[len(rms_list) // 2]) if rms_list else 0)
                 except Exception:
                     pass
+            if self._mid_wake_tail is not None:
+                return None
             if not speech_detected or len(recorded_frames) < 3:
                 return None
             if speech_chunks < MIN_SPEECH_CHUNKS:
@@ -2171,6 +2249,57 @@ class WakeWordDetector(threading.Thread):
         finally:
             self._last_rec_chunks = total_chunks
             self.is_recording = False
+            if partial_cb is not None:
+                try:
+                    partial_cb(None)   # recording over: any partial still in flight is stale
+                except Exception:
+                    pass
+
+    def _on_wake_fired(self, stream, pre_roll, chunk_samples, sample_rate, pre_speech_chunks=0):
+        """"Hey Jarvis" was heard: wake callback (chime / island), then record the command and dispatch it.
+        No command within the window -> on_wake_idle (follow-up window stays open)."""
+        wake_audio = b"".join(self._wake_ring)   # the ~2 s up to the wake: "Hey Jarvis" in the user's voice
+        self._wake_ring.clear()
+        if self.on_wake:
+            try:
+                self.on_wake()
+            except Exception as cb_err:
+                print(f"[voice] on_wake error: {cb_err}")
+        elif getattr(self.cfg, "chime_enabled", True) and _wake_chime_allowed():
+            play_chime(non_blocking=True)
+
+        self.listening_until = time.time() + self.followup_window
+        raw = self.record_utterance_with_vad(
+            stream=stream,
+            pre_roll=pre_roll,
+            chunk_samples=chunk_samples,
+            sample_rate=sample_rate,
+            timeout_no_speech=min(self.followup_window, 3.5),
+            trigger="wake",
+            pre_speech_chunks=pre_speech_chunks,
+        )
+        # The model was not fed during the command, so its feature buffer still ends in "Hey Jarvis":
+        # without a reset it fires again on the first chunks after the command.
+        for m in (self.model, self._aec_model):
+            if m is not None and hasattr(m, "reset"):
+                try:
+                    m.reset()
+                except Exception as r_err:
+                    _vlog.warning("wake model reset failed: %r", r_err)
+        if raw:
+            if self.on_wake_sample is not None and wake_audio:
+                try:
+                    self.on_wake_sample(wake_audio)
+                except Exception as s_err:
+                    _vlog.warning("wake sample callback failed: %r", s_err)
+            self._dispatch_utterance(raw, is_command=True)
+        elif not self._stream_fault:
+            if self.on_wake_idle:
+                try:
+                    self.on_wake_idle()
+                except Exception as idle_err:
+                    print(f"[voice] on_wake_idle error: {idle_err}")
+            self.listening_until = time.time() + self.followup_window
 
     def transcribe(self, raw_bytes: bytes) -> str:
         """Transcribes 16 kHz raw PCM bytes: local model first, then Groq Whisper when AI is on, else ""."""
@@ -2455,55 +2584,23 @@ class WakeWordDetector(threading.Thread):
 
                     # 1. openWakeWord prediction for instant "Hey Jarvis" wake chime
                     wake_triggered = False
-                    if getattr(self.cfg, "wake_word_enabled", True) and self.model is not None:
-                        score = self._wake_predict(arr, self._is_quiet(rms, aec_arr))
-                        if aec_arr is not None and self._aec_model is not None:
-                            # Dual path: the AEC path only ever adds a chance to hear the wake word.
-                            score = max(score, self._aec_model.predict(aec_arr).get("hey_jarvis", 0.0))
-                        self._recent_scores.append(float(score))
-                        if score > self._st_max_score:
-                            self._st_max_score = float(score)
+                    if self._wake_watch_enabled():
+                        score = self._wake_score(arr, rms, aec_arr)
                         if self.guard.evaluate(score, is_speaking=Voice.is_speaking, now=now):
                             wake_triggered = True
                             _vlog.info("wake: openwakeword score=%.2f", float(score))
-                            # WAKE DETECTED!
-                            # 1. Fire wake callback immediately
-                            if self.on_wake:
-                                try:
-                                    self.on_wake()
-                                except Exception as cb_err:
-                                    print(f"[voice] on_wake error: {cb_err}")
-                            elif getattr(self.cfg, "chime_enabled", True) and _wake_chime_allowed():
-                                play_chime(non_blocking=True)
-
-                            # 2. Enter follow-up window & record with VAD
-                            self.listening_until = time.time() + self.followup_window
-                            raw = self.record_utterance_with_vad(
-                                stream=stream,
-                                pre_roll=list(pre_roll),
-                                chunk_samples=chunk_samples,
-                                sample_rate=sample_rate,
-                                timeout_no_speech=min(self.followup_window, 3.5),
-                                trigger="wake",
-                                pre_speech_chunks=1 if chunk_speech else 0,
-                            )
+                            self._on_wake_fired(stream, list(pre_roll), chunk_samples, sample_rate,
+                                                pre_speech_chunks=1 if chunk_speech else 0)
                             pre_roll.clear()
-                            if raw:
-                                self._dispatch_utterance(raw, is_command=True)
-                            elif not self._stream_fault:
-                                if self.on_wake_idle:
-                                    try:
-                                        self.on_wake_idle()
-                                    except Exception as idle_err:
-                                        print(f"[voice] on_wake_idle error: {idle_err}")
-                                self.listening_until = time.time() + self.followup_window
                             if self._stream_fault:
                                 stream_error = True
                                 break
 
                     # 2. Continuous VAD speech capture:
                     # Captures direct voice commands (e.g. "Jarvis open Chrome" or "Jarvis")
-                    # even if openWakeWord did not trigger on "hey_jarvis".
+                    # even if openWakeWord has not (yet) triggered on "hey_jarvis". The wake model keeps
+                    # listening inside this recording; if "Hey Jarvis" fires there, the recording is
+                    # abandoned and the command is captured as a normal wake (below).
                     # _recognition_worker and _process verify wake_aliases in passive standby,
                     # ensuring zero false activations from random background speech.
                     if chunk_speech and not wake_triggered:
@@ -2516,7 +2613,11 @@ class WakeWordDetector(threading.Thread):
                             pre_speech_chunks=1,
                         )
                         pre_roll.clear()
-                        if raw:
+                        tail, self._mid_wake_tail = self._mid_wake_tail, None
+                        if tail is not None and not self._stream_fault:
+                            self._on_wake_fired(stream, tail, chunk_samples, sample_rate,
+                                                pre_speech_chunks=1)
+                        elif raw:
                             self._dispatch_utterance(raw, is_command=in_followup)
                         if self._stream_fault:
                             stream_error = True
@@ -2625,6 +2726,16 @@ class Voice(threading.Thread):
         self._groq_cd_logged = 0.0
         self.listening_until = 0.0
         self.audio_q = queue.Queue(maxsize=3)
+        # Live transcript: newest (generation, audio-so-far) waiting for the partial worker; the generation
+        # is bumped when a recording ends so a late partial never overwrites the final transcript.
+        self._partial_lock = threading.Lock()
+        self._partial_evt = threading.Event()
+        self._partial_pending = None
+        self._partial_gen = 0
+        # Personal wake verifier training (wake_trainer): examples only while voice clips are allowed.
+        import wake_trainer
+        self._wake_trainer = wake_trainer.WakeTrainer(enabled=lambda: _get_personal() is not None
+                                                      and _get_personal().flag("voice_clips"))
         self.current_mic_index = None
         self.current_mic_name = "Auto"
         self.groq_cooldown_until = 0.0
@@ -2821,6 +2932,85 @@ class Voice(threading.Thread):
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------ live transcript (Siri-style)
+    PARTIAL_MAX_AUDIO_S = 12.0   # only the most recent audio is re-transcribed for the live line
+
+    def _on_partial_audio(self, raw):
+        """Detector thread: audio-so-far of a command recording, or None when it ended. Never blocks:
+        the newest clip replaces any clip the partial worker has not started yet."""
+        with self._partial_lock:
+            if raw is None:
+                self._partial_gen += 1
+                self._partial_pending = None
+                return
+            if self._local_stt_ready() is None:
+                return    # live text only from the local model: never a Groq call per partial
+            self._partial_pending = (self._partial_gen, raw)
+        self._partial_evt.set()
+
+    def _partial_worker(self):
+        while not self.stop.is_set() and not self._own_stop.is_set():
+            if not self._partial_evt.wait(0.5):
+                continue
+            self._partial_evt.clear()
+            with self._partial_lock:
+                item, self._partial_pending = self._partial_pending, None
+            if item is None:
+                continue
+            gen, raw = item
+            if self.audio_q.qsize() > 0:
+                continue    # a finished utterance is waiting: the final transcript matters more
+            lt = self._local_stt_ready()
+            if lt is None:
+                continue
+            raw = raw[-int(self.PARTIAL_MAX_AUDIO_S * 32000):]
+            try:
+                text, _conf = lt.transcribe(raw)
+            except Exception as exc:
+                _vlog.warning("partial transcribe failed: %r", exc)
+                continue
+            text = self._partial_display_text(text)
+            with self._partial_lock:
+                if gen != self._partial_gen or not text:
+                    continue    # the recording ended meanwhile: the final transcript takes over
+                self.post_partial_speech(text, is_final=False)
+
+    def _partial_display_text(self, text):
+        """Live line without the wake word ("Hey Jarvis, what's the" -> "What's the"); "" for noise."""
+        t = (text or "").strip()
+        if _normalize_noise_text(t) in _WHISPER_NOISE_NORMALIZED:
+            return ""
+        for alias in list(getattr(self.cfg, "wake_aliases", ["jarvis"])) + ["jarvis"]:
+            m = re.match(_WAKE_PREFIX_RE + re.escape(str(alias)) + r"\b[\s,.!?]*", t, re.IGNORECASE)
+            if m:
+                t = t[m.end():]
+                break
+        t = t.strip()
+        return t[:1].upper() + t[1:] if t else ""
+
+    WAKE_LIKE_RATIO = 0.5      # a word this similar to an alias ("Joffas") may be a misheard wake word
+
+    def _learn_wake_example(self, text, matched_alias):
+        """Passive (no wake model) utterance -> wake_trainer example. Starts with the wake word: a wake the
+        model missed (positive). No wake word and nothing wake-like near the start: negative."""
+        ctx = getattr(self, "_utt_ctx", None)
+        raw = ctx.get("raw") if ctx else None
+        if not raw:
+            return
+        t = (text or "").lower().strip()
+        aliases = [str(a).lower() for a in getattr(self.cfg, "wake_aliases", ["jarvis"])] + ["jarvis"]
+        if matched_alias is not None:
+            if any(re.match(r"^\s*" + _WAKE_PREFIX_RE + re.escape(a) + r"\b", t) for a in aliases):
+                self._wake_trainer.add("pos", raw)
+            return
+        words = re.findall(r"[a-z']+", t)[:3]
+        if not words or words[0] in ("hey", "hi", "ok", "okay"):
+            return
+        from difflib import SequenceMatcher
+        if any(SequenceMatcher(None, a, w).ratio() >= self.WAKE_LIKE_RATIO for a in aliases for w in words):
+            return
+        self._wake_trainer.add("neg", raw)
+
     PASSIVE_PREGATE_FRACTION = 0.5
 
     def _on_utterance_recorded(self, raw_bytes: bytes, is_command: bool = True):
@@ -2906,6 +3096,8 @@ class Voice(threading.Thread):
                                   args=("STTWorker", self._recognition_worker),
                                   name="STTWorker", daemon=True)
         worker.start()
+        threading.Thread(target=jarvis_log.run_logged, args=("PartialSTT", self._partial_worker),
+                         name="PartialSTT", daemon=True).start()
 
         # Dedicated openWakeWord detector at 16 kHz
         self.wake_detector = WakeWordDetector(
@@ -2917,6 +3109,7 @@ class Voice(threading.Thread):
             on_speech_end=self._on_speech_finished,
             on_push_to_talk=self._on_push_to_talk_start,
             on_push_to_talk_done=self._on_push_to_talk_done,
+            on_partial_audio=self._on_partial_audio,
             stop_event=self._own_stop,
             sensitivity=self.sensitivity,
             followup_window=self.followup_window,
@@ -2924,6 +3117,7 @@ class Voice(threading.Thread):
         )
         self.wake_detector._adopt_choice(dev_idx)
         self.wake_detector.on_mic_switch = self._on_mic_switched
+        self.wake_detector.on_wake_sample = lambda pcm: self._wake_trainer.add("pos", pcm, at_end=True)
         if self._suspended:
             self.wake_detector.set_suspended(True)
         self.wake_detector.start()
@@ -3361,7 +3555,7 @@ class Voice(threading.Thread):
         if is_active:
             command = t
             for alias in getattr(self.cfg, "wake_aliases", ["jarvis"]):
-                pattern = r"^\s*" + re.escape(alias) + r"\b"
+                pattern = r"^\s*" + _WAKE_PREFIX_RE + re.escape(alias) + r"\b"
                 match = re.search(pattern, command)
                 if match:
                     matched_alias = alias
@@ -3390,6 +3584,10 @@ class Voice(threading.Thread):
                     command = t[match.end():].strip(" ,.!?")
                     break
             jarvis_log.utterance_event(jarvis_log.WAKE_GATE, active=False, matched=matched_alias, command=command)
+            try:
+                self._learn_wake_example(t, matched_alias)
+            except Exception as exc:
+                _vlog.warning("wake example failed: %r", exc)
             if command is None:
                 jarvis_log.utterance_event(jarvis_log.DROPPED, reason="no_wake_word")
                 # No wake word: ignore and clear any listening state on the island
